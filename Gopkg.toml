@@ -48,3 +48,7 @@
 [[constraint]]
   branch = "master"
   name = "github.com/rivo/tview"
+
+[[constraint]]
+  branch = "master"
+  name = "github.com/drhodes/golorem"

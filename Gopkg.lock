@@ -8,6 +8,12 @@
   revision = "a5a65f0d8b2281c4cc8c259ba882dd0ec851427f"
 
 [[projects]]
+  branch = "master"
+  name = "github.com/drhodes/golorem"
+  packages = ["."]
+  revision = "ecccc744c2d953a1e13cbe5e5fc5d4cbc9b8daeb"
+
+[[projects]]
   name = "github.com/emersion/go-imap"
   packages = [
     ".",
@@ -144,6 +150,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "c18483fb8b0d14683727f38c9f0b90556dead74322b12c937ba79d95bd538416"
+  inputs-digest = "0a5efc0d6b72b289e2ac829643ccc85224ece09692c74a36ab0ad905899946c2"
   solver-name = "gps-cdcl"
   solver-version = 1
