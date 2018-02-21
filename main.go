@@ -3,14 +3,13 @@ package main
 import (
 	"fmt"
 
-	_ "github.com/emersion/go-imap"
 	_ "github.com/emersion/go-pgpmail"
 	_ "github.com/emersion/go-smtp"
 	"github.com/gdamore/tcell"
 	"github.com/rivo/tview"
+	"github.com/roblillack/mail/backend"
 	"github.com/roblillack/mail/models"
 	"github.com/roblillack/mail/views"
-	_ "github.com/tmc/keyring"
 )
 
 func main() {
@@ -18,6 +17,11 @@ func main() {
 	tview.Styles.ContrastBackgroundColor = tcell.ColorDarkRed
 	tview.Styles.InverseTextColor = tcell.ColorWhite
 	tview.Styles.PrimaryTextColor = tcell.ColorBlack
+
+	gmail := backend.NewGmailBackend("rob@lillack.net")
+	if err := gmail.Initialize(); err != nil {
+		panic(err)
+	}
 
 	app := tview.NewApplication()
 
@@ -31,10 +35,14 @@ func main() {
 
 	fmt.Fprintf(actionBar, "^Q:Quit")
 
-	messages := []*models.Message{}
+	/*messages := []*models.Message{}
 
 	for i := 0; i < 1000; i++ {
 		messages = append(messages, models.RandomMessage())
+	}*/
+	messages, err := gmail.LoadInbox()
+	if err != nil {
+		panic(err)
 	}
 
 	infoBar := tview.NewTextView().
@@ -45,10 +53,36 @@ func main() {
 	infoBar.SetTextColor(tcell.ColorBlack).
 		SetBackgroundColor(tcell.ColorYellow)
 
-	messageList := views.NewMessageList().SetMessages(messages).OnSelectionChanged(func(msg *models.Message, idx int) {
-		infoBar.Clear()
-		fmt.Fprintln(infoBar, msg.Subject)
-	}).Select(0)
+	messageList := views.NewMessageList()
+
+	messageList.
+		SetMessages(messages).
+		OnSelectionChanged(func(msg *models.Message, idx int) {
+			infoBar.Clear()
+			fmt.Fprintln(infoBar, msg.Subject)
+		}).
+		OnDeleteMessage(func(msg *models.Message, idx int) {
+			msg.Status = models.StatusDeleted
+			messageList.UpdateMessage(idx, msg)
+			messageList.Select(idx + 1)
+		}).
+		OnArchiveMessage(func(msg *models.Message, idx int) {
+			infoBar.Clear()
+			fmt.Fprintln(infoBar, "Archiving %s …", msg.Subject)
+			msg.Status = models.StatusArchived
+			messageList.UpdateMessage(idx, msg)
+			messageList.Select(idx + 1)
+		}).
+		OnUndoMessageAction(func(msg *models.Message, idx int) {
+			if msg.Status == models.StatusNew || msg.Status == models.StatusRead {
+				msg.Status = models.StatusNew
+			} else {
+				msg.Status = models.StatusRead
+			}
+			messageList.UpdateMessage(idx, msg)
+			messageList.Select(idx + 1)
+		}).
+		Select(0)
 
 	layout := tview.NewFlex().
 		SetDirection(tview.FlexRow).

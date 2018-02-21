@@ -35,7 +35,7 @@
 
 [[constraint]]
   name = "github.com/emersion/go-imap"
-  version = "0.9.0"
+  branch = "v1"
 
 [[constraint]]
   branch = "master"
@@ -52,3 +52,15 @@
 [[constraint]]
   branch = "master"
   name = "github.com/drhodes/golorem"
+
+[[constraint]]
+  branch = "master"
+  name = "github.com/emersion/go-imap-compress"
+
+[[constraint]]
+  branch = "master"
+  name = "github.com/emersion/go-imap-enable"
+
+[[constraint]]
+  branch = "master"
+  name = "github.com/emersion/go-oauthdialog"

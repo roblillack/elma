@@ -36,7 +36,7 @@ type Conn interface {
 
 	setTLSConn(*tls.Conn)
 	silent() *bool // TODO: remove this
-	serve() error
+	serve(Conn) error
 	commandHandler(cmd *imap.Command) (hdlr Handler, err error)
 }
 
@@ -52,17 +52,21 @@ type Context struct {
 	MailboxReadOnly bool
 	// Responses to send to the client.
 	Responses chan<- imap.WriterTo
+	// Closed when the client is logged out.
+	LoggedOut <-chan struct{}
 }
 
 type conn struct {
 	*imap.Conn
 
+	conn      Conn // With extensions overrides
 	s         *Server
 	ctx       *Context
 	l         sync.Locker
 	tlsConn   *tls.Conn
 	continues chan bool
 	responses chan imap.WriterTo
+	loggedOut chan struct{}
 	silentVal bool
 }
 
@@ -73,6 +77,7 @@ func newConn(s *Server, c net.Conn) *conn {
 	w := imap.NewWriter(nil)
 
 	responses := make(chan imap.WriterTo)
+	loggedOut := make(chan struct{})
 
 	tlsConn, _ := c.(*tls.Conn)
 
@@ -84,10 +89,12 @@ func newConn(s *Server, c net.Conn) *conn {
 		ctx: &Context{
 			State:     imap.ConnectingState,
 			Responses: responses,
+			LoggedOut: loggedOut,
 		},
 		tlsConn:   tlsConn,
 		continues: continues,
 		responses: responses,
+		loggedOut: loggedOut,
 	}
 
 	if s.Debug != nil {
@@ -149,14 +156,7 @@ func (c *conn) Close() error {
 		c.ctx.User.Logout()
 	}
 
-	if err := c.Conn.Close(); err != nil {
-		return err
-	}
-
-	close(c.continues)
-
-	c.ctx.State = imap.LogoutState
-	return nil
+	return c.Conn.Close()
 }
 
 func (c *conn) Capabilities() []string {
@@ -187,8 +187,8 @@ func (c *conn) send() {
 	// Send continuation requests
 	go func() {
 		for range c.continues {
-			res := &imap.ContinuationResp{Info: "send literal"}
-			if err := res.WriteTo(c.Writer); err != nil {
+			resp := &imap.ContinuationReq{Info: "send literal"}
+			if err := resp.WriteTo(c.Writer); err != nil {
 				c.Server().ErrorLog.Println("cannot send continuation request: ", err)
 			} else if err := c.Writer.Flush(); err != nil {
 				c.Server().ErrorLog.Println("cannot flush connection: ", err)
@@ -199,19 +199,22 @@ func (c *conn) send() {
 	// Send responses
 	for {
 		// Get a response that needs to be sent
-		res := <-c.responses
+		select {
+		case res := <-c.responses:
+			// Request to send the response
+			c.l.Lock()
 
-		// Request to send the response
-		c.l.Lock()
+			// Send the response
+			if err := res.WriteTo(c.Writer); err != nil {
+				c.Server().ErrorLog.Println("cannot send response: ", err)
+			} else if err := c.Writer.Flush(); err != nil {
+				c.Server().ErrorLog.Println("cannot flush connection: ", err)
+			}
 
-		// Send the response
-		if err := res.WriteTo(c.Writer); err != nil {
-			c.Server().ErrorLog.Println("cannot send response: ", err)
-		} else if err := c.Writer.Flush(); err != nil {
-			c.Server().ErrorLog.Println("cannot flush connection: ", err)
+			c.l.Unlock()
+		case <-c.loggedOut:
+			return
 		}
-
-		c.l.Unlock()
 	}
 }
 
@@ -225,7 +228,7 @@ func (c *conn) greet() error {
 	}
 
 	greeting := &imap.StatusResp{
-		Type:      imap.StatusOk,
+		Type:      imap.StatusRespOk,
 		Code:      imap.CodeCapability,
 		Arguments: args,
 		Info:      "IMAP4rev1 Service Ready",
@@ -262,7 +265,15 @@ func (c *conn) silent() *bool {
 	return &c.silentVal
 }
 
-func (c *conn) serve() error {
+func (c *conn) serve(conn Conn) error {
+	c.conn = conn
+
+	defer func() {
+		c.ctx.State = imap.LogoutState
+		close(c.continues)
+		close(c.loggedOut)
+	}()
+
 	// Send greeting
 	if err := c.greet(); err != nil {
 		return err
@@ -286,7 +297,7 @@ func (c *conn) serve() error {
 		if err != nil {
 			if imap.IsParseError(err) {
 				res = &imap.StatusResp{
-					Type: imap.StatusBad,
+					Type: imap.StatusRespBad,
 					Info: err.Error(),
 				}
 			} else {
@@ -298,7 +309,7 @@ func (c *conn) serve() error {
 			if err := cmd.Parse(fields); err != nil {
 				res = &imap.StatusResp{
 					Tag:  cmd.Tag,
-					Type: imap.StatusBad,
+					Type: imap.StatusRespBad,
 					Info: err.Error(),
 				}
 			} else {
@@ -307,7 +318,7 @@ func (c *conn) serve() error {
 				if err != nil {
 					res = &imap.StatusResp{
 						Tag:  cmd.Tag,
-						Type: imap.StatusBad,
+						Type: imap.StatusRespBad,
 						Info: err.Error(),
 					}
 				}
@@ -323,8 +334,8 @@ func (c *conn) serve() error {
 				continue
 			}
 
-			if up != nil && res.Type == imap.StatusOk {
-				if err := up.Upgrade(c); err != nil {
+			if up != nil && res.Type == imap.StatusRespOk {
+				if err := up.Upgrade(c.conn); err != nil {
 					c.s.ErrorLog.Println("cannot upgrade connection:", err)
 					return err
 				}
@@ -356,24 +367,24 @@ func (c *conn) handleCommand(cmd *imap.Command) (res *imap.StatusResp, up Upgrad
 	c.l.Unlock()
 	defer c.l.Lock()
 
-	hdlrErr := hdlr.Handle(c)
+	hdlrErr := hdlr.Handle(c.conn)
 	if statusErr, ok := hdlrErr.(*errStatusResp); ok {
 		res = statusErr.resp
 	} else if hdlrErr != nil {
 		res = &imap.StatusResp{
-			Type: imap.StatusNo,
+			Type: imap.StatusRespNo,
 			Info: hdlrErr.Error(),
 		}
 	} else {
 		res = &imap.StatusResp{
-			Type: imap.StatusOk,
+			Type: imap.StatusRespOk,
 		}
 	}
 
 	if res != nil {
 		res.Tag = cmd.Tag
 
-		if res.Type == imap.StatusOk && res.Info == "" {
+		if res.Type == imap.StatusRespOk && res.Info == "" {
 			res.Info = cmd.Name + " completed"
 		}
 	}

@@ -45,7 +45,7 @@ type Upgrader interface {
 type HandlerFactory func() Handler
 
 // A function that creates SASL servers.
-type SaslServerFactory func(conn Conn) sasl.Server
+type SASLServerFactory func(conn Conn) sasl.Server
 
 // An IMAP extension.
 type Extension interface {
@@ -94,7 +94,7 @@ type Server struct {
 	conns     map[Conn]struct{}
 
 	commands   map[string]HandlerFactory
-	auths      map[string]SaslServerFactory
+	auths      map[string]SASLServerFactory
 	extensions []Extension
 
 	// TCP address to listen on.
@@ -104,7 +104,7 @@ type Server struct {
 	// This server's backend.
 	Backend backend.Backend
 	// Backend updates that will be sent to connected clients.
-	Updates <-chan interface{}
+	Updates <-chan backend.Update
 	// Automatically logout clients after a duration. To do not logout users
 	// automatically, set this to zero. The duration MUST be at least
 	// MinAutoLogout (as stated in RFC 3501 section 5.4).
@@ -132,7 +132,7 @@ func New(bkd backend.Backend) *Server {
 		ErrorLog:  log.New(os.Stderr, "imap/server: ", log.LstdFlags),
 	}
 
-	s.auths = map[string]SaslServerFactory{
+	s.auths = map[string]SASLServerFactory{
 		sasl.Plain: func(conn Conn) sasl.Server {
 			return sasl.NewPlainServer(func(identity, username, password string) error {
 				if identity != "" && identity != username {
@@ -153,42 +153,42 @@ func New(bkd backend.Backend) *Server {
 	}
 
 	s.commands = map[string]HandlerFactory{
-		imap.Noop:       func() Handler { return &Noop{} },
-		imap.Capability: func() Handler { return &Capability{} },
-		imap.Logout:     func() Handler { return &Logout{} },
+		"NOOP":       func() Handler { return &Noop{} },
+		"CAPABILITY": func() Handler { return &Capability{} },
+		"LOGOUT":     func() Handler { return &Logout{} },
 
-		imap.StartTLS:     func() Handler { return &StartTLS{} },
-		imap.Login:        func() Handler { return &Login{} },
-		imap.Authenticate: func() Handler { return &Authenticate{} },
+		"STARTTLS":     func() Handler { return &StartTLS{} },
+		"LOGIN":        func() Handler { return &Login{} },
+		"AUTHENTICATE": func() Handler { return &Authenticate{} },
 
-		imap.Select: func() Handler { return &Select{} },
-		imap.Examine: func() Handler {
+		"SELECT": func() Handler { return &Select{} },
+		"EXAMINE": func() Handler {
 			hdlr := &Select{}
 			hdlr.ReadOnly = true
 			return hdlr
 		},
-		imap.Create:      func() Handler { return &Create{} },
-		imap.Delete:      func() Handler { return &Delete{} },
-		imap.Rename:      func() Handler { return &Rename{} },
-		imap.Subscribe:   func() Handler { return &Subscribe{} },
-		imap.Unsubscribe: func() Handler { return &Unsubscribe{} },
-		imap.List:        func() Handler { return &List{} },
-		imap.Lsub: func() Handler {
+		"CREATE":      func() Handler { return &Create{} },
+		"DELETE":      func() Handler { return &Delete{} },
+		"RENAME":      func() Handler { return &Rename{} },
+		"SUBSCRIBE":   func() Handler { return &Subscribe{} },
+		"UNSUBSCRIBE": func() Handler { return &Unsubscribe{} },
+		"LIST":        func() Handler { return &List{} },
+		"LSUB": func() Handler {
 			hdlr := &List{}
 			hdlr.Subscribed = true
 			return hdlr
 		},
-		imap.Status: func() Handler { return &Status{} },
-		imap.Append: func() Handler { return &Append{} },
+		"STATUS": func() Handler { return &Status{} },
+		"APPEND": func() Handler { return &Append{} },
 
-		imap.Check:   func() Handler { return &Check{} },
-		imap.Close:   func() Handler { return &Close{} },
-		imap.Expunge: func() Handler { return &Expunge{} },
-		imap.Search:  func() Handler { return &Search{} },
-		imap.Fetch:   func() Handler { return &Fetch{} },
-		imap.Store:   func() Handler { return &Store{} },
-		imap.Copy:    func() Handler { return &Copy{} },
-		imap.Uid:     func() Handler { return &Uid{} },
+		"CHECK":   func() Handler { return &Check{} },
+		"CLOSE":   func() Handler { return &Close{} },
+		"EXPUNGE": func() Handler { return &Expunge{} },
+		"SEARCH":  func() Handler { return &Search{} },
+		"FETCH":   func() Handler { return &Fetch{} },
+		"STORE":   func() Handler { return &Store{} },
+		"COPY":    func() Handler { return &Copy{} },
+		"UID":     func() Handler { return &Uid{} },
 	}
 
 	return s
@@ -207,7 +207,11 @@ func (s *Server) Serve(l net.Listener) error {
 		delete(s.listeners, l)
 	}()
 
-	go s.listenUpdates()
+	updater, ok := s.Backend.(backend.BackendUpdater)
+	if ok {
+		s.Updates = updater.Updates()
+		go s.listenUpdates()
+	}
 
 	for {
 		c, err := l.Accept()
@@ -274,7 +278,7 @@ func (s *Server) serveConn(conn Conn) error {
 		delete(s.conns, conn)
 	}()
 
-	return conn.serve()
+	return conn.serve(conn)
 }
 
 // Get a command handler factory for the provided command name.
@@ -289,49 +293,32 @@ func (s *Server) Command(name string) HandlerFactory {
 	return s.commands[name]
 }
 
-func (s *Server) listenUpdates() (err error) {
-	updater, ok := s.Backend.(backend.Updater)
-	if !ok {
-		return
-	}
-	s.Updates = updater.Updates()
-
+func (s *Server) listenUpdates() {
 	for {
-		item := <-s.Updates
+		update := <-s.Updates
 
-		var (
-			update *backend.Update
-			res    imap.WriterTo
-		)
-
-		switch item := item.(type) {
+		var res imap.WriterTo
+		switch update := update.(type) {
 		case *backend.StatusUpdate:
-			update = &item.Update
-			res = item.StatusResp
+			res = update.StatusResp
 		case *backend.MailboxUpdate:
-			update = &item.Update
-			res = &responses.Select{Mailbox: item.MailboxStatus}
+			res = &responses.Select{Mailbox: update.MailboxStatus}
 		case *backend.MessageUpdate:
-			update = &item.Update
-
 			ch := make(chan *imap.Message, 1)
-			ch <- item.Message
+			ch <- update.Message
 			close(ch)
 
 			res = &responses.Fetch{Messages: ch}
 		case *backend.ExpungeUpdate:
-			update = &item.Update
-
 			ch := make(chan uint32, 1)
-			ch <- item.SeqNum
+			ch <- update.SeqNum
 			close(ch)
 
 			res = &responses.Expunge{SeqNums: ch}
 		default:
-			s.ErrorLog.Printf("unhandled update: %T\n", item)
+			s.ErrorLog.Printf("unhandled update: %T\n", update)
 		}
-
-		if update == nil || res == nil {
+		if res == nil {
 			continue
 		}
 
@@ -341,10 +328,10 @@ func (s *Server) listenUpdates() (err error) {
 		for conn := range s.conns {
 			ctx := conn.Context()
 
-			if update.Username != "" && (ctx.User == nil || ctx.User.Username() != update.Username) {
+			if update.Username() != "" && (ctx.User == nil || ctx.User.Username() != update.Username()) {
 				continue
 			}
-			if update.Mailbox != "" && (ctx.Mailbox == nil || ctx.Mailbox.Name() != update.Mailbox) {
+			if update.Mailbox() != "" && (ctx.Mailbox == nil || ctx.Mailbox.Name() != update.Mailbox()) {
 				continue
 			}
 			if *conn.silent() {
@@ -374,12 +361,11 @@ func (s *Server) listenUpdates() (err error) {
 				for done := 0; done < wait; done++ {
 					<-sends
 				}
-				close(sends)
 
-				backend.DoneUpdate(update)
+				close(update.Done())
 			}()
 		} else {
-			backend.DoneUpdate(update)
+			close(update.Done())
 		}
 	}
 }
@@ -421,6 +407,6 @@ func (s *Server) Enable(extensions ...Extension) {
 //
 // This function should not be called directly, it must only be used by
 // libraries implementing extensions of the IMAP protocol.
-func (s *Server) EnableAuth(name string, f SaslServerFactory) {
+func (s *Server) EnableAuth(name string, f SASLServerFactory) {
 	s.auths[name] = f
 }

@@ -17,13 +17,14 @@ const (
 )
 
 type Message struct {
-	Sent     time.Time
-	Sender   string
-	Subject  string
-	Size     int
-	Starred  bool
-	Answered bool
-	Status   MessageStatus
+	Sent      time.Time
+	Sender    string
+	Subject   string
+	Size      int
+	Starred   bool
+	Answered  bool
+	Forwarded bool
+	Status    MessageStatus
 }
 
 func (m *Message) FlagString() string {
@@ -39,8 +40,12 @@ func (m *Message) FlagString() string {
 	if m.Starred {
 		str[1] = '*'
 	}
-	if m.Answered {
+	if m.Forwarded && m.Answered {
+		str[2] = '⇄'
+	} else if m.Forwarded {
 		str[2] = '→'
+	} else if m.Answered {
+		str[2] = '↩'
 	}
 	return string(str)
 }
