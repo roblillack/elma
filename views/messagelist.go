@@ -5,8 +5,8 @@ import (
 
 	"github.com/gdamore/tcell"
 	"github.com/rivo/tview"
-	"github.com/roblillack/mail/models"
-	"github.com/roblillack/mail/views/formatters"
+	"github.com/roblillack/elma/models"
+	"github.com/roblillack/elma/views/formatters"
 )
 
 type MessageCallback func(msg *models.Message, idx int)

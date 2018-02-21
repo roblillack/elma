@@ -7,9 +7,9 @@ import (
 	_ "github.com/emersion/go-smtp"
 	"github.com/gdamore/tcell"
 	"github.com/rivo/tview"
-	"github.com/roblillack/mail/backend"
-	"github.com/roblillack/mail/models"
-	"github.com/roblillack/mail/views"
+	"github.com/roblillack/elma/backend"
+	"github.com/roblillack/elma/models"
+	"github.com/roblillack/elma/views"
 )
 
 func main() {

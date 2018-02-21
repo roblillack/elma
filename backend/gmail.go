@@ -16,7 +16,7 @@ import (
 	"github.com/emersion/go-imap/client"
 	oauthdialog "github.com/emersion/go-oauthdialog"
 	sasl "github.com/emersion/go-sasl"
-	"github.com/roblillack/mail/models"
+	"github.com/roblillack/elma/models"
 	"golang.org/x/oauth2"
 )
 
