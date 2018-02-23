@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+
 	_ "github.com/emersion/go-pgpmail"
 	_ "github.com/emersion/go-smtp"
 	"github.com/roblillack/elma/backend"
@@ -15,4 +17,6 @@ func main() {
 	if err := app.Run(); err != nil {
 		panic(err)
 	}
+
+	fmt.Println("Done.")
 }
