@@ -20,6 +20,8 @@ type MessageList struct {
 	onArchiveMessage    MessageCallback
 	onOpenMessage       MessageCallback
 	onUndoMessageAction MessageCallback
+	onStarMessageAction MessageCallback
+	onSelectionChanged  MessageCallback
 }
 
 func NewMessageList() *MessageList {
@@ -46,6 +48,12 @@ func (l *MessageList) handleKeyPress(eventKey *tcell.EventKey) *tcell.EventKey {
 		return nil
 	}
 
+	if l.onStarMessageAction != nil && (r == 's' || r == 'S') {
+		msg, idx := l.SelectedMessage()
+		l.onStarMessageAction(msg, idx)
+		return nil
+	}
+
 	if l.onUndoMessageAction != nil && (r == 'u' || r == 'U') {
 		msg, idx := l.SelectedMessage()
 		l.onUndoMessageAction(msg, idx)
@@ -60,6 +68,9 @@ func (l *MessageList) Select(index int) *MessageList {
 		index = len(l.messages) - 1
 	}
 	l.Table.Select(index, 0)
+	if l.onSelectionChanged != nil {
+		l.onSelectionChanged(l.messages[index], index)
+	}
 	return l
 }
 
@@ -128,10 +139,17 @@ func (l *MessageList) OnUndoMessageAction(cb MessageCallback) *MessageList {
 	return l
 }
 
+func (l *MessageList) OnStarMessageAction(cb MessageCallback) *MessageList {
+	l.onStarMessageAction = cb
+	return l
+}
+
 func (l *MessageList) OnSelectionChanged(cb MessageCallback) *MessageList {
+	l.onSelectionChanged = cb
 	l.Table.SetSelectionChangedFunc(func(row int, column int) {
 		cb(l.messages[row], row)
 	})
+
 	return l
 }
 
