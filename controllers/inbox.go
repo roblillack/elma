@@ -129,6 +129,37 @@ func (c *InboxController) handleKeyEvent(event *tcell.EventKey) *tcell.EventKey 
 		return nil
 	}
 
+	if r == '$' {
+		msgs := make([]*models.Message, 0, len(c.Messages))
+		msgCounter := 0
+		newSelectionIdx := -1
+		for _, i := range c.Messages {
+			keep := true
+			for _, act := range c.ScheduledActions {
+				if (act.Type == models.TypeArchive || act.Type == models.TypeDelete) && i == act.Message {
+					keep = false
+					break
+				}
+			}
+
+			if keep {
+				if i == msg {
+					newSelectionIdx = msgCounter
+				}
+				msgs = append(msgs, i)
+				msgCounter++
+			}
+		}
+		c.ScheduledActions = []models.Action{}
+		c.Messages = msgs
+		c.MessageList.SetMessages(msgs)
+		if newSelectionIdx != -1 {
+			c.MessageList.Select(newSelectionIdx)
+		} else {
+			c.MessageList.Select(idx)
+		}
+	}
+
 	return event
 }
 
