@@ -9,58 +9,15 @@ import (
 	"github.com/roblillack/elma/views/formatters"
 )
 
-type MessageCallback func(msg *models.Message, idx int)
-
 type MessageList struct {
 	*tview.Table
 
-	messages            []*models.Message
-	onDeleteMessage     MessageCallback
-	onReplyToMessage    MessageCallback
-	onArchiveMessage    MessageCallback
-	onOpenMessage       MessageCallback
-	onUndoMessageAction MessageCallback
-	onStarMessageAction MessageCallback
-	onSelectionChanged  MessageCallback
+	messages           []*models.Message
+	onSelectionChanged models.MessageCallback
 }
 
 func NewMessageList() *MessageList {
-	t := tview.NewTable().SetBorders(false).SetSelectable(true, false)
-	l := &MessageList{Table: t}
-	t.SetInputCapture(l.handleKeyPress)
-
-	return l
-}
-
-func (l *MessageList) handleKeyPress(eventKey *tcell.EventKey) *tcell.EventKey {
-	key := eventKey.Key()
-	r := eventKey.Rune()
-
-	if l.onDeleteMessage != nil && (key == tcell.KeyBackspace || key == tcell.KeyBackspace2 || key == tcell.KeyBS || key == tcell.KeyDEL || key == tcell.KeyDelete || r == 'd' || r == 'D') {
-		msg, idx := l.SelectedMessage()
-		l.onDeleteMessage(msg, idx)
-		return nil
-	}
-
-	if l.onArchiveMessage != nil && (r == 'y' || r == 'Y') {
-		msg, idx := l.SelectedMessage()
-		l.onArchiveMessage(msg, idx)
-		return nil
-	}
-
-	if l.onStarMessageAction != nil && (r == 's' || r == 'S') {
-		msg, idx := l.SelectedMessage()
-		l.onStarMessageAction(msg, idx)
-		return nil
-	}
-
-	if l.onUndoMessageAction != nil && (r == 'u' || r == 'U') {
-		msg, idx := l.SelectedMessage()
-		l.onUndoMessageAction(msg, idx)
-		return nil
-	}
-
-	return eventKey
+	return &MessageList{Table: tview.NewTable().SetBorders(false).SetSelectable(true, false)}
 }
 
 func (l *MessageList) Select(index int) *MessageList {
@@ -114,37 +71,7 @@ func (l *MessageList) UpdateMessage(idx int, msg *models.Message) *MessageList {
 	return l
 }
 
-func (l *MessageList) OnDeleteMessage(cb MessageCallback) *MessageList {
-	l.onDeleteMessage = cb
-	return l
-}
-
-func (l *MessageList) OnReplyToMessage(cb MessageCallback) *MessageList {
-	l.onReplyToMessage = cb
-	return l
-}
-
-func (l *MessageList) OnArchiveMessage(cb MessageCallback) *MessageList {
-	l.onArchiveMessage = cb
-	return l
-}
-
-func (l *MessageList) OnOpenMessage(cb MessageCallback) *MessageList {
-	l.onOpenMessage = cb
-	return l
-}
-
-func (l *MessageList) OnUndoMessageAction(cb MessageCallback) *MessageList {
-	l.onUndoMessageAction = cb
-	return l
-}
-
-func (l *MessageList) OnStarMessageAction(cb MessageCallback) *MessageList {
-	l.onStarMessageAction = cb
-	return l
-}
-
-func (l *MessageList) OnSelectionChanged(cb MessageCallback) *MessageList {
+func (l *MessageList) OnSelectionChanged(cb models.MessageCallback) *MessageList {
 	l.onSelectionChanged = cb
 	l.Table.SetSelectionChangedFunc(func(row int, column int) {
 		cb(l.messages[row], row)

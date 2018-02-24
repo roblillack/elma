@@ -14,6 +14,7 @@ type InboxController struct {
 	App              *Application
 	ActionBar        *tview.TextView
 	InfoBar          *tview.TextView
+	MessageList      *views.MessageList
 	Messages         []*models.Message
 	ScheduledActions []models.Action
 }
@@ -65,6 +66,72 @@ func (a *InboxController) UpdateInfoBar(msg *models.Message, idx int) {
 	fmt.Fprintf(a.InfoBar, "Message %d/%d, %d scheduled actions", idx, len(a.Messages), len(a.ScheduledActions))
 }
 
+func (c *InboxController) handleKeyEvent(event *tcell.EventKey) *tcell.EventKey {
+	key := event.Key()
+	r := event.Rune()
+
+	msg, idx := c.MessageList.SelectedMessage()
+
+	if key == tcell.KeyBackspace || key == tcell.KeyBackspace2 || key == tcell.KeyBS || key == tcell.KeyDEL || key == tcell.KeyDelete || r == 'd' || r == 'D' {
+		msg.Status = models.StatusDeleted
+		c.MessageList.UpdateMessage(idx, msg)
+		c.ScheduleAction(models.TypeDelete, msg)
+		c.MessageList.Select(idx + 1)
+
+		return nil
+	}
+
+	if r == 'y' || r == 'Y' {
+		msg.Status = models.StatusArchived
+		c.MessageList.UpdateMessage(idx, msg)
+		c.ScheduleAction(models.TypeArchive, msg)
+		c.MessageList.Select(idx + 1)
+
+		return nil
+	}
+
+	if r == 's' || r == 'S' {
+		msg.Starred = !msg.Starred
+		c.MessageList.UpdateMessage(idx, msg)
+		t := models.TypeMarkAsStarred
+		if !msg.Starred {
+			t = models.TypeMarkAsUnstarred
+		}
+		c.ScheduleAction(t, msg)
+		c.MessageList.Select(idx + 1)
+
+		return nil
+	}
+
+	if r == 'u' || r == 'U' {
+		t := models.TypeMarkAsRead
+		if msg.Status == models.StatusNew || msg.Status == models.StatusRead {
+			msg.Status = models.StatusNew
+			t = models.TypeMoveToInboxUnread
+		} else {
+			msg.Status = models.StatusRead
+			t = models.TypeMoveToInboxRead
+		}
+		c.MessageList.UpdateMessage(idx, msg)
+		c.ScheduleAction(t, msg)
+		c.MessageList.Select(idx + 1)
+
+		return nil
+	}
+
+	if key == tcell.KeyEnter || key == tcell.KeyRight {
+		mv, err := NewMessageView(c.App, msg)
+		if err != nil {
+			panic(err)
+		}
+
+		c.App.PushView(mv.View())
+		return nil
+	}
+
+	return event
+}
+
 func (a *InboxController) Init() (tview.Primitive, error) {
 	if msgs, err := a.App.Backend.LoadInbox(); err != nil {
 		return nil, err
@@ -90,55 +157,20 @@ func (a *InboxController) Init() (tview.Primitive, error) {
 	a.InfoBar.SetTextColor(tcell.ColorBlack).
 		SetBackgroundColor(tcell.ColorYellow)
 
-	messageList := views.NewMessageList()
-
-	messageList.
+	a.MessageList = views.NewMessageList()
+	a.MessageList.
 		SetMessages(a.Messages).
 		OnSelectionChanged(func(msg *models.Message, idx int) {
 			a.UpdateActionBar(msg)
 			a.UpdateInfoBar(msg, idx)
 		}).
-		OnDeleteMessage(func(msg *models.Message, idx int) {
-			msg.Status = models.StatusDeleted
-			messageList.UpdateMessage(idx, msg)
-			a.ScheduleAction(models.TypeDelete, msg)
-			messageList.Select(idx + 1)
-		}).
-		OnArchiveMessage(func(msg *models.Message, idx int) {
-			msg.Status = models.StatusArchived
-			messageList.UpdateMessage(idx, msg)
-			a.ScheduleAction(models.TypeArchive, msg)
-			messageList.Select(idx + 1)
-		}).
-		OnUndoMessageAction(func(msg *models.Message, idx int) {
-			t := models.TypeMarkAsRead
-			if msg.Status == models.StatusNew || msg.Status == models.StatusRead {
-				msg.Status = models.StatusNew
-				t = models.TypeMoveToInboxUnread
-			} else {
-				msg.Status = models.StatusRead
-				t = models.TypeMoveToInboxRead
-			}
-			messageList.UpdateMessage(idx, msg)
-			a.ScheduleAction(t, msg)
-			messageList.Select(idx + 1)
-		}).
-		OnStarMessageAction(func(msg *models.Message, idx int) {
-			msg.Starred = !msg.Starred
-			messageList.UpdateMessage(idx, msg)
-			t := models.TypeMarkAsStarred
-			if !msg.Starred {
-				t = models.TypeMarkAsUnstarred
-			}
-			a.ScheduleAction(t, msg)
-			messageList.Select(idx + 1)
-		}).
 		Select(0)
+	a.MessageList.SetInputCapture(a.handleKeyEvent)
 
 	layout := tview.NewFlex().
 		SetDirection(tview.FlexRow).
 		AddItem(a.ActionBar, 1, 1, false).
-		AddItem(messageList, 0, 1, true).
+		AddItem(a.MessageList, 0, 1, true).
 		AddItem(a.InfoBar, 1, 1, false)
 
 	return layout, nil
