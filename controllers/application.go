@@ -16,14 +16,12 @@ type Application struct {
 }
 
 func (a *Application) GotoInbox() error {
-	c := &InboxController{App: a}
-	layout, err := c.Init()
-
+	c, err := NewInbox(a)
 	if err != nil {
 		return err
 	}
 
-	a.ReplaceViews(layout)
+	a.ReplaceViews(c.View())
 	return nil
 }
 

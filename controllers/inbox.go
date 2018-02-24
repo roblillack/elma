@@ -19,6 +19,17 @@ type InboxController struct {
 	ScheduledActions []models.Action
 }
 
+var _ Controller = &InboxController{}
+
+func NewInbox(app *Application) (*InboxController, error) {
+	msgs, err := app.Backend.LoadInbox()
+	if err != nil {
+		return nil, err
+	}
+
+	return &InboxController{App: app, Messages: msgs}, nil
+}
+
 func (a *InboxController) ScheduleAction(t models.ActionType, msg *models.Message) {
 	a.ScheduledActions = append(a.ScheduledActions, models.Action{Type: t, Message: msg})
 }
@@ -163,13 +174,7 @@ func (c *InboxController) handleKeyEvent(event *tcell.EventKey) *tcell.EventKey 
 	return event
 }
 
-func (a *InboxController) Init() (tview.Primitive, error) {
-	if msgs, err := a.App.Backend.LoadInbox(); err != nil {
-		return nil, err
-	} else {
-		a.Messages = msgs
-	}
-
+func (a *InboxController) View() tview.Primitive {
 	a.ActionBar = tview.NewTextView().
 		SetDynamicColors(true).
 		SetRegions(true).
@@ -204,5 +209,5 @@ func (a *InboxController) Init() (tview.Primitive, error) {
 		AddItem(a.MessageList, 0, 1, true).
 		AddItem(a.InfoBar, 1, 1, false)
 
-	return layout, nil
+	return layout
 }
