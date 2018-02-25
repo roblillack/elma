@@ -12,7 +12,7 @@ import (
 type Application struct {
 	Backend backend.Backend
 	View    *tview.Application
-	Views   []tview.Primitive
+	Screens []Controller
 }
 
 func (a *Application) GotoInbox() error {
@@ -21,7 +21,7 @@ func (a *Application) GotoInbox() error {
 		return err
 	}
 
-	a.ReplaceViews(c.View())
+	a.ReplaceScreens(c)
 	return nil
 }
 
@@ -30,40 +30,41 @@ func (a *Application) GotoHelp() error {
 	help.SetTitle("Help").SetBorder(true).SetTitleAlign(tview.AlignLeft)
 	help.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEsc || event.Key() == tcell.KeyEscape {
-			a.PopView()
+			a.PopScreen()
 		}
 
 		return event
 	})
 	fmt.Fprintf(help, "Hello world!\n\ntime: %s", time.Now())
-	a.PushView(help)
+
+	a.PushScreen(NewSimple(help))
 
 	return nil
 }
 
-func (a *Application) PushView(p tview.Primitive) {
-	a.Views = append(a.Views, p)
-	a.View.SetRoot(p, true)
+func (a *Application) PushScreen(c Controller) {
+	a.Screens = append(a.Screens, c)
+	a.View.SetRoot(c.View(), true)
 }
 
-func (a *Application) ReplaceViews(p tview.Primitive) {
-	a.Views = []tview.Primitive{p}
-	a.View.SetRoot(p, true)
+func (a *Application) ReplaceScreens(c Controller) {
+	a.Screens = []Controller{c}
+	a.View.SetRoot(c.View(), true)
 }
 
-func (a *Application) PopView() {
-	l := len(a.Views)
+func (a *Application) PopScreen() {
+	l := len(a.Screens)
 	if l == 0 {
 		return
 	}
-	a.Views = a.Views[0 : l-1]
+	a.Screens = a.Screens[0 : l-1]
 
 	if l <= 1 {
 		a.View.Stop()
 		return
 	}
 
-	a.View.SetRoot(a.Views[l-2], true)
+	a.View.SetRoot(a.Screens[l-2].View(), true)
 }
 
 func (a *Application) Run() error {

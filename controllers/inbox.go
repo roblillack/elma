@@ -136,7 +136,7 @@ func (c *InboxController) handleKeyEvent(event *tcell.EventKey) *tcell.EventKey 
 			panic(err)
 		}
 
-		c.App.PushView(mv.View())
+		c.App.PushScreen(mv)
 		return nil
 	}
 

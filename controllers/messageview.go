@@ -56,7 +56,7 @@ func (c *MessageViewController) View() tview.Primitive {
 	fmt.Fprintln(c.TextView, c.Message.Subject)
 	c.TextView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape || event.Key() == tcell.KeyEsc || event.Key() == tcell.KeyLeft {
-			c.App.PopView()
+			c.App.PopScreen()
 			return nil
 		}
 
