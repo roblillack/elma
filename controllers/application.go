@@ -10,7 +10,7 @@ import (
 )
 
 type Application struct {
-	Backend *backend.GmailBackend
+	Backend backend.Backend
 	View    *tview.Application
 	Views   []tview.Primitive
 }

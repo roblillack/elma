@@ -26,6 +26,8 @@ type GmailBackend struct {
 	Client   *client.Client
 }
 
+var _ Backend = &GmailBackend{}
+
 func NewGmailBackend(email string) *GmailBackend {
 	return &GmailBackend{
 		Email: email,
