@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/roblillack/elma/events"
+
 	"github.com/gdamore/tcell"
 	"github.com/rivo/tview"
 	"github.com/roblillack/elma/models"
@@ -17,9 +19,11 @@ type InboxController struct {
 	MessageList      *views.MessageList
 	Messages         []*models.Message
 	ScheduledActions []models.Action
+	flexLayout       *tview.Flex
 }
 
 var _ Controller = &InboxController{}
+var _ events.EventListener = &InboxController{}
 
 func NewInbox(app *Application) (*InboxController, error) {
 	msgs, err := app.Backend.LoadInbox()
@@ -27,7 +31,46 @@ func NewInbox(app *Application) (*InboxController, error) {
 		return nil, err
 	}
 
-	return &InboxController{App: app, Messages: msgs}, nil
+	inbox := &InboxController{App: app, Messages: msgs}
+	inbox.createLayout()
+
+	return inbox, nil
+}
+
+func (a *InboxController) createLayout() {
+	a.ActionBar = tview.NewTextView().
+		SetDynamicColors(true).
+		SetRegions(true).
+		SetWrap(false)
+
+	a.ActionBar.SetTextColor(tcell.ColorBlack).
+		SetBackgroundColor(tcell.ColorYellow)
+
+	a.UpdateActionBar(nil)
+
+	a.InfoBar = tview.NewTextView().
+		SetDynamicColors(true).
+		SetRegions(true).
+		SetWrap(false)
+
+	a.InfoBar.SetTextColor(tcell.ColorBlack).
+		SetBackgroundColor(tcell.ColorYellow)
+
+	a.MessageList = views.NewMessageList()
+	a.MessageList.
+		SetMessages(a.Messages).
+		OnSelectionChanged(func(msg *models.Message, idx int) {
+			a.UpdateActionBar(msg)
+			a.UpdateInfoBar(msg, idx)
+		}).
+		Select(0)
+	a.MessageList.SetInputCapture(a.handleKeyEvent)
+
+	a.flexLayout = tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(a.ActionBar, 1, 1, false).
+		AddItem(a.MessageList, 0, 1, true).
+		AddItem(a.InfoBar, 1, 1, false)
 }
 
 func (a *InboxController) ScheduleAction(t models.ActionType, msg *models.Message) {
@@ -175,39 +218,15 @@ func (c *InboxController) handleKeyEvent(event *tcell.EventKey) *tcell.EventKey 
 }
 
 func (a *InboxController) View() tview.Primitive {
-	a.ActionBar = tview.NewTextView().
-		SetDynamicColors(true).
-		SetRegions(true).
-		SetWrap(false)
+	return a.flexLayout
+}
 
-	a.ActionBar.SetTextColor(tcell.ColorBlack).
-		SetBackgroundColor(tcell.ColorYellow)
-
-	a.UpdateActionBar(nil)
-
-	a.InfoBar = tview.NewTextView().
-		SetDynamicColors(true).
-		SetRegions(true).
-		SetWrap(false)
-
-	a.InfoBar.SetTextColor(tcell.ColorBlack).
-		SetBackgroundColor(tcell.ColorYellow)
-
-	a.MessageList = views.NewMessageList()
-	a.MessageList.
-		SetMessages(a.Messages).
-		OnSelectionChanged(func(msg *models.Message, idx int) {
-			a.UpdateActionBar(msg)
-			a.UpdateInfoBar(msg, idx)
-		}).
-		Select(0)
-	a.MessageList.SetInputCapture(a.handleKeyEvent)
-
-	layout := tview.NewFlex().
-		SetDirection(tview.FlexRow).
-		AddItem(a.ActionBar, 1, 1, false).
-		AddItem(a.MessageList, 0, 1, true).
-		AddItem(a.InfoBar, 1, 1, false)
-
-	return layout
+func (c *InboxController) HandleEvent(evt events.Event) {
+	switch e := evt.(type) {
+	case events.NewMessage:
+		_, idx := c.MessageList.SelectedMessage()
+		c.Messages = append(c.Messages, e.Message)
+		c.MessageList.SetMessages(c.Messages)
+		c.MessageList.Select(idx)
+	}
 }
