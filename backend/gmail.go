@@ -5,14 +5,17 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"reflect"
 	"regexp"
 	"strconv"
 	"syscall"
-	"time"
+
+	"github.com/roblillack/elma/events"
 
 	"github.com/emersion/go-imap"
 	compress "github.com/emersion/go-imap-compress"
 	"github.com/emersion/go-imap-enable"
+	idle "github.com/emersion/go-imap-idle"
 	"github.com/emersion/go-imap/client"
 	oauthdialog "github.com/emersion/go-oauthdialog"
 	sasl "github.com/emersion/go-sasl"
@@ -24,9 +27,31 @@ type GmailBackend struct {
 	Email    string
 	Password string
 	Client   *client.Client
+
+	eventQueue  chan events.Event
+	idleChannel chan error
+	inbox       map[models.MessageID]*models.Message
+}
+
+var GmailMessageID imap.FetchItem = `X-GM-MSGID`
+
+func getMessageID(msg *imap.Message) (models.MessageID, bool) {
+	raw, haveMsgID := msg.Items[GmailMessageID]
+	if !haveMsgID {
+		return 0, false
+	}
+
+	str, isStr := raw.(string)
+	if !isStr {
+		return 0, false
+	}
+
+	u, err := strconv.ParseUint(str, 10, 64)
+	return models.MessageID(u), err == nil
 }
 
 var _ Backend = &GmailBackend{}
+var _ events.EventPublisher = &GmailBackend{}
 
 func NewGmailBackend(email string) *GmailBackend {
 	return &GmailBackend{
@@ -190,59 +215,25 @@ func (b *GmailBackend) LoadInbox() ([]*models.Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Println("Flags for INBOX:", mbox.Flags)
-	log.Printf("Number of messages here: %d, unseen: %d\n", mbox.Messages, mbox.Unseen)
-	// Get the last 4 messages
-	/*from := uint32(1)
-	to := mbox.Messages
-	if mbox.Messages > 3 {
-		// We're using unsigned integers here, only substract if the result is > 0
-		from = mbox.Messages - 3
-	}*/
 	seqset := &imap.SeqSet{Set: []imap.Seq{{Start: uint32(1), Stop: mbox.Messages}}}
-	//seqset, err := imap.ParseSeqSet("*")
 	if err != nil {
 		log.Println(err)
 	}
-	//seqset := new(imap.SeqSet)
-	//seqset.AddRange(from, to)
 
-	crit := imap.NewSearchCriteria()
-	crit.Before = time.Now().Add(time.Hour)
-	//crit.Uid.Add("*")*/
-
-	/*	uids, err := b.Client.UidSearch(crit)
-		if err != nil {
-			return nil, fmt.Errorf("unable to search for all mails: %s", err)
-		}
-		log.Println(uids)
-
-		seqset.AddNum(uids...)*/
-
-	messages := make(chan *imap.Message, 10000)
+	messages := make(chan *imap.Message, 100000)
 	done := make(chan error, 1)
 	go func() {
-		done <- b.Client.Fetch(seqset, []imap.FetchItem{imap.FetchFlags, imap.FetchInternalDate, imap.FetchRFC822Size, imap.FetchEnvelope}, messages)
+		done <- b.Client.Fetch(seqset, []imap.FetchItem{GmailMessageID, imap.FetchFlags, imap.FetchInternalDate, imap.FetchRFC822Size, imap.FetchEnvelope}, messages)
 	}()
 
+	b.inbox = map[models.MessageID]*models.Message{}
 	list := []*models.Message{}
-	for msg := range messages {
-		log.Printf("%+v\n", msg)
-		log.Println("* " + msg.Envelope.Subject)
-		log.Println(msg.Flags)
-		st := models.StatusRead
-		if isUnread(msg.Flags) {
-			st = models.StatusNew
+	for i := range messages {
+		msg := b.buildMessage(i)
+		if msgID, ok := getMessageID(i); ok {
+			b.inbox[msgID] = msg
 		}
-		list = append(list, &models.Message{
-			Sender:   msg.Envelope.From[0].PersonalName,
-			Sent:     msg.Envelope.Date,
-			Size:     int(msg.Size),
-			Starred:  isStarred(msg.Flags),
-			Answered: isAnswered(msg.Flags),
-			Status:   st,
-			Subject:  msg.Envelope.Subject,
-		})
+		list = append(list, msg)
 	}
 
 	if err := <-done; err != nil {
@@ -250,5 +241,220 @@ func (b *GmailBackend) LoadInbox() ([]*models.Message, error) {
 	}
 
 	return list, nil
-	//return nil, errors.New("Not implemented")
+}
+
+func (b *GmailBackend) loadMessages(seqSet *imap.SeqSet) ([]*models.Message, error) {
+	messages := make(chan *imap.Message, 10000)
+	done := make(chan error, 1)
+	go func() {
+		done <- b.Client.Fetch(seqSet, []imap.FetchItem{GmailMessageID, imap.FetchFlags, imap.FetchInternalDate, imap.FetchRFC822Size, imap.FetchEnvelope}, messages)
+	}()
+
+	list := []*models.Message{}
+	for i := range messages {
+		msg := b.buildMessage(i)
+		if msg == nil {
+			continue
+		}
+		list = append(list, msg)
+	}
+
+	if err := <-done; err != nil {
+		return nil, fmt.Errorf("unable to fetch messages: %s", err)
+	}
+
+	return list, nil
+}
+
+func (b *GmailBackend) getInboxUpdates(stat *imap.MailboxStatus) ([]*models.Message, error) {
+	seqset := &imap.SeqSet{Set: []imap.Seq{{Start: uint32(1), Stop: stat.Messages}}}
+
+	messages := make(chan *imap.Message, 10000)
+	done := make(chan error, 1)
+	go func() {
+		done <- b.Client.Fetch(seqset, []imap.FetchItem{GmailMessageID}, messages)
+	}()
+
+	fetchSet := &imap.SeqSet{}
+	for i := range messages {
+		if msgID, ok := getMessageID(i); ok {
+			if _, known := b.inbox[msgID]; !known {
+				fetchSet.AddNum(i.SeqNum)
+			}
+		}
+	}
+
+	if err := <-done; err != nil {
+		return nil, fmt.Errorf("unable to fetch messages: %s", err)
+	}
+
+	list, err := b.loadMessages(fetchSet)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, i := range list {
+		b.inbox[i.ID] = i
+	}
+
+	return list, nil
+}
+
+func (b *GmailBackend) buildMessage(msg *imap.Message) *models.Message {
+	if msg == nil {
+		return nil
+	}
+
+	msgID, ok := getMessageID(msg)
+	if !ok {
+		return nil
+	}
+
+	st := models.StatusRead
+	if isUnread(msg.Flags) {
+		st = models.StatusNew
+	}
+
+	return &models.Message{
+		ID:       msgID,
+		Sender:   msg.Envelope.From[0].PersonalName,
+		Sent:     msg.Envelope.Date,
+		Size:     int(msg.Size),
+		Starred:  isStarred(msg.Flags),
+		Answered: isAnswered(msg.Flags),
+		Status:   st,
+		Subject:  msg.Envelope.Subject,
+	}
+}
+
+func (b *GmailBackend) Subscribe() (<-chan events.Event, error) {
+	_, err := b.selectMailbox("INBOX")
+	if err != nil {
+		return nil, err
+	}
+
+	idleClient := idle.NewClient(b.Client)
+	updates := make(chan client.Update)
+	b.Client.Updates = updates
+
+	b.idleChannel = make(chan error, 1)
+	go func() {
+		b.idleChannel <- idleClient.IdleWithFallback(nil, 0)
+	}()
+
+	b.eventQueue = make(chan events.Event)
+
+	go func() {
+		for {
+			select {
+			case update := <-updates:
+				//log.Println("New update:", update)
+				b.handleServerUpdate(update)
+
+			case err := <-b.idleChannel:
+				if err != nil {
+					log.Fatal(err)
+				}
+				log.Println("Not idling anymore")
+				return
+			}
+		}
+	}()
+
+	/*go func() {
+		for {
+			time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
+			m := models.RandomMessage()
+			m.Status = models.StatusNew
+			b.events <- events.NewMessage{Message: m}
+		}
+	}()*/
+
+	return b.eventQueue, nil
+}
+
+// TODO: What to do with this? Had 1yr old unsafed changes …
+func (b *GmailBackend) syncInbox() error {
+	mbox, err := b.selectMailbox("INBOX")
+	if err != nil {
+		return err
+	}
+	seqset := &imap.SeqSet{Set: []imap.Seq{{Start: uint32(1), Stop: mbox.Messages}}}
+
+	messages := make(chan *imap.Message)
+	done := make(chan error)
+	go func() {
+		done <- b.Client.Fetch(seqset, []imap.FetchItem{GmailMessageID}, messages)
+	}()
+
+	seenNow := map[models.MessageID]struct{}{}
+	fetchSet := &imap.SeqSet{}
+	for i := range messages {
+		if msgID, ok := getMessageID(i); ok {
+			if _, known := b.inbox[msgID]; !known {
+				fetchSet.AddNum(i.SeqNum)
+			}
+			seenNow[msgID] = struct{}{}
+		}
+	}
+
+	if err := <-done; err != nil {
+		return fmt.Errorf("unable to fetch messages IDs: %s", err)
+	}
+
+	list, err := b.loadMessages(fetchSet)
+	if err != nil {
+		return err
+	}
+
+	b.inbox = map[models.MessageID]*models.Message{}
+	for _, i := range list {
+		b.inbox[i.ID] = i
+	}
+
+	/*removeSet := []models.MessageID{}
+
+	for i := range b.inbox {
+		if _, ok := seenNow[i]; !ok {
+			removeSet = append(removeSet, i)
+		}
+	}
+
+	for _, i := range list {
+		b.inbox[i.ID] = i
+	}*/
+
+	return nil
+}
+
+func (b *GmailBackend) handleServerUpdate(update client.Update) {
+	switch u := update.(type) {
+	case *client.ExpungeUpdate:
+	case *client.MessageUpdate:
+		b.eventQueue <- events.NewMessage{Message: b.buildMessage(u.Message)}
+	case *client.MailboxUpdate:
+		if u.Mailbox.Name != "INBOX" {
+			return
+		}
+		newMsgs, err := b.getInboxUpdates(u.Mailbox)
+		if err != nil {
+			log.Printf("Error getting updates: %s\n", err)
+			return
+		}
+		for _, i := range newMsgs {
+			log.Printf("New: %s\n", i.Subject)
+			b.eventQueue <- events.NewMessage{Message: i}
+		}
+		//u.Mailbox.
+		//u.Mailbox.UidValidity
+		//	b.eventQueue <- events.NewMessage{Message: b.buildMessage(u.Message)}
+	default:
+		log.Printf("%s: %+v\n", reflect.TypeOf(u).Name(), update)
+	}
+}
+
+func (b *GmailBackend) Unsubscribe() error {
+	b.idleChannel <- nil
+
+	return nil
 }

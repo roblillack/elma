@@ -11,8 +11,8 @@ import (
 
 func main() {
 	app := &controllers.Application{
-		//Backend: backend.NewGmailBackend("rob@lillack.net"),
-		Backend: backend.NewFakeBackend(),
+		Backend: backend.NewGmailBackend("rob@lillack.net"),
+		//Backend: backend.NewFakeBackend(),
 	}
 
 	if err := app.Run(); err != nil {

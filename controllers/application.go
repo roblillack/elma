@@ -63,6 +63,7 @@ func (a *Application) ReplaceScreens(c Controller) {
 func (a *Application) PopScreen() {
 	a.screenLock.Lock()
 	defer a.screenLock.Unlock()
+
 	l := len(a.Screens)
 	if l == 0 {
 		return

@@ -7,6 +7,8 @@ import (
 	lorem "github.com/drhodes/golorem"
 )
 
+type MessageID uint64
+
 type MessageCallback func(msg *Message, idx int)
 
 type MessageStatus uint8
@@ -19,6 +21,7 @@ const (
 )
 
 type Message struct {
+	ID        MessageID
 	Sent      time.Time
 	Sender    string
 	Subject   string

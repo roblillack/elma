@@ -41,9 +41,24 @@
 
 [[projects]]
   branch = "master"
+  name = "github.com/emersion/go-imap-idle"
+  packages = ["."]
+  revision = "2af93776db6b042cc1116b0d0af00d7f58eea696"
+
+[[projects]]
+  branch = "master"
   name = "github.com/emersion/go-imap-proxy"
   packages = ["."]
   revision = "512b52b56e7f81bdd3cdde8ab360834287e8762f"
+
+[[projects]]
+  name = "github.com/emersion/go-message"
+  packages = [
+    ".",
+    "charset"
+  ]
+  revision = "1716e3f473f914d0f63389271fbe851c749e0ab4"
+  version = "v0.9"
 
 [[projects]]
   branch = "master"
@@ -57,7 +72,8 @@
   packages = [
     ".",
     "imap",
-    "local"
+    "local",
+    "pgpmessage"
   ]
   revision = "03c895a79e3febeb9c18984c0d2d16dddd50cbcb"
 
@@ -72,6 +88,12 @@
   name = "github.com/emersion/go-smtp"
   packages = ["."]
   revision = "a63104657743890cb7c2fd54f15a2725291f6a9f"
+
+[[projects]]
+  branch = "master"
+  name = "github.com/emersion/go-textwrapper"
+  packages = ["."]
+  revision = "d0e65e56babe3f687ff94c1d764ca0e6aa7723ee"
 
 [[projects]]
   branch = "master"
@@ -155,7 +177,12 @@
   name = "golang.org/x/text"
   packages = [
     "encoding",
+    "encoding/charmap",
+    "encoding/internal",
     "encoding/internal/identifier",
+    "encoding/japanese",
+    "encoding/simplifiedchinese",
+    "encoding/traditionalchinese",
     "internal/gen",
     "transform",
     "unicode/cldr"
@@ -179,6 +206,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "6aeda6871001020af0a2635919f414f7dad28016512cc8fe0b48f43ec70b98da"
+  inputs-digest = "6346d77d2ecb8aedc1cf13bbe38cbd45269ca4cec24c85f79d4d13967bbfd64e"
   solver-name = "gps-cdcl"
   solver-version = 1
