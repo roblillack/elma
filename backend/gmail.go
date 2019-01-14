@@ -10,11 +10,14 @@ import (
 	"strconv"
 	"syscall"
 
+	"github.com/gdamore/tcell"
+	"github.com/rivo/tview"
+
 	"github.com/roblillack/elma/events"
 
-	"github.com/emersion/go-imap"
+	imap "github.com/emersion/go-imap"
 	compress "github.com/emersion/go-imap-compress"
-	"github.com/emersion/go-imap-enable"
+	enable "github.com/emersion/go-imap-enable"
 	idle "github.com/emersion/go-imap-idle"
 	"github.com/emersion/go-imap/client"
 	oauthdialog "github.com/emersion/go-oauthdialog"
@@ -81,7 +84,10 @@ func getFromKeyChain(service, username string) (string, error) {
 	c := exec.Command("/usr/bin/security", args...)
 	o, err := c.CombinedOutput()
 	if err != nil {
-		exitCode := c.ProcessState.Sys().(syscall.WaitStatus).ExitStatus()
+		exitCode := -1
+		if c.ProcessState != nil && c.ProcessState.Sys() != nil {
+			exitCode = c.ProcessState.Sys().(syscall.WaitStatus).ExitStatus()
+		}
 		// check particular exit code
 		if exitCode == 44 {
 			return "", ErrNotFound
@@ -123,7 +129,22 @@ func authenticate(c *client.Client, cfg *oauth2.Config, username string) error {
 func (b *GmailBackend) Initialize() error {
 	pw, err := getFromKeyChain("www.google.com", b.Email)
 	if err != nil {
-		return err
+		log.Println(err)
+		ok := false
+		app := tview.NewApplication()
+		inp := tview.NewInputField().SetLabel("Password: ").SetMaskCharacter('*').SetDoneFunc(func(key tcell.Key) {
+			if key == tcell.KeyEnter {
+				ok = true
+				app.Stop()
+			}
+		})
+		if err := app.SetRoot(inp, true).Run(); err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("Bah, no password entered.")
+		}
+		pw = inp.GetText()
 	}
 	b.Password = pw
 	return nil

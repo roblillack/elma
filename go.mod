@@ -1,0 +1,29 @@
+module github.com/roblillack/elma
+
+require (
+	camlistore.org v0.0.0-20171230002226-a5a65f0d8b22
+	github.com/drhodes/golorem v0.0.0-20160418191928-ecccc744c2d9
+	github.com/emersion/go-imap v1.0.0-beta.1
+	github.com/emersion/go-imap-compress v0.0.0-20170105185004-f036eda44681
+	github.com/emersion/go-imap-enable v0.0.0-20171113210557-34871b6fe7d2
+	github.com/emersion/go-imap-idle v0.0.0-20180114101550-2af93776db6b
+	github.com/emersion/go-imap-proxy v0.0.0-20171212131948-512b52b56e7f
+	github.com/emersion/go-message v0.0.0-20170802224156-1716e3f473f9
+	github.com/emersion/go-oauthdialog v0.0.0-20160528192336-53626322c75d
+	github.com/emersion/go-pgpmail v0.0.0-20171212131820-03c895a79e3f
+	github.com/emersion/go-sasl v0.0.0-20161116183048-7e096a0a6197
+	github.com/emersion/go-smtp v0.0.0-20180204110156-a63104657743
+	github.com/emersion/go-textwrapper v0.0.0-20160606182133-d0e65e56babe
+	github.com/gdamore/encoding v0.0.0-20151215212835-b23993cbb635
+	github.com/gdamore/tcell v1.0.0
+	github.com/golang/protobuf v1.0.0
+	github.com/lucasb-eyer/go-colorful v0.0.0-20170903184257-231272389856
+	github.com/mattn/go-runewidth v0.0.2
+	github.com/rivo/tview v0.0.0-20180215173527-f6602e7eb19c
+	github.com/skratchdot/open-golang v0.0.0-20160302144031-75fb7ed4208c
+	golang.org/x/crypto v0.0.0-20180214000028-650f4a345ab4
+	golang.org/x/net v0.0.0-20180218175443-cbe0f9307d01
+	golang.org/x/oauth2 v0.0.0-20180207181906-543e37812f10
+	golang.org/x/text v0.0.0-20180208041248-4e4a3210bb54
+	google.golang.org/appengine v1.0.0
+)
