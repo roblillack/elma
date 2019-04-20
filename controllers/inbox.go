@@ -115,9 +115,9 @@ func (a *InboxController) UpdateActionBar(msg *models.Message) {
 	fmt.Fprint(a.ActionBar, b.String())
 }
 
-func (a *InboxController) UpdateInfoBar(msg *models.Message, idx int) {
-	a.InfoBar.Clear()
-	fmt.Fprintf(a.InfoBar, "Message %d/%d, %d scheduled actions", idx, len(a.Messages), len(a.ScheduledActions))
+func (c *InboxController) UpdateInfoBar(msg *models.Message, idx int) {
+	c.InfoBar.Clear()
+	fmt.Fprintf(c.InfoBar, "Message %d/%d, %d scheduled actions", idx, len(c.Messages), len(c.ScheduledActions))
 }
 
 func (c *InboxController) handleKeyEvent(event *tcell.EventKey) *tcell.EventKey {

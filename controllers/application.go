@@ -2,21 +2,19 @@ package controllers
 
 import (
 	"fmt"
-	"sync"
 	"time"
-
-	"github.com/roblillack/elma/events"
 
 	"github.com/gdamore/tcell"
 	"github.com/rivo/tview"
+
 	"github.com/roblillack/elma/backend"
+	"github.com/roblillack/elma/events"
 )
 
 type Application struct {
-	Backend    backend.Backend
-	View       *tview.Application
-	Screens    []Controller
-	screenLock sync.RWMutex
+	Backend backend.Backend
+	View    *tview.Application
+	Screens []Controller
 }
 
 func (a *Application) GotoInbox() error {
@@ -47,23 +45,16 @@ func (a *Application) GotoHelp() error {
 }
 
 func (a *Application) PushScreen(c Controller) {
-	a.screenLock.Lock()
-	defer a.screenLock.Unlock()
 	a.Screens = append(a.Screens, c)
 	a.View.SetRoot(c.View(), true)
 }
 
 func (a *Application) ReplaceScreens(c Controller) {
-	a.screenLock.Lock()
-	defer a.screenLock.Unlock()
 	a.Screens = []Controller{c}
 	a.View.SetRoot(c.View(), true)
 }
 
 func (a *Application) PopScreen() {
-	a.screenLock.Lock()
-	defer a.screenLock.Unlock()
-
 	l := len(a.Screens)
 	if l == 0 {
 		return
@@ -81,15 +72,13 @@ func (a *Application) PopScreen() {
 func (a *Application) processEvents(backend backend.Backend, eventBus <-chan events.Event) {
 	for {
 		evt := <-eventBus
-		a.screenLock.RLock()
-		for _, screen := range a.Screens {
-			if listener, ok := screen.(events.EventListener); ok {
-				listener.HandleEvent(evt)
+		a.View.QueueUpdateDraw(func() {
+			for _, screen := range a.Screens {
+				if listener, ok := screen.(events.EventListener); ok {
+					listener.HandleEvent(evt)
+				}
 			}
-		}
-		a.screenLock.RUnlock()
-
-		a.View.Draw()
+		})
 	}
 }
 
@@ -101,6 +90,8 @@ func (a *Application) Run() error {
 	if err := a.Backend.Initialize(); err != nil {
 		return err
 	}
+
+	a.View = tview.NewApplication()
 
 	if publisher, ok := a.Backend.(events.EventPublisher); ok {
 		c, err := publisher.Subscribe()
@@ -115,7 +106,6 @@ func (a *Application) Run() error {
 	tview.Styles.InverseTextColor = tcell.ColorWhite
 	tview.Styles.PrimaryTextColor = tcell.ColorBlack
 
-	a.View = tview.NewApplication()
 	a.View.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyCtrlQ {
 			a.View.Stop()
