@@ -70,13 +70,20 @@ func (a *Application) PopScreen() {
 }
 
 func (a *Application) processEvents(backend backend.Backend, eventBus <-chan events.Event) {
+	var lastRedraw time.Time
+
 	for {
 		evt := <-eventBus
-		a.View.QueueUpdateDraw(func() {
+		a.View.QueueUpdate(func() {
 			for _, screen := range a.Screens {
 				if listener, ok := screen.(events.EventListener); ok {
 					listener.HandleEvent(evt)
 				}
+			}
+
+			if len(eventBus) == 0 || lastRedraw.Add(time.Millisecond*100).Before(time.Now()) {
+				a.View.ForceDraw()
+				lastRedraw = time.Now()
 			}
 		})
 	}
