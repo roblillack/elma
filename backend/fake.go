@@ -1,9 +1,7 @@
 package backend
 
 import (
-	"math/rand"
-	"time"
-
+	"github.com/roblillack/elma/backend/mock"
 	"github.com/roblillack/elma/events"
 	"github.com/roblillack/elma/models"
 )
@@ -42,12 +40,12 @@ func (b *FakeBackend) LoadInbox() ([]*models.Message, error) {
 }
 
 func (b *FakeBackend) Subscribe() (<-chan events.Event, error) {
-	b.events = make(chan events.Event)
+	b.events = make(chan events.Event, 1000)
 
 	go func() {
 		for {
 			time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
-			m := models.RandomMessage()
+			m := mock.RandomMessage()
 			m.Status = models.StatusNew
 			b.events <- events.NewMessage{Message: m}
 		}

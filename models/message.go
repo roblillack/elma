@@ -1,10 +1,7 @@
 package models
 
 import (
-	"math/rand"
 	"time"
-
-	lorem "github.com/drhodes/golorem"
 )
 
 type MessageID uint64
@@ -53,25 +50,4 @@ func (m *Message) FlagString() string {
 		str[2] = '↩'
 	}
 	return string(str)
-}
-
-func randomString(options ...string) string {
-	return options[rand.Intn(len(options))]
-}
-
-func RandomMessage() *Message {
-	s := StatusRead
-	if rand.Intn(10) == 0 {
-		s = StatusNew
-	}
-	return &Message{
-		Sent: time.Now().Add(-time.Hour*time.Duration(rand.Intn(1000)) - time.Duration(rand.Intn(60))*time.Minute),
-		Sender: randomString("Anton", "Bertram", "Chris", "David", "Emil", "Frank", "Gert", "Hugh", "Ian", "John", "Kevin") + " " +
-			randomString("Achilles", "Johnson", "Mustermann", "Mueller", "Østerberg", "Smith"),
-		Subject:  lorem.Sentence(3, 15),
-		Size:     rand.Intn(7203680) + 200,
-		Starred:  rand.Intn(10) == 0,
-		Answered: rand.Intn(8) == 0,
-		Status:   s,
-	}
 }
