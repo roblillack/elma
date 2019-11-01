@@ -62,6 +62,13 @@ func NewGmailBackend(email string) *GmailBackend {
 	}
 }
 
+func NewGmailBackendWithPassword(email, pw string) *GmailBackend {
+	return &GmailBackend{
+		Email:    email,
+		Password: pw,
+	}
+}
+
 func getFromKeyChain(service, username string) (string, error) {
 	ErrNotFound := errors.New("Password not found")
 	pwRe := regexp.MustCompile(`password:\s+(?:0x[A-Fa-f0-9]+\s+)?"(.+)"`)
@@ -127,6 +134,10 @@ func authenticate(c *client.Client, cfg *oauth2.Config, username string) error {
 }
 
 func (b *GmailBackend) Initialize() error {
+	if b.Password != "" {
+		return nil
+	}
+
 	pw, err := getFromKeyChain("www.google.com", b.Email)
 	if err != nil {
 		log.Println(err)

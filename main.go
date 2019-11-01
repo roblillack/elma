@@ -2,17 +2,53 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path"
 
 	_ "github.com/emersion/go-pgpmail"
 	_ "github.com/emersion/go-smtp"
+	"github.com/mitchellh/go-homedir"
+	"github.com/pelletier/go-toml"
 	"github.com/roblillack/elma/backend"
 	"github.com/roblillack/elma/controllers"
 )
 
+type GmailConfig struct {
+	Email    string
+	Password string
+}
+type Config struct {
+	Gmail GmailConfig
+}
+
+func getBackend() backend.Backend {
+	home, err := homedir.Dir()
+	if err != nil {
+		panic(err)
+	}
+	config, err := toml.LoadFile(path.Join(home, ".elmarc"))
+	if err != nil && !os.IsNotExist(err) {
+		panic(err)
+	}
+
+	if err != nil {
+		return backend.NewFakeBackend()
+	}
+
+	if email := config.Get("gmail.email").(string); email != "" {
+		if pw := config.Get("gmail.password").(string); pw != "" {
+			return backend.NewGmailBackendWithPassword(email, pw)
+		}
+		return backend.NewGmailBackend(email)
+
+	}
+
+	return backend.NewFakeBackend()
+}
+
 func main() {
 	app := &controllers.Application{
-		Backend: backend.NewGmailBackend("rob@lillack.net"),
-		//Backend: backend.NewFakeBackend(),
+		Backend: getBackend(),
 	}
 
 	if err := app.Run(); err != nil {
