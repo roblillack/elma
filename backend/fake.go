@@ -1,6 +1,9 @@
 package backend
 
 import (
+	"math/rand"
+	"time"
+
 	"github.com/roblillack/elma/backend/mock"
 	"github.com/roblillack/elma/events"
 	"github.com/roblillack/elma/models"
@@ -17,7 +20,7 @@ var _ events.EventPublisher = &FakeBackend{}
 func NewFakeBackend() *FakeBackend {
 	msgs := []*models.Message{}
 	for i := 0; i < 10; i++ {
-		msgs = append(msgs, models.RandomMessage())
+		msgs = append(msgs, mock.RandomMessage())
 	}
 
 	return &FakeBackend{msgs, nil}
