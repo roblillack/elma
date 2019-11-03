@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 
 	"github.com/roblillack/elma/events"
@@ -18,7 +19,8 @@ type InboxController struct {
 	InfoBar          *tview.TextView
 	MessageList      *views.MessageList
 	Messages         []*models.Message
-	ScheduledActions []models.Action
+	OriginalStatus   map[int]Status
+	ScheduledActions []models.MessageStatus
 	flexLayout       *tview.Flex
 }
 
@@ -72,9 +74,26 @@ func (a *InboxController) createLayout() {
 		AddItem(a.MessageList, 0, 1, true).
 		AddItem(a.InfoBar, 1, 1, false)
 }
+func (c *InboxController) unscheduleActions(msg *models.Message) {
+	newList := []models.Action{}
+	for _, i := range c.ScheduledActions {
+		if i.Message != msg {
+			newList = append(newList, i)
+		}
+	}
+	c.ScheduledActions = newList
+}
 
-func (a *InboxController) ScheduleAction(t models.ActionType, msg *models.Message) {
-	a.ScheduledActions = append(a.ScheduledActions, models.Action{Type: t, Message: msg})
+func (c *InboxController) ScheduleAction(t models.ActionType, msg *models.Message) {
+	c.unscheduleActions(msg)
+
+	origStatus, haveChanges := c.OriginalStatus[msg]
+	if haveChanges && msg.Status == origStatus {
+		delete(c.OriginalStatus, msg)
+	}
+
+	// if !t.ApplicableTo()
+	c.ScheduledActions = append(c.ScheduledActions, models.Action{Type: t, Message: msg})
 }
 
 func (a *InboxController) UpdateActionBar(msg *models.Message) {
@@ -118,6 +137,10 @@ func (a *InboxController) UpdateActionBar(msg *models.Message) {
 func (c *InboxController) UpdateInfoBar(msg *models.Message, idx int) {
 	c.InfoBar.Clear()
 	fmt.Fprintf(c.InfoBar, "Message %d/%d, %d scheduled actions", idx, len(c.Messages), len(c.ScheduledActions))
+
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	fmt.Fprintf(c.InfoBar, ", RAM usage: %.02f MiB", float64(m.Alloc)/1024/1024)
 }
 
 func (c *InboxController) handleKeyEvent(event *tcell.EventKey) *tcell.EventKey {
@@ -125,6 +148,9 @@ func (c *InboxController) handleKeyEvent(event *tcell.EventKey) *tcell.EventKey 
 	r := event.Rune()
 
 	msg, idx := c.MessageList.SelectedMessage()
+	if _, haveChanges := c.OriginalStatus[msg]; !haveChanges {
+		c.OriginalStatus[msg] = msg.Status
+	}
 
 	if key == tcell.KeyBackspace || key == tcell.KeyBackspace2 || key == tcell.KeyBS || key == tcell.KeyDEL || key == tcell.KeyDelete || r == 'd' || r == 'D' {
 		msg.Status = models.StatusDeleted

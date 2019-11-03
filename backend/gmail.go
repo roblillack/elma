@@ -10,11 +10,6 @@ import (
 	"strconv"
 	"syscall"
 
-	"github.com/gdamore/tcell"
-	"github.com/rivo/tview"
-
-	"github.com/roblillack/elma/events"
-
 	imap "github.com/emersion/go-imap"
 	compress "github.com/emersion/go-imap-compress"
 	enable "github.com/emersion/go-imap-enable"
@@ -22,8 +17,12 @@ import (
 	"github.com/emersion/go-imap/client"
 	oauthdialog "github.com/emersion/go-oauthdialog"
 	sasl "github.com/emersion/go-sasl"
-	"github.com/roblillack/elma/models"
+	"github.com/gdamore/tcell"
+	"github.com/rivo/tview"
 	"golang.org/x/oauth2"
+
+	"github.com/roblillack/elma/events"
+	"github.com/roblillack/elma/models"
 )
 
 type GmailBackend struct {

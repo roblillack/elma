@@ -16,8 +16,8 @@ var _ events.EventPublisher = &FakeBackend{}
 
 func NewFakeBackend() *FakeBackend {
 	msgs := []*models.Message{}
-	for i := 0; i < 10; i++ {
-		msgs = append(msgs, models.RandomMessage())
+	for i := 0; i < 1000; i++ {
+		msgs = append(msgs, mock.RandomMessage())
 	}
 
 	return &FakeBackend{msgs, nil}
@@ -44,7 +44,7 @@ func (b *FakeBackend) Subscribe() (<-chan events.Event, error) {
 
 	go func() {
 		for {
-			time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
+			// time.Sleep(time.Duration(rand.Intn(10)) * time.Millisecond)
 			m := mock.RandomMessage()
 			m.Status = models.StatusNew
 			b.events <- events.NewMessage{Message: m}
