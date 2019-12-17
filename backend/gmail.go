@@ -4,17 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os/exec"
-	"reflect"
-	"regexp"
 	"strconv"
-	"syscall"
+	"reflect"
 
 	"github.com/gdamore/tcell"
 	"github.com/rivo/tview"
-
 	"github.com/roblillack/elma/events"
-
+	"github.com/roblillack/elma/internal/credentials"
 	imap "github.com/emersion/go-imap"
 	compress "github.com/emersion/go-imap-compress"
 	enable "github.com/emersion/go-imap-enable"
@@ -62,44 +58,6 @@ func NewGmailBackend(email string) *GmailBackend {
 	}
 }
 
-func getFromKeyChain(service, username string) (string, error) {
-	ErrNotFound := errors.New("Password not found")
-	pwRe := regexp.MustCompile(`password:\s+(?:0x[A-Fa-f0-9]+\s+)?"(.+)"`)
-	escapeCodeRegexp := regexp.MustCompile(`\\([0-3][0-7]{2})`)
-
-	unescapeOne := func(code []byte) []byte {
-		i, _ := strconv.ParseUint(string(code[1:]), 8, 8)
-		return []byte{byte(i)}
-	}
-
-	unescape := func(raw string) string {
-		if !escapeCodeRegexp.MatchString(raw) {
-			return raw
-		} else {
-			return string(escapeCodeRegexp.ReplaceAllFunc([]byte(raw), unescapeOne))
-		}
-	}
-
-	args := []string{"find-internet-password", "-s", service, "-a", username, "-g"}
-	c := exec.Command("/usr/bin/security", args...)
-	o, err := c.CombinedOutput()
-	if err != nil {
-		exitCode := -1
-		if c.ProcessState != nil && c.ProcessState.Sys() != nil {
-			exitCode = c.ProcessState.Sys().(syscall.WaitStatus).ExitStatus()
-		}
-		// check particular exit code
-		if exitCode == 44 {
-			return "", ErrNotFound
-		}
-		return "", fmt.Errorf("/usr/bin/security: %s", err)
-	}
-	matches := pwRe.FindStringSubmatch(string(o))
-	if len(matches) != 2 {
-		return "", ErrNotFound
-	}
-	return unescape(matches[1]), nil
-}
 
 func authenticate(c *client.Client, cfg *oauth2.Config, username string) error {
 	if ok, err := c.SupportAuth(sasl.Xoauth2); err != nil {
@@ -127,7 +85,7 @@ func authenticate(c *client.Client, cfg *oauth2.Config, username string) error {
 }
 
 func (b *GmailBackend) Initialize() error {
-	pw, err := getFromKeyChain("www.google.com", b.Email)
+	pw, err := credentials.Get("www.google.com", b.Email)
 	if err != nil {
 		log.Println(err)
 		ok := false

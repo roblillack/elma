@@ -5,6 +5,7 @@ import (
 
 	_ "github.com/emersion/go-pgpmail"
 	_ "github.com/emersion/go-smtp"
+
 	"github.com/roblillack/elma/backend"
 	"github.com/roblillack/elma/controllers"
 )
