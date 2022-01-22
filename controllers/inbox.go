@@ -126,6 +126,7 @@ func (c *InboxController) handleKeyEvent(event *tcell.EventKey) *tcell.EventKey 
 
 	msg, idx := c.MessageList.SelectedMessage()
 
+	// TODO: '#' too?
 	if key == tcell.KeyBackspace || key == tcell.KeyBackspace2 || key == tcell.KeyBS || key == tcell.KeyDEL || key == tcell.KeyDelete || r == 'd' || r == 'D' {
 		msg.Status = models.StatusDeleted
 		c.MessageList.UpdateMessage(idx, msg)
