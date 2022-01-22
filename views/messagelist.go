@@ -53,9 +53,9 @@ func (l *MessageList) updateCells(startRow, stopRow int) {
 		}
 		l.Table.SetCell(idx, 0, tview.NewTableCell(msg.FlagString()).SetMaxWidth(3).SetTextColor(fg))
 		l.Table.SetCell(idx, 1, tview.NewTableCell(msg.Sent.Format("[Jan 02 15:04]")).SetTextColor(fg))
-		l.Table.SetCell(idx, 2, tview.NewTableCell(fmt.Sprintf("%-20s", msg.Sender)).SetMaxWidth(21).SetTextColor(fg))
+		l.Table.SetCell(idx, 2, tview.NewTableCell(tview.Escape(fmt.Sprintf("%-20s", msg.Sender))).SetMaxWidth(21).SetTextColor(fg))
 		l.Table.SetCell(idx, 3, tview.NewTableCell(formatters.FormatSize(msg.Size)).SetMaxWidth(5).SetTextColor(fg))
-		l.Table.SetCell(idx, 4, tview.NewTableCell(msg.Subject).SetTextColor(fg))
+		l.Table.SetCell(idx, 4, tview.NewTableCell(tview.Escape(msg.Subject)).SetTextColor(fg))
 	}
 
 }

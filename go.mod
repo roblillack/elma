@@ -14,10 +14,12 @@ require (
 	github.com/emersion/go-textwrapper v0.0.0-20160606182133-d0e65e56babe // indirect
 	github.com/gdamore/tcell v1.1.1
 	github.com/golang/protobuf v1.0.0 // indirect
+	github.com/lucasb-eyer/go-colorful v0.0.0-20181028223441-12d3b2882a08
+	github.com/mattn/go-runewidth v0.0.4
 	github.com/mitchellh/go-homedir v1.1.0
 	github.com/pelletier/go-toml v1.6.0
 	github.com/rivo/tview v0.0.0-20190406182340-90b4da1bd64c
-	github.com/rivo/uniseg v0.0.0-20190313204849-f699dde9c340 // indirect
+	github.com/rivo/uniseg v0.0.0-20190313204849-f699dde9c340
 	github.com/skratchdot/open-golang v0.0.0-20160302144031-75fb7ed4208c // indirect
 	github.com/smartystreets/goconvey v0.0.0-20190330032615-68dc04aab96a // indirect
 	golang.org/x/oauth2 v0.0.0-20180207181906-543e37812f10
