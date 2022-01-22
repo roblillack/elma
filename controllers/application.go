@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/gdamore/tcell"
@@ -94,11 +95,17 @@ func (a *Application) Run() error {
 		return fmt.Errorf("no application backend set up")
 	}
 
+	log.Println("Initializing backend ...")
+
 	if err := a.Backend.Initialize(); err != nil {
 		return err
 	}
 
+	log.Println("Starting app ...")
+
 	a.View = tview.NewApplication()
+
+	log.Println("Subscribing to events ...")
 
 	if publisher, ok := a.Backend.(events.EventPublisher); ok {
 		c, err := publisher.Subscribe()

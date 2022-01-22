@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/roblillack/elma/events"
@@ -26,6 +27,7 @@ var _ Controller = &InboxController{}
 var _ events.EventListener = &InboxController{}
 
 func NewInbox(app *Application) (*InboxController, error) {
+	log.Println("Loading inbox ...")
 	msgs, err := app.Backend.LoadInbox()
 	if err != nil {
 		return nil, err

@@ -218,7 +218,12 @@ func (b *GmailBackend) selectMailbox(name string) (*imap.MailboxStatus, error) {
 		return s, nil
 	}
 
-	return b.Client.Select(name, false)
+	st, err := b.Client.Select(name, false)
+	if err != nil {
+		return nil, fmt.Errorf("unable to select mailbox: %w", err)
+	}
+
+	return st, nil
 }
 
 func flagsContains(flags []string, what string) bool {
