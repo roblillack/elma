@@ -1,4 +1,4 @@
-# ELMA – Eectronic mail agent
+# ELMA – Electronic mail agent
 
 ## Keybindings
 
