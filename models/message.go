@@ -27,6 +27,7 @@ type Message struct {
 	Answered  bool
 	Forwarded bool
 	Status    MessageStatus
+	Labels    []string
 }
 
 func (m *Message) FlagString() string {

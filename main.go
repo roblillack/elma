@@ -9,6 +9,7 @@ import (
 	_ "github.com/emersion/go-smtp"
 	"github.com/mitchellh/go-homedir"
 	"github.com/pelletier/go-toml"
+
 	"github.com/roblillack/elma/backend"
 	"github.com/roblillack/elma/controllers"
 )
@@ -35,11 +36,11 @@ func getBackend() backend.Backend {
 		return backend.NewFakeBackend()
 	}
 
-	if email := config.Get("gmail.email").(string); email != "" {
-		if pw := config.Get("gmail.password").(string); pw != "" {
-			return backend.NewGmailBackendWithPassword(email, pw)
+	if email := config.Get("gmail.email"); email != nil {
+		if pw := config.Get("gmail.password"); pw != nil {
+			return backend.NewGmailBackendWithPassword(email.(string), pw.(string))
 		}
-		return backend.NewGmailBackend(email)
+		return backend.NewGmailBackend(email.(string))
 
 	}
 

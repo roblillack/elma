@@ -10,11 +10,6 @@ import (
 	"strconv"
 	"syscall"
 
-	"github.com/gdamore/tcell"
-	"github.com/rivo/tview"
-
-	"github.com/roblillack/elma/events"
-
 	imap "github.com/emersion/go-imap"
 	compress "github.com/emersion/go-imap-compress"
 	enable "github.com/emersion/go-imap-enable"
@@ -22,10 +17,15 @@ import (
 	"github.com/emersion/go-imap/client"
 	oauthdialog "github.com/emersion/go-oauthdialog"
 	sasl "github.com/emersion/go-sasl"
-	"github.com/roblillack/elma/models"
+	"github.com/gdamore/tcell"
+	"github.com/rivo/tview"
 	"golang.org/x/oauth2"
+
+	"github.com/roblillack/elma/events"
+	"github.com/roblillack/elma/models"
 )
 
+// https://developers.google.com/gmail/imap/imap-smtp
 type GmailBackend struct {
 	Email    string
 	Password string
@@ -36,7 +36,18 @@ type GmailBackend struct {
 	inbox       map[models.MessageID]*models.Message
 }
 
-var GmailMessageID imap.FetchItem = `X-GM-MSGID`
+const GmailMessageID imap.FetchItem = `X-GM-MSGID`
+const GmailLabelsAttribute imap.FetchItem = `X-GM-LABELS`
+
+func getMessageLabels(msg *imap.Message) ([]string, bool) {
+	raw, haveMsgID := msg.Items[GmailLabelsAttribute]
+	if !haveMsgID {
+		return nil, false
+	}
+
+	l, err := imap.ParseStringList(raw)
+	return l, err == nil
+}
 
 func getMessageID(msg *imap.Message) (models.MessageID, bool) {
 	raw, haveMsgID := msg.Items[GmailMessageID]
@@ -186,7 +197,7 @@ func (b *GmailBackend) Open() error {
 		return err
 	}
 
-	//authenticate(c, cfg, "rob@lillack.net")
+	// authenticate(c, cfg, b.Email)
 
 	b.Client = c
 
@@ -260,7 +271,7 @@ func (b *GmailBackend) LoadInbox() ([]*models.Message, error) {
 	messages := make(chan *imap.Message, 100000)
 	done := make(chan error, 1)
 	go func() {
-		done <- b.Client.Fetch(seqset, []imap.FetchItem{GmailMessageID, imap.FetchFlags, imap.FetchInternalDate, imap.FetchRFC822Size, imap.FetchEnvelope}, messages)
+		done <- b.Client.Fetch(seqset, []imap.FetchItem{GmailMessageID, GmailLabelsAttribute, imap.FetchFlags, imap.FetchInternalDate, imap.FetchRFC822Size, imap.FetchEnvelope}, messages)
 	}()
 
 	b.inbox = map[models.MessageID]*models.Message{}
@@ -284,7 +295,7 @@ func (b *GmailBackend) loadMessages(seqSet *imap.SeqSet) ([]*models.Message, err
 	messages := make(chan *imap.Message, 10000)
 	done := make(chan error, 1)
 	go func() {
-		done <- b.Client.Fetch(seqSet, []imap.FetchItem{GmailMessageID, imap.FetchFlags, imap.FetchInternalDate, imap.FetchRFC822Size, imap.FetchEnvelope}, messages)
+		done <- b.Client.Fetch(seqSet, []imap.FetchItem{GmailMessageID, GmailLabelsAttribute, imap.FetchFlags, imap.FetchInternalDate, imap.FetchRFC822Size, imap.FetchEnvelope}, messages)
 	}()
 
 	list := []*models.Message{}
@@ -352,6 +363,7 @@ func (b *GmailBackend) buildMessage(msg *imap.Message) *models.Message {
 		st = models.StatusNew
 	}
 
+	labels, _ := getMessageLabels(msg)
 	return &models.Message{
 		ID:       msgID,
 		Sender:   msg.Envelope.From[0].PersonalName,
@@ -361,6 +373,7 @@ func (b *GmailBackend) buildMessage(msg *imap.Message) *models.Message {
 		Answered: isAnswered(msg.Flags),
 		Status:   st,
 		Subject:  msg.Envelope.Subject,
+		Labels:   labels,
 	}
 }
 

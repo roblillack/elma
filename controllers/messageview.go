@@ -5,6 +5,7 @@ import (
 
 	"github.com/gdamore/tcell"
 	"github.com/rivo/tview"
+
 	"github.com/roblillack/elma/models"
 )
 
