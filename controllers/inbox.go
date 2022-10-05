@@ -22,6 +22,7 @@ type InboxController struct {
 	Messages         []*models.Message
 	ScheduledActions []models.Action
 	flexLayout       *tview.Flex
+	eventCount       int
 }
 
 var _ Controller = &InboxController{}
@@ -29,13 +30,15 @@ var _ events.EventListener = &InboxController{}
 
 func NewInbox(app *Application) (*InboxController, error) {
 	log.Println("Loading inbox ...")
-	msgs, err := app.Backend.LoadInbox()
+	msgs, events, err := app.Backend.LoadInbox()
 	if err != nil {
 		return nil, err
 	}
 
 	inbox := &InboxController{App: app, Messages: msgs}
 	inbox.createLayout()
+
+	go app.processEvents(app.Backend, events)
 
 	return inbox, nil
 }
@@ -120,7 +123,7 @@ func (a *InboxController) UpdateActionBar(msg *models.Message) {
 
 func (c *InboxController) UpdateInfoBar(msg *models.Message, idx int) {
 	c.InfoBar.Clear()
-	fmt.Fprintf(c.InfoBar, "Message %d/%d, %d scheduled actions", idx, len(c.Messages), len(c.ScheduledActions))
+	fmt.Fprintf(c.InfoBar, "Message %d/%d, %d scheduled actions, got %d events", idx+1, len(c.Messages), len(c.ScheduledActions), c.eventCount)
 }
 
 func (c *InboxController) handleKeyEvent(event *tcell.EventKey) *tcell.EventKey {
@@ -249,7 +252,25 @@ func (a *InboxController) View() tview.Primitive {
 }
 
 func (c *InboxController) HandleEvent(evt events.Event) {
+	c.eventCount++
+
+	_, idx := c.MessageList.SelectedMessage()
+	// c.UpdateInfoBar(msg, idx)
+
 	switch e := evt.(type) {
+	case events.MessageFlagsChanged:
+		c.MessageList.SetMessages(c.Messages)
+		c.MessageList.Select(idx)
+	case events.MessageDeleted:
+		list := []*models.Message{}
+		for _, msg := range c.Messages {
+			if e.Message.ID != msg.ID {
+				list = append(list, msg)
+			}
+		}
+		c.Messages = list
+		c.MessageList.SetMessages(c.Messages)
+		c.MessageList.Select(idx)
 	case events.NewMessage:
 		_, idx := c.MessageList.SelectedMessage()
 		c.Messages = append(c.Messages, e.Message)

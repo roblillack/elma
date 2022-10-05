@@ -50,6 +50,7 @@ func getBackend() backend.Backend {
 func main() {
 	app := &controllers.Application{
 		Backend: getBackend(),
+		// Backend: backend.NewFakeBackend(),
 	}
 
 	if err := app.Run(); err != nil {

@@ -27,7 +27,7 @@ type Message struct {
 	Answered  bool
 	Forwarded bool
 	Status    MessageStatus
-	Labels    []string
+	Labels    []string // TODO: Remove this, as they don't get updated in IDLE mode?
 	// IMAP protocol specific stuff
 	UID        uint32
 	SequenceID uint32

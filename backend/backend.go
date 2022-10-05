@@ -3,6 +3,7 @@ package backend
 import (
 	"errors"
 
+	"github.com/roblillack/elma/events"
 	"github.com/roblillack/elma/models"
 )
 
@@ -12,7 +13,7 @@ type Backend interface {
 	Initialize() error
 	Open() error
 	Close() error
-	LoadInbox() ([]*models.Message, error)
+	LoadInbox() ([]*models.Message, chan events.Event, error)
 
 	ArchiveMessage(*models.Message) error
 	DeleteMessage(*models.Message) error

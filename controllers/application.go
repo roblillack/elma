@@ -95,26 +95,15 @@ func (a *Application) Run() error {
 		return fmt.Errorf("no application backend set up")
 	}
 
-	log.Println("Initializing backend ...")
+	log.Println("Application.Run: Initializing backend ...")
 
 	if err := a.Backend.Initialize(); err != nil {
 		return err
 	}
 
-	log.Println("Starting app ...")
+	log.Println("Application.Run: Starting app ...")
 
 	a.View = tview.NewApplication()
-
-	log.Println("Subscribing to events ...")
-
-	if publisher, ok := a.Backend.(events.EventPublisher); ok {
-		// TODO: We cannot subscribe here, when we're still trying to submit commands to the server ...
-		c, err := publisher.Subscribe()
-		if err != nil {
-			return err
-		}
-		go a.processEvents(a.Backend, c)
-	}
 
 	tview.Styles.PrimitiveBackgroundColor = tcell.ColorWhite
 	tview.Styles.ContrastBackgroundColor = tcell.ColorDarkRed
@@ -134,6 +123,7 @@ func (a *Application) Run() error {
 		return event
 	})
 
+	log.Println("Application.Run: Loading inbox ...")
 	if err := a.GotoInbox(); err != nil {
 		return err
 	}

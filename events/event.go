@@ -19,3 +19,11 @@ type EventPublisher interface {
 type NewMessage struct {
 	Message *models.Message
 }
+
+type MessageDeleted struct {
+	Message *models.Message
+}
+
+type MessageFlagsChanged struct {
+	Message *models.Message
+}
