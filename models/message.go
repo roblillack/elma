@@ -28,6 +28,9 @@ type Message struct {
 	Forwarded bool
 	Status    MessageStatus
 	Labels    []string
+	// IMAP protocol specific stuff
+	UID        uint32
+	SequenceID uint32
 }
 
 func (m *Message) FlagString() string {

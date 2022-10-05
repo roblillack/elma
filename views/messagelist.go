@@ -2,6 +2,8 @@ package views
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 
 	tcell "github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -34,7 +36,9 @@ func (l *MessageList) Select(index int) *MessageList {
 
 func (l *MessageList) SetMessages(messages []*models.Message) *MessageList {
 	l.messages = append([]*models.Message{}, messages...)
-
+	sort.Slice(l.messages, func(i, j int) bool {
+		return l.messages[i].Sent.Before(l.messages[j].Sent)
+	})
 	l.Table.Clear()
 	l.updateCells(0, len(messages))
 
@@ -56,7 +60,8 @@ func (l *MessageList) updateCells(startRow, stopRow int) {
 		l.Table.SetCell(idx, 1, tview.NewTableCell(msg.Sent.Format("[Jan 02 15:04]")).SetTextColor(fg))
 		l.Table.SetCell(idx, 2, tview.NewTableCell(tview.Escape(fmt.Sprintf("%-20s", msg.Sender))).SetMaxWidth(21).SetTextColor(fg))
 		l.Table.SetCell(idx, 3, tview.NewTableCell(formatters.FormatSize(msg.Size)).SetMaxWidth(5).SetTextColor(fg))
-		l.Table.SetCell(idx, 4, tview.NewTableCell(tview.Escape(msg.Subject)).SetTextColor(fg))
+		txt := fmt.Sprintf("%d %s %s", msg.UID, strings.Join(msg.Labels, "+"), msg.Subject)
+		l.Table.SetCell(idx, 4, tview.NewTableCell(tview.Escape(txt)).SetTextColor(fg))
 		// TODO: Add msg.Labels floating in from the right
 	}
 

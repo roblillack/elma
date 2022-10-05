@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log"
@@ -28,11 +29,17 @@ type GmailBackend struct {
 
 	eventQueue  chan events.Event
 	idleChannel chan error
+	stopIdling  chan struct{}
 	inbox       map[models.MessageID]*models.Message
+
+	archiveName string
+	trashName   string
 }
 
 const GmailMessageID imap.FetchItem = `X-GM-MSGID`
 const GmailLabelsAttribute imap.FetchItem = `X-GM-LABELS`
+const defaultArchiveLabelName string = "[Gmail]/All Mail"
+const defaultTrashLabelName string = "[Gmail]/Trash"
 
 func getMessageLabels(msg *imap.Message) ([]string, bool) {
 	raw, haveMsgID := msg.Items[GmailLabelsAttribute]
@@ -199,6 +206,46 @@ func (b *GmailBackend) Open() error {
 
 	b.Client = c
 
+	if err := b.determineSpecialFolders(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (b *GmailBackend) determineSpecialFolders() error {
+	b.archiveName = defaultArchiveLabelName
+	b.trashName = defaultTrashLabelName
+
+	all := []*imap.MailboxInfo{}
+	ch := make(chan *imap.MailboxInfo)
+
+	go func() {
+		for i := range ch {
+			all = append(all, i)
+		}
+	}()
+
+	if err := b.Client.List("", "*", ch); err != nil {
+		return err
+	}
+
+	for _, folder := range all {
+		for _, attr := range folder.Attributes {
+			if attr == `\All` {
+				b.archiveName = folder.Name
+			} else if attr == `\Trash` {
+				b.trashName = folder.Name
+			}
+		}
+	}
+
+	if ok, err := b.Client.Support("MOVE"); err != nil {
+		return err
+	} else {
+		log.Printf("MOVE extension supported: %v\n", ok)
+	}
+
 	return nil
 }
 
@@ -262,23 +309,21 @@ func (b *GmailBackend) LoadInbox() ([]*models.Message, error) {
 		return nil, err
 	}
 	seqset := &imap.SeqSet{Set: []imap.Seq{{Start: uint32(1), Stop: mbox.Messages}}}
-	if err != nil {
-		log.Println(err)
-	}
 
 	messages := make(chan *imap.Message, 100000)
 	done := make(chan error, 1)
 	go func() {
-		done <- b.Client.Fetch(seqset, []imap.FetchItem{GmailMessageID, GmailLabelsAttribute, imap.FetchFlags, imap.FetchInternalDate, imap.FetchRFC822Size, imap.FetchEnvelope}, messages)
+		done <- b.Client.Fetch(seqset, []imap.FetchItem{GmailMessageID, GmailLabelsAttribute, imap.FetchFlags, imap.FetchInternalDate, imap.FetchRFC822Size, imap.FetchEnvelope, imap.FetchUid}, messages)
 	}()
 
 	b.inbox = map[models.MessageID]*models.Message{}
 	list := []*models.Message{}
 	for i := range messages {
 		msg := b.buildMessage(i)
-		if msgID, ok := getMessageID(i); ok {
-			b.inbox[msgID] = msg
+		if msg == nil {
+			continue
 		}
+		b.inbox[msg.ID] = msg
 		list = append(list, msg)
 	}
 
@@ -293,7 +338,7 @@ func (b *GmailBackend) loadMessages(seqSet *imap.SeqSet) ([]*models.Message, err
 	messages := make(chan *imap.Message, 10000)
 	done := make(chan error, 1)
 	go func() {
-		done <- b.Client.Fetch(seqSet, []imap.FetchItem{GmailMessageID, GmailLabelsAttribute, imap.FetchFlags, imap.FetchInternalDate, imap.FetchRFC822Size, imap.FetchEnvelope}, messages)
+		done <- b.Client.Fetch(seqSet, []imap.FetchItem{GmailMessageID, GmailLabelsAttribute, imap.FetchFlags, imap.FetchInternalDate, imap.FetchRFC822Size, imap.FetchEnvelope, imap.FetchUid}, messages)
 	}()
 
 	list := []*models.Message{}
@@ -363,15 +408,17 @@ func (b *GmailBackend) buildMessage(msg *imap.Message) *models.Message {
 
 	labels, _ := getMessageLabels(msg)
 	return &models.Message{
-		ID:       msgID,
-		Sender:   msg.Envelope.From[0].PersonalName,
-		Sent:     msg.Envelope.Date,
-		Size:     int(msg.Size),
-		Starred:  isStarred(msg.Flags),
-		Answered: isAnswered(msg.Flags),
-		Status:   st,
-		Subject:  msg.Envelope.Subject,
-		Labels:   labels,
+		ID:         msgID,
+		Sender:     msg.Envelope.From[0].PersonalName,
+		Sent:       msg.Envelope.Date,
+		Size:       int(msg.Size),
+		Starred:    isStarred(msg.Flags),
+		Answered:   isAnswered(msg.Flags),
+		Status:     st,
+		Subject:    msg.Envelope.Subject,
+		Labels:     labels,
+		SequenceID: msg.SeqNum,
+		UID:        msg.Uid,
 	}
 }
 
@@ -389,8 +436,9 @@ func (b *GmailBackend) Subscribe() (<-chan events.Event, error) {
 	b.Client.Updates = updates
 
 	b.idleChannel = make(chan error, 1)
+	b.stopIdling = make(chan struct{})
 	go func() {
-		b.idleChannel <- b.Client.Idle(nil, nil)
+		b.idleChannel <- b.Client.Idle(b.stopIdling, nil)
 		// b.idleChannel <- idleClient.IdleWithFallback(nil, 0)
 	}()
 
@@ -408,6 +456,8 @@ func (b *GmailBackend) Subscribe() (<-chan events.Event, error) {
 					log.Fatal(err)
 				}
 				log.Println("Not idling anymore")
+				b.stopIdling = nil
+
 				return
 			}
 		}
@@ -511,11 +561,37 @@ func (b *GmailBackend) Unsubscribe() error {
 	return nil
 }
 
-func (b *GmailBackend) ArchiveMessage(id models.MessageID) error {
+func formatLabelList(list []string) (fields []interface{}) {
+	fields = make([]interface{}, len(list))
+	for i, v := range list {
+		fields[i] = bytes.NewBufferString(v)
+	}
+	return
+}
+
+func (b *GmailBackend) DeleteMessage(msg *models.Message) error {
+	return b.Client.UidMove(&imap.SeqSet{Set: []imap.Seq{{Start: msg.UID, Stop: msg.UID}}}, b.trashName)
+}
+
+func (b *GmailBackend) ArchiveMessage(msg *models.Message) error {
+	// newLabels := []string{}
+	// for _, i := range msg.Labels {
+	// 	if i == b.archiveName {
+	// 		continue
+	// 	}
+	// 	newLabels = append(newLabels, i)
+	// }
+	// newLabels = append(newLabels, b.archiveName)
+	// log.Printf("\n\nlabels: %s --> %s\n\n\n", strings.Join(msg.Labels, ", "), strings.Join(newLabels, ", "))
+	// time.Sleep(time.Second * 5)
+	// return b.Client.Store(&imap.SeqSet{Set: []imap.Seq{{Start: msg.SequenceID, Stop: msg.SequenceID}}},
+	// 	imap.StoreItem(GmailLabelsAttribute), formatStringList(newLabels), nil)
+	return b.Client.UidMove(&imap.SeqSet{Set: []imap.Seq{{Start: msg.UID, Stop: msg.UID}}}, b.archiveName)
+
 	crit := imap.NewSearchCriteria()
 	err := crit.ParseWithCharset([]interface{}{
 		string(GmailMessageID),
-		fmt.Sprintf("%d", id),
+		fmt.Sprintf("%d", msg.ID),
 	}, nil)
 	if err != nil {
 		return err
@@ -525,10 +601,10 @@ func (b *GmailBackend) ArchiveMessage(id models.MessageID) error {
 		return err
 	}
 	if len(uids) > 1 {
-		return fmt.Errorf("More than one UID returned for Message ID: %d", id)
+		return fmt.Errorf("More than one UID returned for Message ID: %d", msg.ID)
 	}
 	if len(uids) < 1 {
-		return fmt.Errorf("Message not found: %d", id)
+		return fmt.Errorf("Message not found: %d", msg.ID)
 	}
 	log.Printf("Have seq ID: %d\n", uids[0])
 	return b.Client.Store(&imap.SeqSet{Set: []imap.Seq{{Start: uids[0], Stop: uids[0]}}},

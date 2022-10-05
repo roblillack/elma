@@ -61,6 +61,10 @@ func (b *FakeBackend) Unsubscribe() error {
 	return nil
 }
 
-func (b *FakeBackend) ArchiveMessage(id models.MessageID) error {
+func (b *FakeBackend) ArchiveMessage(*models.Message) error {
+	return nil
+}
+
+func (b *FakeBackend) DeleteMessage(*models.Message) error {
 	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	tcell "github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -189,12 +190,20 @@ func (c *InboxController) handleKeyEvent(event *tcell.EventKey) *tcell.EventKey 
 	if r == '$' {
 		msgs := make([]*models.Message, 0, len(c.Messages))
 
-		// TODO: Execute DELETEs
 		actionErrors := map[models.MessageID]error{}
 		for _, i := range c.ScheduledActions {
-			if i.Type == models.TypeArchive {
-				if err := c.App.Backend.ArchiveMessage(i.Message.ID); err != nil {
+			switch i.Type {
+			case models.TypeArchive:
+				if err := c.App.Backend.ArchiveMessage(i.Message); err != nil {
 					log.Printf("Unable to archive msg %d: %s", i.Message.ID, err)
+					time.Sleep(time.Second)
+					actionErrors[i.Message.ID] = err
+				}
+
+			case models.TypeDelete:
+				if err := c.App.Backend.DeleteMessage(i.Message); err != nil {
+					log.Printf("Unable to delete msg %d: %s", i.Message.ID, err)
+					time.Sleep(time.Second)
 					actionErrors[i.Message.ID] = err
 				}
 			}
