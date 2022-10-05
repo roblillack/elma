@@ -7,4 +7,5 @@ type Backend interface {
 	Open() error
 	Close() error
 	LoadInbox() ([]*models.Message, error)
+	ArchiveMessage(models.MessageID) error
 }

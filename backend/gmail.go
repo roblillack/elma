@@ -12,14 +12,9 @@ import (
 
 	imap "github.com/emersion/go-imap"
 	compress "github.com/emersion/go-imap-compress"
-	enable "github.com/emersion/go-imap-enable"
-	idle "github.com/emersion/go-imap-idle"
 	"github.com/emersion/go-imap/client"
-	oauthdialog "github.com/emersion/go-oauthdialog"
-	sasl "github.com/emersion/go-sasl"
-	"github.com/gdamore/tcell"
+	tcell "github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
-	"golang.org/x/oauth2"
 
 	"github.com/roblillack/elma/events"
 	"github.com/roblillack/elma/models"
@@ -119,30 +114,30 @@ func getFromKeyChain(service, username string) (string, error) {
 	return unescape(matches[1]), nil
 }
 
-func authenticate(c *client.Client, cfg *oauth2.Config, username string) error {
-	if ok, err := c.SupportAuth(sasl.Xoauth2); err != nil {
-		return err
-	} else if !ok {
-		return errors.New("XOAUTH2 not supported by the server")
-	}
+// func authenticate(c *client.Client, cfg *oauth2.Config, username string) error {
+// 	if ok, err := c.SupportAuth(sasl.auth2); err != nil {
+// 		return err
+// 	} else if !ok {
+// 		return errors.New("XOAUTH2 not supported by the server")
+// 	}
 
-	// Ask for the user to login with his Google account
-	code, err := oauthdialog.Open(cfg)
-	if err != nil {
-		return err
-	}
+// 	// Ask for the user to login with his Google account
+// 	code, err := oauthdialog.Open(cfg)
+// 	if err != nil {
+// 		return err
+// 	}
 
-	// Get a token from the returned code
-	// This token can be saved in a secure store to be reused later
-	token, err := cfg.Exchange(oauth2.NoContext, code)
-	if err != nil {
-		return err
-	}
+// 	// Get a token from the returned code
+// 	// This token can be saved in a secure store to be reused later
+// 	token, err := cfg.Exchange(oauth2.NoContext, code)
+// 	if err != nil {
+// 		return err
+// 	}
 
-	// Login to the IMAP server with XOAUTH2
-	saslClient := sasl.NewXoauth2Client(username, token.AccessToken)
-	return c.Authenticate(saslClient)
-}
+// 	// Login to the IMAP server with XOAUTH2
+// 	saslClient := sasl.NewXoauth2Client(username, token.AccessToken)
+// 	return c.Authenticate(saslClient)
+// }
 
 func (b *GmailBackend) Initialize() error {
 	if b.Password != "" {
@@ -178,9 +173,12 @@ func (b *GmailBackend) Open() error {
 		return err
 	}
 
-	if _, err := enable.NewClient(c).SupportEnable(); err != nil {
-		return err
-	}
+	// if ok, _ := c.Support("ENABLE"); !ok {
+
+	// }
+	// if _, err := enable.NewClient(c).SupportEnable(); err != nil {
+	// 	return err
+	// }
 
 	comp := compress.NewClient(c)
 	if ok, err := comp.SupportCompress(compress.Deflate); err != nil {
@@ -378,18 +376,22 @@ func (b *GmailBackend) buildMessage(msg *imap.Message) *models.Message {
 }
 
 func (b *GmailBackend) Subscribe() (<-chan events.Event, error) {
+	// TODO: Disabled for now
+	return b.eventQueue, nil
+
 	_, err := b.selectMailbox("INBOX")
 	if err != nil {
 		return nil, err
 	}
 
-	idleClient := idle.NewClient(b.Client)
+	// idleClient := idle.NewClient(b.Client)
 	updates := make(chan client.Update)
 	b.Client.Updates = updates
 
 	b.idleChannel = make(chan error, 1)
 	go func() {
-		b.idleChannel <- idleClient.IdleWithFallback(nil, 0)
+		b.idleChannel <- b.Client.Idle(nil, nil)
+		// b.idleChannel <- idleClient.IdleWithFallback(nil, 0)
 	}()
 
 	b.eventQueue = make(chan events.Event)
@@ -507,4 +509,29 @@ func (b *GmailBackend) Unsubscribe() error {
 	b.idleChannel <- nil
 
 	return nil
+}
+
+func (b *GmailBackend) ArchiveMessage(id models.MessageID) error {
+	crit := imap.NewSearchCriteria()
+	err := crit.ParseWithCharset([]interface{}{
+		string(GmailMessageID),
+		fmt.Sprintf("%d", id),
+	}, nil)
+	if err != nil {
+		return err
+	}
+	uids, err := b.Client.Search(crit)
+	if err != nil {
+		return err
+	}
+	if len(uids) > 1 {
+		return fmt.Errorf("More than one UID returned for Message ID: %d", id)
+	}
+	if len(uids) < 1 {
+		return fmt.Errorf("Message not found: %d", id)
+	}
+	log.Printf("Have seq ID: %d\n", uids[0])
+	return b.Client.Store(&imap.SeqSet{Set: []imap.Seq{{Start: uids[0], Stop: uids[0]}}},
+		imap.StoreItem(GmailLabelsAttribute),
+		"\\Archive", nil)
 }

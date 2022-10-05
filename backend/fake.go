@@ -60,3 +60,7 @@ func (b *FakeBackend) Subscribe() (<-chan events.Event, error) {
 func (b *FakeBackend) Unsubscribe() error {
 	return nil
 }
+
+func (b *FakeBackend) ArchiveMessage(id models.MessageID) error {
+	return nil
+}

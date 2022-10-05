@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/gdamore/tcell"
+	tcell "github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 
 	"github.com/roblillack/elma/backend"
@@ -108,6 +108,7 @@ func (a *Application) Run() error {
 	log.Println("Subscribing to events ...")
 
 	if publisher, ok := a.Backend.(events.EventPublisher); ok {
+		// TODO: We cannot subscribe here, when we're still trying to submit commands to the server ...
 		c, err := publisher.Subscribe()
 		if err != nil {
 			return err

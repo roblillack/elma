@@ -5,10 +5,10 @@ import (
 	"log"
 	"strings"
 
-	"github.com/roblillack/elma/events"
-
-	"github.com/gdamore/tcell"
+	tcell "github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+
+	"github.com/roblillack/elma/events"
 	"github.com/roblillack/elma/models"
 	"github.com/roblillack/elma/views"
 )
@@ -188,11 +188,26 @@ func (c *InboxController) handleKeyEvent(event *tcell.EventKey) *tcell.EventKey 
 
 	if r == '$' {
 		msgs := make([]*models.Message, 0, len(c.Messages))
+
+		// TODO: Execute DELETEs
+		actionErrors := map[models.MessageID]error{}
+		for _, i := range c.ScheduledActions {
+			if i.Type == models.TypeArchive {
+				if err := c.App.Backend.ArchiveMessage(i.Message.ID); err != nil {
+					log.Printf("Unable to archive msg %d: %s", i.Message.ID, err)
+					actionErrors[i.Message.ID] = err
+				}
+			}
+		}
+
 		msgCounter := 0
 		newSelectionIdx := -1
 		for _, i := range c.Messages {
 			keep := true
 			for _, act := range c.ScheduledActions {
+				if _, ok := actionErrors[act.Message.ID]; ok {
+					continue
+				}
 				if (act.Type == models.TypeArchive || act.Type == models.TypeDelete) && i == act.Message {
 					keep = false
 					break
