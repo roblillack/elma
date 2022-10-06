@@ -194,7 +194,6 @@ func (c *InboxController) handleKeyEvent(event *tcell.EventKey) *tcell.EventKey 
 		msgs := make([]*models.Message, 0, len(c.Messages))
 
 		actionErrors := map[models.MessageID]error{}
-		// c.App.Backend.PauseEvents()
 		for _, i := range c.ScheduledActions {
 			switch i.Type {
 			case models.TypeArchive:
@@ -212,7 +211,6 @@ func (c *InboxController) handleKeyEvent(event *tcell.EventKey) *tcell.EventKey 
 				}
 			}
 		}
-		// c.App.Backend.ResumeEvents()
 
 		msgCounter := 0
 		newSelectionIdx := -1

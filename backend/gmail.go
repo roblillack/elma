@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,6 +32,7 @@ type GmailBackend struct {
 	// updates    chan client.Update
 	// eventQueue chan events.Event
 	stopIdling chan struct{}
+	idleMutex  sync.Mutex
 	// inbox      map[models.MessageID]*models.Message
 
 	archiveName string
@@ -68,7 +70,8 @@ func getMessageID(msg *imap.Message) (models.MessageID, bool) {
 }
 
 var _ Backend = &GmailBackend{}
-var _ events.EventPublisher = &GmailBackend{}
+
+// var _ events.EventPublisher = &GmailBackend{}
 
 func NewGmailBackend(email string) *GmailBackend {
 	return &GmailBackend{
@@ -323,7 +326,7 @@ func (b *GmailBackend) LoadInbox() ([]*models.Message, chan events.Event, error)
 	seqset := &imap.SeqSet{Set: []imap.Seq{{Start: uint32(1), Stop: mbox.Messages}}}
 
 	messages := make(chan *imap.Message, 100000)
-	done := make(chan error, 1)
+	done := make(chan error)
 	go func() {
 		done <- b.Client.Fetch(seqset, []imap.FetchItem{GmailMessageID, GmailLabelsAttribute, imap.FetchFlags, imap.FetchInternalDate, imap.FetchRFC822Size, imap.FetchEnvelope, imap.FetchUid}, messages)
 	}()
@@ -364,6 +367,21 @@ func (b *GmailBackend) LoadInbox() ([]*models.Message, chan events.Event, error)
 				log.Printf("Status update: %+v\n", u.Status)
 			case *client.MailboxUpdate:
 				log.Printf("Mailbox update: %+v\n", u.Mailbox)
+				if newLen := int(u.Mailbox.Messages) - len(seqIDs); newLen > 0 {
+					log.Printf("-> %d new messages\n", newLen)
+					newMsgs, err := b.loadMessages(&imap.SeqSet{Set: []imap.Seq{{
+						Start: uint32(len(seqIDs) + 1),
+						Stop:  uint32(len(seqIDs) + newLen)}}})
+					if err != nil {
+						log.Printf("Unable to load missing messages: %s\n", err)
+					}
+					log.Printf("   loaded %d messages\n", len(newMsgs))
+					for _, i := range newMsgs {
+						seqIDs[i.SequenceID] = i
+						list = append(list, i)
+						eventQueue <- events.NewMessage{Message: i}
+					}
+				}
 			case *client.MessageUpdate:
 				log.Printf("Message update: %+v\n", u.Message)
 				msg := seqIDs[u.Message.SeqNum]
@@ -405,8 +423,10 @@ func (b *GmailBackend) LoadInbox() ([]*models.Message, chan events.Event, error)
 }
 
 func (b *GmailBackend) loadMessages(seqSet *imap.SeqSet) ([]*models.Message, error) {
+	idle := b.pauseIdle()
+
 	messages := make(chan *imap.Message, 10000)
-	done := make(chan error, 1)
+	done := make(chan error)
 	go func() {
 		done <- b.Client.Fetch(seqSet, []imap.FetchItem{GmailMessageID, GmailLabelsAttribute, imap.FetchFlags, imap.FetchInternalDate, imap.FetchRFC822Size, imap.FetchEnvelope, imap.FetchUid}, messages)
 	}()
@@ -422,6 +442,10 @@ func (b *GmailBackend) loadMessages(seqSet *imap.SeqSet) ([]*models.Message, err
 
 	if err := <-done; err != nil {
 		return nil, fmt.Errorf("unable to fetch messages: %s", err)
+	}
+
+	if idle {
+		b.ResumeEvents()
 	}
 
 	return list, nil
@@ -530,7 +554,9 @@ func (b *GmailBackend) pauseIdle() bool {
 	if b.stopIdling != nil {
 		log.Println("Pausing IDLE ....")
 		close(b.stopIdling)
+		b.idleMutex.Lock()
 		b.stopIdling = nil
+		b.idleMutex.Unlock()
 		return true
 	}
 
@@ -538,13 +564,17 @@ func (b *GmailBackend) pauseIdle() bool {
 }
 
 func (b *GmailBackend) ResumeEvents() {
+	b.idleMutex.Lock()
 	b.stopIdling = make(chan struct{})
 
 	go func() {
 		err := b.Client.Idle(b.stopIdling, nil)
 		if err != nil {
 			log.Printf("Error IDLEing: %s", err)
+			// close(b.stopIdling)
+			// b.stopIdling = nil
 		}
+		b.idleMutex.Unlock()
 	}()
 
 	log.Println("ok, we're IDLEing")
@@ -576,15 +606,6 @@ func (b *GmailBackend) handleServerUpdate(update client.Update) {
 	time.Sleep(3 * time.Second)
 	// b.eventQueue <- update
 	// return
-}
-
-func (b *GmailBackend) Unsubscribe() error {
-	if b.stopIdling != nil {
-		close(b.stopIdling)
-		b.stopIdling = nil
-	}
-
-	return nil
 }
 
 func formatLabelList(list []string) (fields []interface{}) {
