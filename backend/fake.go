@@ -40,6 +40,12 @@ func (b *FakeBackend) Close() error {
 	return nil
 }
 
+func (b *FakeBackend) PauseEvents() {
+}
+
+func (b *FakeBackend) ResumeEvents() {
+}
+
 func (b *FakeBackend) LoadInbox() ([]*models.Message, chan events.Event, error) {
 	ch := make(chan events.Event, 1000)
 

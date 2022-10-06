@@ -256,7 +256,8 @@ func (b *GmailBackend) determineSpecialFolders() error {
 
 func (b *GmailBackend) Close() error {
 	if b.stopIdling != nil {
-		b.stopIdling <- struct{}{}
+		close(b.stopIdling)
+		b.stopIdling = nil
 	}
 	if b.Client != nil {
 		return b.Client.Logout()
@@ -345,8 +346,7 @@ func (b *GmailBackend) LoadInbox() ([]*models.Message, chan events.Event, error)
 	}
 
 	updates := make(chan client.Update)
-	stopIdling := make(chan struct{})
-	eventQueue := make(chan events.Event)
+	eventQueue := make(chan events.Event, 1000)
 
 	go func() {
 		f, err := os.OpenFile("events.log", os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
@@ -398,15 +398,8 @@ func (b *GmailBackend) LoadInbox() ([]*models.Message, chan events.Event, error)
 		}
 	}()
 
-	go func() {
-		b.Client.Updates = updates
-		err := b.Client.Idle(stopIdling, nil)
-		if err != nil {
-			log.Printf("Error IDLEing: %s", err)
-		}
-	}()
-
-	log.Println("ok, we're IDLEing")
+	b.Client.Updates = updates
+	b.ResumeEvents()
 
 	return list, eventQueue, err
 }
@@ -529,25 +522,24 @@ func (b *GmailBackend) Subscribe() (<-chan events.Event, error) {
 	return make(chan events.Event), nil
 }
 
+func (b *GmailBackend) PauseEvents() {
+	b.pauseIdle()
+}
+
 func (b *GmailBackend) pauseIdle() bool {
 	if b.stopIdling != nil {
 		log.Println("Pausing IDLE ....")
-		b.stopIdling <- struct{}{}
+		close(b.stopIdling)
+		b.stopIdling = nil
 		return true
 	}
 
 	return false
 }
 
-func (b *GmailBackend) resumeIdle() error {
-	log.Println("Resuming IDLE ....")
-	_, err := b.selectMailbox("INBOX")
-	if err != nil {
-		return err
-	}
-	log.Println("INBOX selected....")
-
+func (b *GmailBackend) ResumeEvents() {
 	b.stopIdling = make(chan struct{})
+
 	go func() {
 		err := b.Client.Idle(b.stopIdling, nil)
 		if err != nil {
@@ -556,7 +548,6 @@ func (b *GmailBackend) resumeIdle() error {
 	}()
 
 	log.Println("ok, we're IDLEing")
-	return err
 }
 
 func (b *GmailBackend) handleServerUpdate(update client.Update) {
@@ -588,11 +579,11 @@ func (b *GmailBackend) handleServerUpdate(update client.Update) {
 }
 
 func (b *GmailBackend) Unsubscribe() error {
-	if b.stopIdling == nil {
-		return nil
+	if b.stopIdling != nil {
+		close(b.stopIdling)
+		b.stopIdling = nil
 	}
 
-	b.stopIdling <- struct{}{}
 	return nil
 }
 
@@ -608,7 +599,7 @@ func (b *GmailBackend) DeleteMessage(msg *models.Message) error {
 	idle := b.pauseIdle()
 	err := b.Client.UidMove(&imap.SeqSet{Set: []imap.Seq{{Start: msg.UID, Stop: msg.UID}}}, b.trashName)
 	if idle {
-		b.resumeIdle()
+		b.ResumeEvents()
 	}
 	return err
 }
@@ -629,7 +620,7 @@ func (b *GmailBackend) ArchiveMessage(msg *models.Message) error {
 	idle := b.pauseIdle()
 	err := b.Client.UidMove(&imap.SeqSet{Set: []imap.Seq{{Start: msg.UID, Stop: msg.UID}}}, b.archiveName)
 	if idle {
-		b.resumeIdle()
+		b.ResumeEvents()
 	}
 	return err
 

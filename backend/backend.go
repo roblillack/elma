@@ -14,6 +14,8 @@ type Backend interface {
 	Open() error
 	Close() error
 	LoadInbox() ([]*models.Message, chan events.Event, error)
+	PauseEvents()
+	ResumeEvents()
 
 	ArchiveMessage(*models.Message) error
 	DeleteMessage(*models.Message) error
