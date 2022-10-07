@@ -11,11 +11,6 @@ type EventListener interface {
 	HandleEvent(evt Event)
 }
 
-type EventPublisher interface {
-	Subscribe() (<-chan Event, error)
-	Unsubscribe() error
-}
-
 type NewMessage struct {
 	Message *models.Message
 }
