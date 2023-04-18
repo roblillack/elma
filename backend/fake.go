@@ -48,7 +48,7 @@ func (b *FakeBackend) LoadInbox() ([]*models.Message, chan events.Event, error) 
 			time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
 			m := b.Mocker.RandomMessage()
 			m.Status = models.StatusNew
-			b.events <- events.NewMessage{Message: m}
+			ch <- events.NewMessage{Message: m}
 		}
 	}()
 
@@ -61,7 +61,7 @@ func (b *FakeBackend) Subscribe() (<-chan events.Event, error) {
 	// go func() {
 	// 	for {
 	// 		time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
-	// 		m := mock.RandomMessage()
+	// 		m := b.Mocker.RandomMessage()
 	// 		m.Status = models.StatusNew
 	// 		b.events <- events.NewMessage{Message: m}
 	// 	}
