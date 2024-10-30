@@ -358,24 +358,24 @@ func (b *GmailBackend) LoadInbox() ([]*models.Message, chan events.Event, error)
 		}
 		defer f.Close()
 
-		log.SetOutput(f)
+		eventsLog := log.New(f, "", log.LstdFlags)
 
 		for {
 			update := <-updates
 			switch u := update.(type) {
 			case *client.StatusUpdate:
-				log.Printf("Status update: %+v\n", u.Status)
+				eventsLog.Printf("Status update: %+v\n", u.Status)
 			case *client.MailboxUpdate:
-				log.Printf("Mailbox update: %+v\n", u.Mailbox)
+				eventsLog.Printf("Mailbox update: %+v\n", u.Mailbox)
 				if newLen := int(u.Mailbox.Messages) - len(seqIDs); newLen > 0 {
-					log.Printf("-> %d new messages\n", newLen)
+					eventsLog.Printf("-> %d new messages\n", newLen)
 					newMsgs, err := b.loadMessages(&imap.SeqSet{Set: []imap.Seq{{
 						Start: uint32(len(seqIDs) + 1),
 						Stop:  uint32(len(seqIDs) + newLen)}}})
 					if err != nil {
-						log.Printf("Unable to load missing messages: %s\n", err)
+						eventsLog.Printf("Unable to load missing messages: %s\n", err)
 					}
-					log.Printf("   loaded %d messages\n", len(newMsgs))
+					eventsLog.Printf("   loaded %d messages\n", len(newMsgs))
 					for _, i := range newMsgs {
 						seqIDs[i.SequenceID] = i
 						list = append(list, i)
@@ -383,14 +383,14 @@ func (b *GmailBackend) LoadInbox() ([]*models.Message, chan events.Event, error)
 					}
 				}
 			case *client.MessageUpdate:
-				log.Printf("Message update: %+v\n", u.Message)
+				eventsLog.Printf("Message update: %+v\n", u.Message)
 				msg := seqIDs[u.Message.SeqNum]
 				if msg != nil && flagsChanged(msg, u.Message) {
 					updateFlags(msg, u.Message)
 					eventQueue <- events.MessageFlagsChanged{Message: msg}
 				}
 			case *client.ExpungeUpdate:
-				log.Printf("Expunge update: %+v\n", u.SeqNum)
+				eventsLog.Printf("Expunge update: %+v\n", u.SeqNum)
 				msg := seqIDs[u.SeqNum]
 				if msg == nil {
 					continue
@@ -408,8 +408,8 @@ func (b *GmailBackend) LoadInbox() ([]*models.Message, chan events.Event, error)
 					seqIDs[i.SequenceID] = i
 					newList = append(newList, i)
 				}
-				log.Printf("list %d --> %d\n", len(list), len(newList))
-				log.Printf("seqIDs %d\n", len(seqIDs))
+				eventsLog.Printf("list %d --> %d\n", len(list), len(newList))
+				eventsLog.Printf("seqIDs %d\n", len(seqIDs))
 				list = newList
 				eventQueue <- events.MessageDeleted{Message: msg}
 			}
