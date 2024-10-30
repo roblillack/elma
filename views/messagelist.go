@@ -35,6 +35,22 @@ func (l *MessageList) Select(index int) *MessageList {
 	return l
 }
 
+func (l *MessageList) SelectMessage(m *models.Message) bool {
+	idx := -1
+	for i, e := range l.messages {
+		if e == m {
+			idx = i
+			break
+		}
+	}
+
+	if idx == -1 {
+		return false
+	}
+
+	return true
+}
+
 func (l *MessageList) SetMessages(messages []*models.Message) *MessageList {
 	l.messages = append([]*models.Message{}, messages...)
 	sort.Slice(l.messages, func(i, j int) bool {

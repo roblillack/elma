@@ -7,8 +7,10 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"reflect"
 	"regexp"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,6 +24,8 @@ import (
 	"github.com/roblillack/elma/models"
 )
 
+const IdleSupport = true
+
 // https://developers.google.com/gmail/imap/imap-smtp
 type GmailBackend struct {
 	Email    string
@@ -30,11 +34,24 @@ type GmailBackend struct {
 
 	// updates    chan client.Update
 	// eventQueue chan events.Event
+
+	// used to signal the goroutine watching for updates to stop
 	stopIdling chan struct{}
+	// used to wait for the goroutine watching for updates to stop
+	idleDone  chan struct{}
+	idleMutex sync.Mutex
 	// inbox      map[models.MessageID]*models.Message
+	logfile *os.File
 
 	archiveName string
 	trashName   string
+
+	// current folder
+	folderLock  sync.Mutex
+	folderName  string
+	messageList []*models.Message
+	msgsBySeqID map[uint32]*models.Message
+	eventQueue  chan events.Event
 }
 
 const GmailMessageID imap.FetchItem = `X-GM-MSGID`
@@ -177,6 +194,14 @@ func (b *GmailBackend) Initialize() error {
 }
 
 func (b *GmailBackend) Open() error {
+	f, err := os.OpenFile("events.log", os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
+	if err != nil {
+		fmt.Printf("error opening file: %v", err)
+	}
+	b.logfile = f
+
+	log.SetOutput(b.logfile)
+
 	c, err := client.DialTLS("imap.gmail.com:993", nil)
 	if err != nil {
 		return err
@@ -207,6 +232,7 @@ func (b *GmailBackend) Open() error {
 	// authenticate(c, cfg, b.Email)
 
 	b.Client = c
+	b.Client.ErrorLog = log.Default()
 	// b.Client.Updates = b.updates
 
 	if ok, err := b.Client.Support("MOVE"); err != nil {
@@ -230,16 +256,19 @@ func (b *GmailBackend) determineSpecialFolders() error {
 
 	all := []*imap.MailboxInfo{}
 	ch := make(chan *imap.MailboxInfo)
+	c := make(chan struct{})
 
 	go func() {
 		for i := range ch {
 			all = append(all, i)
 		}
+		close(c)
 	}()
 
 	if err := b.Client.List("", "*", ch); err != nil {
 		return err
 	}
+	<-c
 
 	for _, folder := range all {
 		for _, attr := range folder.Attributes {
@@ -251,12 +280,18 @@ func (b *GmailBackend) determineSpecialFolders() error {
 		}
 	}
 
+	log.Printf("Trash folder: %s\n", b.trashName)
+	log.Printf("Archive folder: %s\n", b.archiveName)
+
 	return nil
 }
 
 func (b *GmailBackend) Close() error {
+	if b.logfile != nil {
+		b.logfile.Close()
+	}
 	if b.stopIdling != nil {
-		b.stopIdling <- struct{}{}
+		close(b.stopIdling)
 	}
 	if b.Client != nil {
 		return b.Client.Logout()
@@ -311,6 +346,99 @@ func isUnread(flags []string) bool {
 	return !flagsContains(flags, `\Seen`)
 }
 
+func (b *GmailBackend) idle() {
+	if !IdleSupport {
+		log.Println("Skipping IDLE.")
+		return
+	}
+
+	log.Println("Preparing to idle...")
+	b.idleMutex.Lock()
+
+	// Create a channel to receive mailbox updates
+	updates := make(chan client.Update)
+	b.Client.Updates = updates
+	b.stopIdling = make(chan struct{})
+	// b.idleDone = make(chan struct{})
+
+	done := make(chan error, 1)
+
+	go func() {
+		// Listen for updates
+		for {
+			log.Println("IDLE2: Waiting for updates...")
+			select {
+			case update := <-updates:
+				log.Println("IDLE2: New update:", update)
+				b.processUpdate(update)
+				// if !stopped {
+				// 	close(b.stopIdling)
+				// 	stopped = true
+				// }
+			case err := <-done:
+				if err != nil {
+					log.Fatal(err)
+				}
+				log.Println("IDLE2: Not idling anymore")
+				// close(b.idleDone)
+				b.idleMutex.Unlock()
+				return
+			}
+		}
+	}()
+
+	go func() {
+		log.Println("IDLE1: Idling...")
+		done <- b.Client.Idle(b.stopIdling, nil)
+		log.Println("IDLE1: Done")
+	}()
+}
+
+func (b *GmailBackend) processUpdate(update client.Update) {
+	log.Println("Processing update:", update)
+
+	log.Printf("Update: %s\n", reflect.TypeOf(update).String())
+	switch u := update.(type) {
+	case *client.StatusUpdate:
+		log.Printf("Status update: %+v\n", u.Status)
+	case *client.MailboxUpdate:
+		log.Printf("Mailbox update: %+v\n", u.Mailbox)
+	case *client.MessageUpdate:
+		log.Printf("Message update: %+v\n", u.Message)
+		msg := b.msgsBySeqID[u.Message.SeqNum]
+		if msg != nil && flagsChanged(msg, u.Message) {
+			updateFlags(msg, u.Message)
+			b.eventQueue <- events.MessageFlagsChanged{Message: msg}
+		}
+	case *client.ExpungeUpdate:
+		log.Printf("Expunge update: %+v\n", u.SeqNum)
+		msg := b.msgsBySeqID[u.SeqNum]
+		if msg == nil {
+			return
+		}
+
+		b.folderLock.Lock()
+		defer b.folderLock.Unlock()
+
+		newList := make([]*models.Message, 0, len(b.messageList)-1)
+		b.msgsBySeqID = map[uint32]*models.Message{}
+		for _, i := range b.messageList {
+			if i.ID == msg.ID {
+				continue
+			}
+			if i.SequenceID > u.SeqNum {
+				i.SequenceID--
+			}
+			b.msgsBySeqID[i.SequenceID] = i
+			newList = append(newList, i)
+		}
+		log.Printf("list %d --> %d\n", len(b.messageList), len(newList))
+		log.Printf("seqIDs %d\n", len(b.msgsBySeqID))
+		b.messageList = newList
+		b.eventQueue <- events.MessageDeleted{Message: msg}
+	}
+}
+
 func (b *GmailBackend) LoadInbox() ([]*models.Message, chan events.Event, error) {
 	log.Println("GmailBackend.LoadInbox")
 	// idle := b.pauseIdle()
@@ -327,88 +455,31 @@ func (b *GmailBackend) LoadInbox() ([]*models.Message, chan events.Event, error)
 		done <- b.Client.Fetch(seqset, []imap.FetchItem{GmailMessageID, GmailLabelsAttribute, imap.FetchFlags, imap.FetchInternalDate, imap.FetchRFC822Size, imap.FetchEnvelope, imap.FetchUid}, messages)
 	}()
 
+	b.folderLock.Lock()
+	defer b.folderLock.Unlock()
 	// b.inbox = map[models.MessageID]*models.Message{}
-	list := []*models.Message{}
-	seqIDs := map[uint32]*models.Message{}
+	b.folderName = "INBOX"
+	b.messageList = []*models.Message{}
+	b.msgsBySeqID = map[uint32]*models.Message{}
+	b.eventQueue = make(chan events.Event)
+
 	for i := range messages {
 		msg := b.buildMessage(i)
 		if msg == nil {
 			continue
 		}
 		// b.inbox[msg.ID] = msg
-		seqIDs[msg.SequenceID] = msg
-		list = append(list, msg)
+		b.msgsBySeqID[msg.SequenceID] = msg
+		b.messageList = append(b.messageList, msg)
 	}
 
 	if err := <-done; err != nil {
 		return nil, nil, fmt.Errorf("unable to fetch messages: %s", err)
 	}
 
-	updates := make(chan client.Update)
-	stopIdling := make(chan struct{})
-	eventQueue := make(chan events.Event)
+	b.idle()
 
-	go func() {
-		f, err := os.OpenFile("events.log", os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
-		if err != nil {
-			fmt.Printf("error opening file: %v", err)
-		}
-		defer f.Close()
-
-		log.SetOutput(f)
-
-		for {
-			update := <-updates
-			switch u := update.(type) {
-			case *client.StatusUpdate:
-				log.Printf("Status update: %+v\n", u.Status)
-			case *client.MailboxUpdate:
-				log.Printf("Mailbox update: %+v\n", u.Mailbox)
-			case *client.MessageUpdate:
-				log.Printf("Message update: %+v\n", u.Message)
-				msg := seqIDs[u.Message.SeqNum]
-				if msg != nil && flagsChanged(msg, u.Message) {
-					updateFlags(msg, u.Message)
-					eventQueue <- events.MessageFlagsChanged{Message: msg}
-				}
-			case *client.ExpungeUpdate:
-				log.Printf("Expunge update: %+v\n", u.SeqNum)
-				msg := seqIDs[u.SeqNum]
-				if msg == nil {
-					continue
-				}
-
-				newList := make([]*models.Message, 0, len(list)-1)
-				seqIDs = map[uint32]*models.Message{}
-				for _, i := range list {
-					if i.ID == msg.ID {
-						continue
-					}
-					if i.SequenceID > u.SeqNum {
-						i.SequenceID--
-					}
-					seqIDs[i.SequenceID] = i
-					newList = append(newList, i)
-				}
-				log.Printf("list %d --> %d\n", len(list), len(newList))
-				log.Printf("seqIDs %d\n", len(seqIDs))
-				list = newList
-				eventQueue <- events.MessageDeleted{Message: msg}
-			}
-		}
-	}()
-
-	go func() {
-		b.Client.Updates = updates
-		err := b.Client.Idle(stopIdling, nil)
-		if err != nil {
-			log.Printf("Error IDLEing: %s", err)
-		}
-	}()
-
-	log.Println("ok, we're IDLEing")
-
-	return list, eventQueue, err
+	return b.messageList, b.eventQueue, err
 }
 
 func (b *GmailBackend) loadMessages(seqSet *imap.SeqSet) ([]*models.Message, error) {
@@ -532,7 +603,12 @@ func (b *GmailBackend) Subscribe() (<-chan events.Event, error) {
 func (b *GmailBackend) pauseIdle() bool {
 	if b.stopIdling != nil {
 		log.Println("Pausing IDLE ....")
-		b.stopIdling <- struct{}{}
+		close(b.stopIdling)
+		//<-b.idleDone
+		b.idleMutex.Lock()
+		log.Println("IDLE seems done....")
+
+		b.idleMutex.Unlock()
 		return true
 	}
 
@@ -540,23 +616,25 @@ func (b *GmailBackend) pauseIdle() bool {
 }
 
 func (b *GmailBackend) resumeIdle() error {
-	log.Println("Resuming IDLE ....")
-	_, err := b.selectMailbox("INBOX")
-	if err != nil {
-		return err
-	}
-	log.Println("INBOX selected....")
+	b.idle()
+	return nil
+	// log.Println("Resuming IDLE ....")
+	// _, err := b.selectMailbox("INBOX")
+	// if err != nil {
+	// 	return err
+	// }
+	// log.Println("INBOX selected....")
 
-	b.stopIdling = make(chan struct{})
-	go func() {
-		err := b.Client.Idle(b.stopIdling, nil)
-		if err != nil {
-			log.Printf("Error IDLEing: %s", err)
-		}
-	}()
+	// b.stopIdling = make(chan struct{})
+	// go func() {
+	// 	err := b.Client.Idle(b.stopIdling, nil)
+	// 	if err != nil {
+	// 		log.Printf("Error IDLEing: %s", err)
+	// 	}
+	// }()
 
-	log.Println("ok, we're IDLEing")
-	return err
+	// log.Println("ok, we're IDLEing")
+	// return err
 }
 
 func (b *GmailBackend) handleServerUpdate(update client.Update) {
@@ -605,11 +683,16 @@ func formatLabelList(list []string) (fields []interface{}) {
 }
 
 func (b *GmailBackend) DeleteMessage(msg *models.Message) error {
+	log.Printf("DeleteMessage: %d / %d / %d\n", msg.UID, msg.ID, msg.SequenceID)
 	idle := b.pauseIdle()
+	log.Println("DeleteMessage: triggering move")
+	log.Println(b.Client.Check())
 	err := b.Client.UidMove(&imap.SeqSet{Set: []imap.Seq{{Start: msg.UID, Stop: msg.UID}}}, b.trashName)
+	log.Println(err)
 	if idle {
 		b.resumeIdle()
 	}
+	log.Println("DeleteMessage: resumed idle")
 	return err
 }
 

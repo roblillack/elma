@@ -254,7 +254,7 @@ func (a *InboxController) View() tview.Primitive {
 func (c *InboxController) HandleEvent(evt events.Event) {
 	c.eventCount++
 
-	_, idx := c.MessageList.SelectedMessage()
+	msg, idx := c.MessageList.SelectedMessage()
 	// c.UpdateInfoBar(msg, idx)
 
 	switch e := evt.(type) {
@@ -270,7 +270,9 @@ func (c *InboxController) HandleEvent(evt events.Event) {
 		}
 		c.Messages = list
 		c.MessageList.SetMessages(c.Messages)
-		c.MessageList.Select(idx)
+		if !c.MessageList.SelectMessage(msg) {
+			c.MessageList.Select(idx)
+		}
 	case events.NewMessage:
 		_, idx := c.MessageList.SelectedMessage()
 		c.Messages = append(c.Messages, e.Message)
