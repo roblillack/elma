@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"path"
 
@@ -59,8 +60,14 @@ func getBackend() backend.Backend {
 func main() {
 	flag.Parse()
 
+	beLog, err := os.Create("backend.log")
+	if err != nil {
+		panic(err)
+	}
+	defer beLog.Close()
+
 	app := &controllers.Application{
-		Backend: getBackend(),
+		Backend: backend.NewLogger(getBackend(), log.New(beLog, "", log.LstdFlags)),
 	}
 
 	if err := app.Run(); err != nil {
