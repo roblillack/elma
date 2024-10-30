@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"path"
@@ -14,6 +15,8 @@ import (
 	"github.com/roblillack/elma/controllers"
 )
 
+var demoMode = flag.Bool("D", false, "Run in demo mode, which allows you to play with the UI without configuring an actual account.")
+
 type GmailConfig struct {
 	Email    string
 	Password string
@@ -23,34 +26,41 @@ type Config struct {
 }
 
 func getBackend() backend.Backend {
+	if *demoMode {
+		fmt.Println("Running in demo mode.")
+		return backend.NewFakeBackend()
+	}
+
 	home, err := homedir.Dir()
 	if err != nil {
 		panic(err)
 	}
 	config, err := toml.LoadFile(path.Join(home, ".elmarc"))
-	if err != nil && !os.IsNotExist(err) {
-		panic(err)
+	if err != nil && os.IsNotExist(err) {
+		fmt.Println("No configuration file found. Running in demo mode.")
+		return backend.NewFakeBackend()
 	}
 
 	if err != nil {
-		return backend.NewFakeBackend()
+		panic(err)
 	}
 
 	if email := config.Get("gmail.email"); email != nil {
 		if pw := config.Get("gmail.password"); pw != nil {
 			return backend.NewGmailBackendWithPassword(email.(string), pw.(string))
 		}
-		return backend.NewGmailBackend(email.(string))
 
+		return backend.NewGmailBackend(email.(string))
 	}
 
-	return backend.NewFakeBackend()
+	panic("No email account configured.")
 }
 
 func main() {
+	flag.Parse()
+
 	app := &controllers.Application{
 		Backend: getBackend(),
-		// Backend: backend.NewFakeBackend(),
 	}
 
 	if err := app.Run(); err != nil {
