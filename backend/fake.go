@@ -60,6 +60,17 @@ func (b *FakeBackend) LoadInbox() ([]*models.Message, chan events.Event, error) 
 	return b.Messages, ch, nil
 }
 
+func (b *FakeBackend) LoadMessageContent(*models.Message) (*models.MessageContent, error) {
+	return &models.MessageContent{
+		Parts: []models.MessageContentPart{
+			{
+				ContentType: "text/plain",
+				Content:     []byte("Hello, World!\r\n"),
+			},
+		},
+	}, nil
+}
+
 func (b *FakeBackend) ArchiveMessage(*models.Message) error {
 	return nil
 }

@@ -43,6 +43,11 @@ func (l *LoggerBackend) LoadInbox() (msgs []*models.Message, events chan events.
 	return l.Backend.LoadInbox()
 }
 
+func (b *LoggerBackend) LoadMessageContent(m *models.Message) (*models.MessageContent, error) {
+	b.Log.Printf("LoadMessageContent: %s\n", m.ID)
+	return b.Backend.LoadMessageContent(m)
+}
+
 func (l *LoggerBackend) Open() error {
 	l.Log.Printf("Open\n")
 	return l.Backend.Open()

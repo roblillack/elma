@@ -1,12 +1,16 @@
 package controllers
 
 import (
+	"bytes"
 	"fmt"
+	"strings"
 
 	tcell "github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 
 	"github.com/roblillack/elma/models"
+	"github.com/roblillack/ftml/formatter"
+	"github.com/roblillack/ftml/html"
 )
 
 type MessageViewController struct {
@@ -15,14 +19,16 @@ type MessageViewController struct {
 	ActionBar *tview.TextView
 	InfoBar   *tview.TextView
 	Message   *models.Message
+	Content   *models.MessageContent
 }
 
 var _ Controller = &MessageViewController{}
 
-func NewMessageView(app *Application, msg *models.Message) (Controller, error) {
+func NewMessageView(app *Application, msg *models.Message, content *models.MessageContent) (Controller, error) {
 	return &MessageViewController{
 		App:     app,
 		Message: msg,
+		Content: content,
 	}, nil
 }
 
@@ -32,6 +38,39 @@ func (c *MessageViewController) UpdateActionBar() {
 
 func (c *MessageViewController) UpdateInfoBar() {
 
+}
+
+func getContentType(content *models.MessageContent, contentType string) []byte {
+	for _, part := range content.Parts {
+		if part.ContentType == contentType {
+			return part.Content
+		}
+	}
+
+	return nil
+}
+
+func renderMessage(msg *models.Message, content *models.MessageContent) string {
+	if rawHTML := getContentType(content, "text/html"); rawHTML != nil {
+		fmt.Println(string(rawHTML))
+		fmt.Println("--------------")
+		doc, err := html.Parse(bytes.NewReader(rawHTML))
+		if err != nil {
+			return fmt.Sprintf("Failed to parse HTML: %v", err)
+		}
+		buf := &strings.Builder{}
+		if err := formatter.Write(buf, doc, false); err != nil {
+			return fmt.Sprintf("Failed to format FTML: %v", err)
+		}
+
+		return fmt.Sprintf("From: %s\nSubject: %s\n\n%s", msg.Sender, msg.Subject, buf.String())
+	}
+
+	if txt := getContentType(content, "text/plain"); txt != nil {
+		return fmt.Sprintf("From: %s\nSubject: %s\n\n%s", msg.Sender, msg.Subject, string(txt))
+	}
+
+	return fmt.Sprintf("From: %s\nSubject: %s\n\n???", msg.Sender, msg.Subject)
 }
 
 func (c *MessageViewController) View() tview.Primitive {
@@ -54,7 +93,7 @@ func (c *MessageViewController) View() tview.Primitive {
 		SetBackgroundColor(tcell.ColorYellow)
 
 	c.TextView = tview.NewTextView()
-	fmt.Fprintln(c.TextView, c.Message.Subject)
+	fmt.Fprintln(c.TextView, renderMessage(c.Message, c.Content))
 	c.TextView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape || event.Key() == tcell.KeyEsc || event.Key() == tcell.KeyLeft {
 			c.App.PopScreen()

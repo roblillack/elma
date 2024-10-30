@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -16,8 +17,12 @@ import (
 	imap "github.com/emersion/go-imap"
 	compress "github.com/emersion/go-imap-compress"
 	"github.com/emersion/go-imap/client"
+	message "github.com/emersion/go-message"
 	tcell "github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+
+	// Necessary to import "most common charsets" for go-message
+	_ "github.com/emersion/go-message/charset"
 
 	"github.com/roblillack/elma/events"
 	"github.com/roblillack/elma/models"
@@ -420,6 +425,113 @@ func (b *GmailBackend) LoadInbox() ([]*models.Message, chan events.Event, error)
 	b.ResumeEvents()
 
 	return list, eventQueue, err
+}
+
+func (b *GmailBackend) LoadMessageContent(m *models.Message) (*models.MessageContent, error) {
+	log.Println("GmailBackend.LoadMessageContent")
+
+	idle := b.pauseIdle()
+
+	log.Println("No longer IDLEing ...")
+
+	messages := make(chan *imap.Message, 1)
+	done := make(chan error, 1)
+	go func() {
+		log.Println("Fetching message content ...")
+		done <- b.Client.UidFetch(&imap.SeqSet{Set: []imap.Seq{{Start: m.UID, Stop: m.UID}}},
+			[]imap.FetchItem{imap.FetchRFC822, imap.FetchBodyStructure}, messages)
+	}()
+
+	log.Println("Waiting for message content ...")
+	msg := <-messages
+
+	log.Println("Done waiting for message content ...")
+
+	if err := <-done; err != nil {
+		log.Fatal(err)
+	}
+
+	// ch := make(chan *imap.Message)
+	// if err := b.Client.UidFetch(&imap.SeqSet{Set: []imap.Seq{{Start: m.UID, Stop: m.UID}}},
+	// 	[]imap.FetchItem{imap.FetchFull}, ch); err != nil {
+	// 	return nil, err
+	// }
+
+	if idle {
+		log.Println("Resuming IDLE ...")
+		b.ResumeEvents()
+	}
+
+	// log.Printf("ENVELOPE: %+v\n", msg.BodyStructure.Envelope)
+	for idx, part := range msg.BodyStructure.Parts {
+		fn, _ := part.Filename()
+		log.Printf("- ID: %s\n", part.Id)
+		log.Printf("  PART: %d (description: %s, filename: %s)\n", idx+1, part.Description, fn)
+		log.Printf("  TYPE: %s/%s\n", part.MIMEType, part.MIMESubType)
+		log.Printf("  SIZE: %d\n", part.Size)
+		log.Printf("  PARAMS: %+v\n", part.Params)
+		log.Printf("  DISPOSITION: %+v\n", part.Disposition)
+		log.Printf("  LANG: %s\n", part.Language)
+		log.Printf("  LOCATION: %s\n", part.Location)
+		log.Printf("  MD5: %s\n", part.MD5)
+		log.Printf("  ENCODING: %s\n", part.Encoding)
+	}
+	sec, err := imap.ParseBodySectionName(imap.FetchRFC822)
+	if err != nil {
+		return nil, err
+	}
+
+	content, err := message.Read(msg.GetBody(sec))
+	if message.IsUnknownCharset(err) {
+		// This error is not fatal
+		log.Println("Unknown encoding:", err)
+	} else if err != nil {
+		log.Fatal(err)
+	}
+
+	response := models.MessageContent{
+		Parts: []models.MessageContentPart{},
+	}
+
+	if mr := content.MultipartReader(); mr != nil {
+		// This is a multipart message
+		log.Println("This is a multipart message containing:")
+		for {
+			p, err := mr.NextPart()
+			if err == io.EOF {
+				break
+			} else if err != nil {
+				log.Fatal(err)
+			}
+
+			rawContent, err := io.ReadAll(p.Body)
+			if err != nil {
+				return nil, err
+			}
+
+			t, _, _ := p.Header.ContentType()
+			log.Println("A part with type", t)
+			response.Parts = append(response.Parts, models.MessageContentPart{
+				ContentType: t,
+				Content:     rawContent,
+			})
+		}
+	} else {
+		t, _, _ := content.Header.ContentType()
+		log.Println("This is a non-multipart message with type", t)
+
+		rawContent, err := io.ReadAll(content.Body)
+		if err != nil {
+			return nil, err
+		}
+
+		response.Parts = append(response.Parts, models.MessageContentPart{
+			ContentType: t,
+			Content:     rawContent,
+		})
+	}
+
+	return &response, nil
 }
 
 func (b *GmailBackend) loadMessages(seqSet *imap.SeqSet) ([]*models.Message, error) {

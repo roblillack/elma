@@ -181,7 +181,13 @@ func (c *InboxController) handleKeyEvent(event *tcell.EventKey) *tcell.EventKey 
 	}
 
 	if key == tcell.KeyEnter || key == tcell.KeyRight {
-		mv, err := NewMessageView(c.App, msg)
+		content, err := c.App.Backend.LoadMessageContent(msg)
+		if err != nil {
+			log.Printf("Unable to load message content: %s", err)
+			return nil
+		}
+
+		mv, err := NewMessageView(c.App, msg, content)
 		if err != nil {
 			panic(err)
 		}
