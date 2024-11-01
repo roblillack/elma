@@ -55,7 +55,7 @@ func (a *Application) ReplaceScreens(c Controller) {
 	a.View.SetRoot(c.View(), true)
 }
 
-func (a *Application) PopScreen() {
+func (a *Application) PopScreen(unhandledKeybinding ...rune) {
 	l := len(a.Screens)
 	if l == 0 {
 		return
@@ -68,6 +68,14 @@ func (a *Application) PopScreen() {
 	}
 
 	a.View.SetRoot(a.Screens[l-2].View(), true)
+
+	if parent := a.Screens[len(a.Screens)-1].(ParentController); parent != nil {
+		for _, r := range unhandledKeybinding {
+			parent.HandleChildKeypress(r)
+		}
+	} else {
+		log.Printf("Unhandled keybinding: %v", unhandledKeybinding)
+	}
 }
 
 func (a *Application) processEvents(backend backend.Backend, eventBus <-chan events.Event) {

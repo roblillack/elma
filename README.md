@@ -2,8 +2,8 @@
 
 ## TODO
 
-- [ ] Enable mouse support
-- [ ] Jump to next/previous message in message view
+- [x] Enable mouse support
+- [x] Jump to next/previous message in message view
 - [ ] Support for `multipart/alternative` and `multipart/related`
 - [ ] Support for `application/ics` (iCalendar) to at least show basic content
 - [ ] Support identifying and working with attachments

@@ -20,15 +20,17 @@ type MessageViewController struct {
 	InfoBar   *tview.TextView
 	Message   *models.Message
 	Content   *models.MessageContent
+	Keymap    []KeymapEntry
 }
 
 var _ Controller = &MessageViewController{}
 
-func NewMessageView(app *Application, msg *models.Message, content *models.MessageContent) (Controller, error) {
+func NewMessageView(app *Application, msg *models.Message, content *models.MessageContent, keymap []KeymapEntry) (Controller, error) {
 	return &MessageViewController{
 		App:     app,
 		Message: msg,
 		Content: content,
+		Keymap:  keymap,
 	}, nil
 }
 
@@ -36,7 +38,13 @@ func (c *MessageViewController) UpdateActionBar() {
 	c.ActionBar.Clear()
 
 	b := strings.Builder{}
-	b.WriteString("Esc:Close")
+	b.WriteString("q:Close s:Star r:Reply f:Forward y:Archive d:Delete")
+	if len(c.Keymap) > 0 {
+		b.WriteString(" —")
+		for _, e := range c.Keymap {
+			fmt.Fprintf(&b, " %c:%s", e.Key, e.Description)
+		}
+	}
 	fmt.Fprint(c.ActionBar, b.String())
 }
 
@@ -112,9 +120,17 @@ func (c *MessageViewController) View() tview.Primitive {
 	}
 	fmt.Fprintln(c.TextView, txt)
 	c.TextView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEscape || event.Key() == tcell.KeyEsc || event.Key() == tcell.KeyLeft {
+		if event.Key() == tcell.KeyEscape || event.Key() == tcell.KeyEsc ||
+			event.Key() == tcell.KeyLeft || event.Rune() == 'q' || event.Rune() == 'Q' {
 			c.App.PopScreen()
 			return nil
+		}
+
+		for _, e := range c.Keymap {
+			if event.Rune() == e.Key {
+				c.App.PopScreen(event.Rune())
+				return nil
+			}
 		}
 
 		return event

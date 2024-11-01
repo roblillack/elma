@@ -26,6 +26,7 @@ type InboxController struct {
 }
 
 var _ Controller = &InboxController{}
+var _ ParentController = &InboxController{}
 var _ events.EventListener = &InboxController{}
 
 func NewInbox(app *Application) (*InboxController, error) {
@@ -77,18 +78,7 @@ func (a *InboxController) createLayout() {
 			if msg == nil {
 				return tview.MouseConsumed, nil
 			}
-			content, err := a.App.Backend.LoadMessageContent(msg)
-			if err != nil {
-				log.Printf("Unable to load message content: %s", err)
-				return tview.MouseConsumed, nil
-			}
-
-			mv, err := NewMessageView(a.App, msg, content)
-			if err != nil {
-				panic(err)
-			}
-
-			a.App.PushScreen(mv)
+			a.openSelectedMessage()
 			return tview.MouseConsumed, nil
 		}
 
@@ -149,6 +139,50 @@ func (c *InboxController) UpdateInfoBar(msg *models.Message, idx int) {
 	fmt.Fprintf(c.InfoBar, "Message %d/%d, %d scheduled actions, got %d events", idx+1, len(c.Messages), len(c.ScheduledActions), c.eventCount)
 }
 
+func (c *InboxController) openSelectedMessage() {
+	msg, idx := c.MessageList.SelectedMessage()
+	content, err := c.App.Backend.LoadMessageContent(msg)
+	if err != nil {
+		log.Fatalf("Unable to load message content: %s", err)
+	}
+
+	keymap := []KeymapEntry{}
+	if idx < len(c.Messages)-1 {
+		keymap = append(keymap, KeymapEntry{'j', "Next"})
+	}
+	if idx > 0 {
+		keymap = append(keymap, KeymapEntry{'k', "Prev"})
+	}
+
+	mv, err := NewMessageView(c.App, msg, content, keymap)
+	if err != nil {
+		log.Fatalf("Unable to create message view: %s", err)
+	}
+
+	c.App.PushScreen(mv)
+}
+
+func (c *InboxController) HandleChildKeypress(r rune) {
+	if r == 'j' || r == 'J' {
+		_, idx := c.MessageList.SelectedMessage()
+		if idx == len(c.Messages)-1 {
+			return
+		}
+		c.MessageList.Select(idx + 1)
+		c.openSelectedMessage()
+		return
+	}
+
+	if r == 'k' || r == 'K' {
+		_, idx := c.MessageList.SelectedMessage()
+		if idx == 0 {
+			return
+		}
+		c.MessageList.Select(idx - 1)
+		c.openSelectedMessage()
+	}
+}
+
 func (c *InboxController) handleKeyEvent(event *tcell.EventKey) *tcell.EventKey {
 	key := event.Key()
 	r := event.Rune()
@@ -204,18 +238,7 @@ func (c *InboxController) handleKeyEvent(event *tcell.EventKey) *tcell.EventKey 
 	}
 
 	if key == tcell.KeyEnter || key == tcell.KeyRight {
-		content, err := c.App.Backend.LoadMessageContent(msg)
-		if err != nil {
-			log.Printf("Unable to load message content: %s", err)
-			return nil
-		}
-
-		mv, err := NewMessageView(c.App, msg, content)
-		if err != nil {
-			panic(err)
-		}
-
-		c.App.PushScreen(mv)
+		c.openSelectedMessage()
 		return nil
 	}
 
