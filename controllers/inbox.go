@@ -142,6 +142,9 @@ func (c *InboxController) openSelectedMessage() {
 	if err != nil {
 		log.Fatalf("Unable to load message content: %s", err)
 	}
+	if msg.Status == models.StatusNew {
+		msg.Status = models.StatusRead
+	}
 
 	keymap := []KeymapEntry{}
 	if idx < len(c.Messages)-1 {
