@@ -463,6 +463,7 @@ func (b *GmailBackend) LoadMessageContent(m *models.Message) (*models.MessageCon
 	}
 
 	// log.Printf("ENVELOPE: %+v\n", msg.BodyStructure.Envelope)
+	log.Printf("Message %s\nFrom %s\nSubject: %s\nDate: %s\n", m.ID, m.Sender, m.Subject, m.Sent.Format(time.RFC3339))
 	for idx, part := range msg.BodyStructure.Parts {
 		fn, _ := part.Filename()
 		log.Printf("- ID: %s\n", part.Id)
@@ -482,11 +483,11 @@ func (b *GmailBackend) LoadMessageContent(m *models.Message) (*models.MessageCon
 	}
 
 	content, err := message.Read(msg.GetBody(sec))
-	if message.IsUnknownCharset(err) {
+	if message.IsUnknownCharset(err) || message.IsUnknownEncoding(err) {
 		// This error is not fatal
-		log.Println("Unknown encoding:", err)
+		log.Printf("Unable to read message %v from %s: %s", m.ID, m.Sent.Format(time.RFC3339), err)
 	} else if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Unable to read message %v from %s: %s", m.ID, m.Sent.Format(time.RFC3339), err)
 	}
 
 	response := models.MessageContent{
@@ -498,10 +499,11 @@ func (b *GmailBackend) LoadMessageContent(m *models.Message) (*models.MessageCon
 		log.Println("This is a multipart message containing:")
 		for {
 			p, err := mr.NextPart()
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			} else if err != nil {
-				log.Fatal(err)
+				log.Printf("Unable to read part of multipart message %v from %s: %s", m.ID, m.Sent.Format(time.RFC3339), err)
+				break
 			}
 
 			rawContent, err := io.ReadAll(p.Body)

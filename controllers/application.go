@@ -69,12 +69,12 @@ func (a *Application) PopScreen(unhandledKeybinding ...rune) {
 
 	a.View.SetRoot(a.Screens[l-2].View(), true)
 
-	if parent := a.Screens[len(a.Screens)-1].(ParentController); parent != nil {
-		for _, r := range unhandledKeybinding {
+	for _, r := range unhandledKeybinding {
+		if parent, ok := a.Screens[len(a.Screens)-1].(ParentController); ok {
 			parent.HandleChildKeypress(r)
+		} else {
+			log.Printf("Unhandled keybinding: %v", unhandledKeybinding)
 		}
-	} else {
-		log.Printf("Unhandled keybinding: %v", unhandledKeybinding)
 	}
 }
 
