@@ -11,6 +11,7 @@ import (
 
 	"github.com/roblillack/elma/events"
 	"github.com/roblillack/elma/models"
+	"github.com/roblillack/elma/styles"
 	"github.com/roblillack/elma/views"
 )
 
@@ -48,20 +49,16 @@ func (a *InboxController) createLayout() {
 	a.ActionBar = tview.NewTextView().
 		SetDynamicColors(true).
 		SetRegions(true).
-		SetWrap(false)
-
-	a.ActionBar.SetTextColor(tcell.ColorBlack).
-		SetBackgroundColor(tcell.ColorYellow)
+		SetWrap(false).
+		SetTextStyle(styles.ActionBarStyle)
 
 	a.UpdateActionBar(nil)
 
 	a.InfoBar = tview.NewTextView().
 		SetDynamicColors(true).
 		SetRegions(true).
-		SetWrap(false)
-
-	a.InfoBar.SetTextColor(tcell.ColorBlack).
-		SetBackgroundColor(tcell.ColorYellow)
+		SetWrap(false).
+		SetTextStyle(styles.InfoBarStyle)
 
 	a.MessageList = views.NewMessageList()
 	a.MessageList.

@@ -9,6 +9,7 @@ import (
 	"github.com/rivo/tview"
 
 	"github.com/roblillack/elma/models"
+	"github.com/roblillack/elma/styles"
 	"github.com/roblillack/ftml/formatter"
 	"github.com/roblillack/ftml/html"
 )
@@ -98,20 +99,16 @@ func (c *MessageViewController) View() tview.Primitive {
 	c.ActionBar = tview.NewTextView().
 		SetDynamicColors(true).
 		SetRegions(true).
-		SetWrap(false)
-
-	c.ActionBar.SetTextColor(tcell.ColorBlack).
-		SetBackgroundColor(tcell.ColorYellow)
+		SetWrap(false).
+		SetTextStyle(styles.ActionBarStyle)
 
 	c.UpdateActionBar()
 
 	c.InfoBar = tview.NewTextView().
 		SetDynamicColors(true).
 		SetRegions(true).
-		SetWrap(false)
-
-	c.InfoBar.SetTextColor(tcell.ColorBlack).
-		SetBackgroundColor(tcell.ColorYellow)
+		SetWrap(false).
+		SetTextStyle(styles.InfoBarStyle)
 
 	c.TextView = tview.NewTextView()
 	txt, err := renderMessage(c.Message, c.Content)

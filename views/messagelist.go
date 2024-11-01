@@ -10,6 +10,7 @@ import (
 	"github.com/rivo/tview"
 
 	"github.com/roblillack/elma/models"
+	"github.com/roblillack/elma/styles"
 	"github.com/roblillack/elma/views/formatters"
 )
 
@@ -21,7 +22,10 @@ type MessageList struct {
 }
 
 func NewMessageList() *MessageList {
-	return &MessageList{Table: tview.NewTable().SetBorders(false).SetSelectable(true, false)}
+	table := tview.NewTable().SetBorders(false).SetSelectable(true, false)
+	table.SetSelectedStyle(tcell.StyleDefault.Reverse(true))
+	table.SetBackgroundColor(tcell.ColorDefault)
+	return &MessageList{Table: table}
 }
 
 func (l *MessageList) Select(index int) *MessageList {
@@ -50,25 +54,39 @@ func (l *MessageList) updateCells(startRow, stopRow int) {
 	thisyear := time.Now().Year()
 	for idx := startRow; idx < stopRow; idx++ {
 		msg := l.messages[idx]
-		fg := tview.Styles.PrimaryTextColor
-		if msg.Status == models.StatusNew {
-			fg = tcell.ColorRed
-		} else if msg.Status == models.StatusArchived {
-			fg = tcell.ColorDarkCyan
-		} else if msg.Status == models.StatusDeleted {
-			fg = tcell.ColorDimGray
+		fg := tcell.ColorDefault
+		if msg.Starred {
+			fg = styles.MessageColorStarred
 		}
-		l.Table.SetCell(idx, 0, tview.NewTableCell(msg.FlagString()).SetMaxWidth(3).SetTextColor(fg))
+		if msg.Status == models.StatusNew {
+			fg = styles.MessageColorNew
+		} else if msg.Status == models.StatusArchived {
+			fg = styles.MessageColorArchived
+		} else if msg.Status == models.StatusDeleted {
+			fg = styles.MessageColorDeleted
+		}
+		attr := tcell.AttrNone
+		if msg.Starred {
+			attr |= styles.MessageAttributeStarred
+		}
+		if msg.Status == models.StatusNew {
+			attr |= styles.MessageAttributeNew
+		} else if msg.Status == models.StatusArchived {
+			attr |= styles.MessageAttributeArchived
+		} else if msg.Status == models.StatusDeleted {
+			attr |= styles.MessageAttributeDeleted
+		}
+		l.Table.SetCell(idx, 0, tview.NewTableCell(msg.FlagString()).SetMaxWidth(3).SetTextColor(fg).SetAttributes(attr))
 		if msg.Sent.Year() != thisyear {
-			l.Table.SetCell(idx, 1, tview.NewTableCell(msg.Sent.Format("[Jan 02, 2006]")).SetTextColor(fg))
+			l.Table.SetCell(idx, 1, tview.NewTableCell(msg.Sent.Format("[Jan 02, 2006]")).SetTextColor(fg).SetAttributes(attr))
 		} else {
 			// TODO: if am/pm locale, format with 12 hour clock
-			l.Table.SetCell(idx, 1, tview.NewTableCell(msg.Sent.Format("[Jan 02 15:04]")).SetTextColor(fg))
+			l.Table.SetCell(idx, 1, tview.NewTableCell(msg.Sent.Format("[Jan 02 15:04]")).SetTextColor(fg).SetAttributes(attr))
 		}
-		l.Table.SetCell(idx, 2, tview.NewTableCell(tview.Escape(fmt.Sprintf("%-20s", msg.Sender))).SetMaxWidth(21).SetTextColor(fg))
-		l.Table.SetCell(idx, 3, tview.NewTableCell(formatters.FormatSize(msg.Size)).SetMaxWidth(5).SetTextColor(fg))
+		l.Table.SetCell(idx, 2, tview.NewTableCell(tview.Escape(fmt.Sprintf("%-20s", msg.Sender))).SetMaxWidth(21).SetTextColor(fg).SetAttributes(attr))
+		l.Table.SetCell(idx, 3, tview.NewTableCell(formatters.FormatSize(msg.Size)).SetMaxWidth(5).SetTextColor(fg).SetAttributes(attr))
 		txt := fmt.Sprintf("%d %s %s", msg.UID, strings.Join(msg.Labels, "+"), msg.Subject)
-		l.Table.SetCell(idx, 4, tview.NewTableCell(tview.Escape(txt)).SetTextColor(fg))
+		l.Table.SetCell(idx, 4, tview.NewTableCell(tview.Escape(txt)).SetTextColor(fg).SetAttributes(attr))
 		// TODO: Add msg.Labels floating in from the right
 	}
 
