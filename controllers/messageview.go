@@ -50,27 +50,25 @@ func getContentType(content *models.MessageContent, contentType string) []byte {
 	return nil
 }
 
-func renderMessage(msg *models.Message, content *models.MessageContent) string {
+func renderMessage(msg *models.Message, content *models.MessageContent) (string, error) {
 	if rawHTML := getContentType(content, "text/html"); rawHTML != nil {
-		fmt.Println(string(rawHTML))
-		fmt.Println("--------------")
 		doc, err := html.Parse(bytes.NewReader(rawHTML))
 		if err != nil {
-			return fmt.Sprintf("Failed to parse HTML: %v", err)
+			return "", fmt.Errorf("Failed to parse HTML: %v", err)
 		}
 		buf := &strings.Builder{}
 		if err := formatter.Write(buf, doc, false); err != nil {
-			return fmt.Sprintf("Failed to format FTML: %v", err)
+			return "", fmt.Errorf("Failed to format FTML: %v", err)
 		}
 
-		return fmt.Sprintf("From: %s\nSubject: %s\n\n%s", msg.Sender, msg.Subject, buf.String())
+		return fmt.Sprintf("From: %s\nSubject: %s\n\n%s", msg.Sender, msg.Subject, buf.String()), nil
 	}
 
 	if txt := getContentType(content, "text/plain"); txt != nil {
-		return fmt.Sprintf("From: %s\nSubject: %s\n\n%s", msg.Sender, msg.Subject, string(txt))
+		return fmt.Sprintf("From: %s\nSubject: %s\n\n%s", msg.Sender, msg.Subject, string(txt)), nil
 	}
 
-	return fmt.Sprintf("From: %s\nSubject: %s\n\n???", msg.Sender, msg.Subject)
+	return fmt.Sprintf("From: %s\nSubject: %s\n\n???", msg.Sender, msg.Subject), nil
 }
 
 func (c *MessageViewController) View() tview.Primitive {
@@ -93,7 +91,11 @@ func (c *MessageViewController) View() tview.Primitive {
 		SetBackgroundColor(tcell.ColorYellow)
 
 	c.TextView = tview.NewTextView()
-	fmt.Fprintln(c.TextView, renderMessage(c.Message, c.Content))
+	txt, err := renderMessage(c.Message, c.Content)
+	if err != nil {
+		txt = fmt.Sprintf("Failed to render message: %v", err)
+	}
+	fmt.Fprintln(c.TextView, txt)
 	c.TextView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape || event.Key() == tcell.KeyEsc || event.Key() == tcell.KeyLeft {
 			c.App.PopScreen()

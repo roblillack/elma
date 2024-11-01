@@ -60,14 +60,16 @@ func getBackend() backend.Backend {
 func main() {
 	flag.Parse()
 
-	beLog, err := os.Create("backend.log")
+	beLog, err := os.Create("elma.log")
 	if err != nil {
 		panic(err)
 	}
 	defer beLog.Close()
 
+	log.SetOutput(beLog)
+
 	app := &controllers.Application{
-		Backend: backend.NewLogger(getBackend(), log.New(beLog, "", log.LstdFlags)),
+		Backend: backend.NewLogger(getBackend(), nil),
 	}
 
 	if err := app.Run(); err != nil {

@@ -15,6 +15,9 @@ type LoggerBackend struct {
 var _ Backend = &LoggerBackend{}
 
 func NewLogger(backend Backend, logger *log.Logger) *LoggerBackend {
+	if logger == nil {
+		logger = log.Default()
+	}
 	return &LoggerBackend{Log: logger, Backend: backend}
 }
 
