@@ -33,11 +33,14 @@ func NewMessageView(app *Application, msg *models.Message, content *models.Messa
 }
 
 func (c *MessageViewController) UpdateActionBar() {
+	c.ActionBar.Clear()
 
+	b := strings.Builder{}
+	b.WriteString("Esc:Close")
+	fmt.Fprint(c.ActionBar, b.String())
 }
 
 func (c *MessageViewController) UpdateInfoBar() {
-
 }
 
 func getContentType(content *models.MessageContent, contentType string) []byte {
@@ -50,25 +53,37 @@ func getContentType(content *models.MessageContent, contentType string) []byte {
 	return nil
 }
 
-func renderMessage(msg *models.Message, content *models.MessageContent) (string, error) {
+func renderContent(content *models.MessageContent) string {
 	if rawHTML := getContentType(content, "text/html"); rawHTML != nil {
 		doc, err := html.Parse(bytes.NewReader(rawHTML))
 		if err != nil {
-			return "", fmt.Errorf("Failed to parse HTML: %v", err)
+			return fmt.Sprintf("Failed to parse HTML: %v", err)
 		}
 		buf := &strings.Builder{}
 		if err := formatter.Write(buf, doc, false); err != nil {
-			return "", fmt.Errorf("Failed to format FTML: %v", err)
+			return fmt.Sprintf("Failed to format FTML: %v", err)
 		}
 
-		return fmt.Sprintf("From: %s\nSubject: %s\n\n%s", msg.Sender, msg.Subject, buf.String()), nil
+		return buf.String()
 	}
 
 	if txt := getContentType(content, "text/plain"); txt != nil {
-		return fmt.Sprintf("From: %s\nSubject: %s\n\n%s", msg.Sender, msg.Subject, string(txt)), nil
+		return string(txt)
 	}
 
-	return fmt.Sprintf("From: %s\nSubject: %s\n\n???", msg.Sender, msg.Subject), nil
+	return "???"
+}
+
+func renderMessage(msg *models.Message, content *models.MessageContent) (string, error) {
+	footer := &strings.Builder{}
+	footer.WriteString("---\nMessage parts:\n")
+	for _, parts := range content.Parts {
+		fmt.Fprintf(footer, "- %s: %d bytes\n", parts.ContentType, len(parts.Content))
+	}
+
+	txt := renderContent(content)
+
+	return fmt.Sprintf("From: %s\nSubject: %s\n\n%s\n\n%s", msg.Sender, msg.Subject, txt, footer.String()), nil
 }
 
 func (c *MessageViewController) View() tview.Primitive {
