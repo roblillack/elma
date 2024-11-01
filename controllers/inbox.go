@@ -71,6 +71,29 @@ func (a *InboxController) createLayout() {
 		}).
 		Select(0)
 	a.MessageList.SetInputCapture(a.handleKeyEvent)
+	a.MessageList.SetMouseCapture(func(action tview.MouseAction, event *tcell.EventMouse) (tview.MouseAction, *tcell.EventMouse) {
+		if action == tview.MouseLeftDoubleClick {
+			msg, _ := a.MessageList.SelectedMessage()
+			if msg == nil {
+				return tview.MouseConsumed, nil
+			}
+			content, err := a.App.Backend.LoadMessageContent(msg)
+			if err != nil {
+				log.Printf("Unable to load message content: %s", err)
+				return tview.MouseConsumed, nil
+			}
+
+			mv, err := NewMessageView(a.App, msg, content)
+			if err != nil {
+				panic(err)
+			}
+
+			a.App.PushScreen(mv)
+			return tview.MouseConsumed, nil
+		}
+
+		return action, event
+	})
 
 	a.flexLayout = tview.NewFlex().
 		SetDirection(tview.FlexRow).

@@ -104,6 +104,7 @@ func (a *Application) Run() error {
 	log.Println("Application.Run: Starting app ...")
 
 	a.View = tview.NewApplication()
+	a.View.EnableMouse(true)
 
 	tview.Styles.PrimitiveBackgroundColor = tcell.ColorWhite
 	tview.Styles.ContrastBackgroundColor = tcell.ColorDarkRed
