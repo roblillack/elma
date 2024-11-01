@@ -13,7 +13,7 @@ require (
 	github.com/gdamore/tcell/v2 v2.7.4
 	github.com/mitchellh/go-homedir v1.1.0
 	github.com/pelletier/go-toml v1.9.5
-	github.com/rivo/tview v0.0.0-20241016194538-c5e4fb24af13
+	github.com/rivo/tview v0.0.0-20241030223020-e34b54cd4c27
 	github.com/roblillack/ftml v0.0.0-20241030170330-a8d7d9c7ac74 // indirect
 )
 
