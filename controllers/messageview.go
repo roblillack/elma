@@ -101,12 +101,18 @@ func padToWidth(s string, width int) string {
 func (c *MessageViewController) renderMessage(w *tview.TextView, msg *models.Message, content *models.MessageContent) error {
 	width, _ := c.App.ScreenSize()
 
-	if _, err := io.WriteString(w,
-		fmt.Sprintf("[::i]%s[::I]\n[::i]%s[::I]\n\n",
-			tview.Escape(padToWidth("From:    "+msg.Sender, width)),
-			tview.Escape(padToWidth("Subject: "+msg.Subject, width)))); err != nil {
-		return err
+	for _, line := range []string{
+		"Date:    " + msg.Sent.Format("2006-01-02 15:04:05 -0700"),
+		"From:    " + msg.Sender,
+		"Subject: " + msg.Subject,
+	} {
+		if _, err := io.WriteString(w,
+			fmt.Sprintf("[::i]%s[::I]\n",
+				tview.Escape(padToWidth(line, width)))); err != nil {
+			return err
+		}
 	}
+	io.WriteString(w, "\n")
 
 	if err := writeContent(w, content); err != nil {
 		fmt.Fprintf(w, "Failed to render message content: %v", err)
