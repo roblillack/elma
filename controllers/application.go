@@ -98,6 +98,12 @@ func (a *Application) processEvents(backend backend.Backend, eventBus <-chan eve
 	}
 }
 
+func (a *Application) ScreenSize() (int, int) {
+	// TODO: Does not really work when terminal is resized ...
+	_, _, w, h := a.Screens[0].View().GetRect()
+	return w, h
+}
+
 func (a *Application) Run() error {
 	if a.Backend == nil {
 		return fmt.Errorf("no application backend set up")

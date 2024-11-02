@@ -86,10 +86,25 @@ func writeContent(w io.Writer, content *models.MessageContent) error {
 	return fmt.Errorf("No known content types found")
 }
 
-func renderMessage(w io.Writer, msg *models.Message, content *models.MessageContent) error {
+func padToWidth(s string, width int) string {
+	if len(s) > width {
+		return s[:width-1] + "…"
+	}
+
+	for i := len(s); i < width; i++ {
+		s += " "
+	}
+
+	return s
+}
+
+func (c *MessageViewController) renderMessage(w *tview.TextView, msg *models.Message, content *models.MessageContent) error {
+	width, _ := c.App.ScreenSize()
+
 	if _, err := io.WriteString(w,
-		fmt.Sprintf("From: %s\nSubject: %s\n\n",
-			tview.Escape(msg.Sender), tview.Escape(msg.Subject))); err != nil {
+		fmt.Sprintf("[::i]%s[::I]\n[::i]%s[::I]\n\n",
+			tview.Escape(padToWidth("From:    "+msg.Sender, width)),
+			tview.Escape(padToWidth("Subject: "+msg.Subject, width)))); err != nil {
 		return err
 	}
 
@@ -126,7 +141,7 @@ func (c *MessageViewController) View() tview.Primitive {
 		SetTextStyle(styles.InfoBarStyle)
 
 	c.TextView = tview.NewTextView().SetDynamicColors(true).SetTextStyle(styles.MessageViewStyle)
-	if err := renderMessage(c.TextView, c.Message, c.Content); err != nil {
+	if err := c.renderMessage(c.TextView, c.Message, c.Content); err != nil {
 		fmt.Fprintf(c.TextView, "Failed to render message: %v", err)
 	}
 	c.TextView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
