@@ -10,6 +10,7 @@ import tcell "github.com/gdamore/tcell/v2"
 var ActionBarStyle = tcell.StyleDefault.Background(tcell.ColorLightGray).Foreground(tcell.ColorDimGray)
 var InfoBarStyle = tcell.StyleDefault.Background(tcell.ColorLightGray).Foreground(tcell.ColorDimGray)
 var MessageListStyle = tcell.StyleDefault.Background(tcell.ColorDefault).Foreground(tcell.ColorDefault)
+var MessageViewStyle = tcell.StyleDefault.Background(tcell.ColorDefault).Foreground(tcell.ColorDefault)
 
 var MessageColorStarred = tcell.ColorDefault
 var MessageAttributeStarred = tcell.AttrBold

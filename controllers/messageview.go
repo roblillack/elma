@@ -3,6 +3,7 @@ package controllers
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"strings"
 
 	tcell "github.com/gdamore/tcell/v2"
@@ -10,7 +11,7 @@ import (
 
 	"github.com/roblillack/elma/models"
 	"github.com/roblillack/elma/styles"
-	"github.com/roblillack/ftml/formatter"
+	"github.com/roblillack/elma/views/formatters"
 	"github.com/roblillack/ftml/html"
 )
 
@@ -62,37 +63,51 @@ func getContentType(content *models.MessageContent, contentType string) []byte {
 	return nil
 }
 
-func renderContent(content *models.MessageContent) string {
+func writeContent(w io.Writer, content *models.MessageContent) error {
 	if rawHTML := getContentType(content, "text/html"); rawHTML != nil {
 		doc, err := html.Parse(bytes.NewReader(rawHTML))
 		if err != nil {
-			return fmt.Sprintf("Failed to parse HTML: %v", err)
-		}
-		buf := &strings.Builder{}
-		if err := formatter.Write(buf, doc, false); err != nil {
-			return fmt.Sprintf("Failed to format FTML: %v", err)
+			return fmt.Errorf("Failed to parse HTML: %v", err)
 		}
 
-		return buf.String()
+		if err := formatters.WriteFTML(w, doc); err != nil {
+			return fmt.Errorf("Failed to format FTML: %v", err)
+		}
+
+		return nil
 	}
 
 	if txt := getContentType(content, "text/plain"); txt != nil {
-		return string(txt)
+		if _, err := io.WriteString(w, tview.Escape(string(txt))); err != nil {
+			return fmt.Errorf("Failed to write plain text: %v", err)
+		}
 	}
 
-	return "???"
+	return fmt.Errorf("No known content types found")
 }
 
-func renderMessage(msg *models.Message, content *models.MessageContent) (string, error) {
+func renderMessage(w io.Writer, msg *models.Message, content *models.MessageContent) error {
+	if _, err := io.WriteString(w,
+		fmt.Sprintf("From: %s\nSubject: %s\n\n",
+			tview.Escape(msg.Sender), tview.Escape(msg.Subject))); err != nil {
+		return err
+	}
+
+	if err := writeContent(w, content); err != nil {
+		fmt.Fprintf(w, "Failed to render message content: %v", err)
+		return nil
+	}
+
 	footer := &strings.Builder{}
 	footer.WriteString("---\nMessage parts:\n")
 	for _, parts := range content.Parts {
 		fmt.Fprintf(footer, "- %s: %d bytes\n", parts.ContentType, len(parts.Content))
 	}
+	if _, err := io.WriteString(w, tview.Escape(footer.String())); err != nil {
+		return err
+	}
 
-	txt := renderContent(content)
-
-	return fmt.Sprintf("From: %s\nSubject: %s\n\n%s\n\n%s", msg.Sender, msg.Subject, txt, footer.String()), nil
+	return nil
 }
 
 func (c *MessageViewController) View() tview.Primitive {
@@ -110,12 +125,10 @@ func (c *MessageViewController) View() tview.Primitive {
 		SetWrap(false).
 		SetTextStyle(styles.InfoBarStyle)
 
-	c.TextView = tview.NewTextView()
-	txt, err := renderMessage(c.Message, c.Content)
-	if err != nil {
-		txt = fmt.Sprintf("Failed to render message: %v", err)
+	c.TextView = tview.NewTextView().SetDynamicColors(true).SetTextStyle(styles.MessageViewStyle)
+	if err := renderMessage(c.TextView, c.Message, c.Content); err != nil {
+		fmt.Fprintf(c.TextView, "Failed to render message: %v", err)
 	}
-	fmt.Fprintln(c.TextView, txt)
 	c.TextView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape || event.Key() == tcell.KeyEsc ||
 			event.Key() == tcell.KeyLeft || event.Rune() == 'q' || event.Rune() == 'Q' {

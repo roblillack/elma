@@ -67,6 +67,12 @@ func (b *FakeBackend) LoadMessageContent(*models.Message) (*models.MessageConten
 				ContentType: "text/plain",
 				Content:     []byte("Hello, World!\r\n"),
 			},
+			{
+				ContentType: "text/html",
+				Content: []byte(`<h1>Hello, World!</h1>
+		<p>This is a test message.</p>
+		<p>It contains some <mark>highlighted</mark> content.</p>`),
+			},
 		},
 	}, nil
 }
