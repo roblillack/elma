@@ -36,10 +36,12 @@ func WriteFTML(w io.Writer, d *ftml.Document) error {
 		Document: d,
 	}
 
-	return f.WriteParagraphs(d.Paragraphs, "", "")
+	indent := strings.Repeat(" ", IndentWidth)
+	return f.WriteParagraphs(d.Paragraphs, indent, indent)
 }
 
-const WrapWidth = 72
+const IndentWidth = 2
+const WrapWidth = 78
 
 // As per tview's documentation:
 // https://github.com/rivo/tview/blob/master/doc.go#L95
@@ -116,11 +118,7 @@ func (f *FTMLRenderer) WriteSpan(span ftml.Span, length int, followPrefix string
 
 			nextWs := strings.IndexAny(span.Text[pos:], " \t\n")
 			if nextWs == -1 {
-				if err := f.WriteString(span.Text[pos:]); err != nil {
-					return length, err
-				}
-				length += len([]rune(span.Text[pos:]))
-				break
+				nextWs = len(span.Text) - pos
 			}
 
 			word := span.Text[pos : pos+nextWs]
