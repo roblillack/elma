@@ -1,6 +1,7 @@
 package mock
 
 import (
+	_ "embed"
 	"math/rand"
 	"time"
 
@@ -559,4 +560,18 @@ func (m *Mocker) OldRandomMessage() *models.Message {
 		msg.Forwarded = false
 	}
 	return msg
+}
+
+//go:embed content.html
+var msgContent []byte
+
+func MessageContent() *models.MessageContent {
+	return &models.MessageContent{
+		Parts: []models.MessageContentPart{
+			{
+				ContentType: "text/html",
+				Content: msgContent,
+			},
+		},
+	}
 }

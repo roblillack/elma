@@ -61,20 +61,7 @@ func (b *FakeBackend) LoadInbox() ([]*models.Message, chan events.Event, error) 
 }
 
 func (b *FakeBackend) LoadMessageContent(*models.Message) (*models.MessageContent, error) {
-	return &models.MessageContent{
-		Parts: []models.MessageContentPart{
-			{
-				ContentType: "text/plain",
-				Content:     []byte("Hello, World!\r\n"),
-			},
-			{
-				ContentType: "text/html",
-				Content: []byte(`<h1>Hello, World!</h1>
-		<p>This is a test message.</p>
-		<p>It contains some <mark>highlighted</mark> content.</p>`),
-			},
-		},
-	}, nil
+	return mock.MessageContent(), nil
 }
 
 func (b *FakeBackend) ArchiveMessage(*models.Message) error {
