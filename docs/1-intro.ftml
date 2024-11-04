@@ -1,16 +1,3 @@
-<p>Hey John Doe,</p>
-
-<p>for the purpose of showcasing ELMA, the ELectronic Mail Agent, I herewith
-send you the current version of the «User Guide» as an email. Feel free to
-read it right here, run <code>man elma</code> or press the <code>?</code>
-key at any time to get back to reading.</p>
-
-<p>Best,<br/>Rob Lillack,<br/>ELMA Author.</p>
-
-<h1>* * *</h1>
-
-<h1>ELMA User Guide</h1>
-
 <p>The purpose of this document is to demonstrate the following use-cases:</p>
 
 <ul>

@@ -1,10 +1,14 @@
 package mock
 
 import (
+	"bytes"
 	_ "embed"
+	"html/template"
 	"math/rand"
+	"os/user"
 	"time"
 
+	"github.com/roblillack/elma/docs"
 	"github.com/roblillack/elma/models"
 )
 
@@ -562,15 +566,49 @@ func (m *Mocker) OldRandomMessage() *models.Message {
 	return msg
 }
 
-//go:embed content.html
-var msgContent []byte
+//go:embed welcome-msg.html
+var welcomeIntro []byte
+
+var welcomeMail []byte
+
+func init() {
+	tpl, err := template.New("welcome").Parse(string(welcomeIntro))
+	if err != nil {
+		panic(err)
+	}
+
+	name := "ELMA User"
+	if u, err := user.Current(); err == nil && u != nil && u.Name != "" {
+		name = u.Name
+	}
+
+	buf := bytes.Buffer{}
+	if err := tpl.Execute(&buf, map[string]string{
+		"name": name,
+	}); err != nil {
+		panic(err)
+	}
+
+	docs, err := docs.ByteSlices()
+	if err != nil {
+		panic(err)
+	}
+
+	for _, doc := range docs {
+		if _, err := buf.Write(doc); err != nil {
+			panic(err)
+		}
+	}
+
+	welcomeMail = buf.Bytes()
+}
 
 func MessageContent() *models.MessageContent {
 	return &models.MessageContent{
 		Parts: []models.MessageContentPart{
 			{
 				ContentType: "text/html",
-				Content: msgContent,
+				Content:     welcomeMail,
 			},
 		},
 	}
