@@ -7,6 +7,20 @@
 - [ ] Support for `multipart/alternative` and `multipart/related`
 - [ ] Support for `application/ics` (iCalendar) to at least show basic content
 - [ ] Support identifying and working with attachments
+- [ ] `/` should search for messages in the current mailbox
+- [ ] `%` (needs to be checked against Gmail web, fastmail web, Mutt) shulf offer a menu to FILTER the current mailbox against (to be selected by user) all mails with same list-id/sender/subject/date
+- [ ] `!` should mark as Spam
+- [ ] `.` Should open a MENU in most cases to allow the user to select the default and additional actions
+- [ ] `?` Should open the online help whenever possible. This should be a full manual, not just a simple list of keybindings, because: The "default" actions are shown in the action bar anyhow, the additional commands are listed in the "context menu"
+- [ ] Right-clicking should also open the context menu
+- [ ] We should try out centered modal dialogs, instead of a command prompt at the bottom
+- [ ] "toolbar buttons" should flash before the action is executed
+- We commands to:
+  - [ ] Open the current view (message or folder) in a web view (specific to the used backend)
+  - [ ] View this message in a browser for selected extensions and/or use xdg-open to open the current message part using the default application
+- Nice to have:
+  - Build website/tool to compare html2txt/links/lynx/elinks vs. FTML import for random websites
+  
 
 ## User Manual
 
