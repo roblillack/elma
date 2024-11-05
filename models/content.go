@@ -1,7 +1,8 @@
 package models
 
 type MessageContent struct {
-	Parts []MessageContentPart
+	Mailer string
+	Parts  []MessageContentPart
 }
 
 type MessageContentPart struct {

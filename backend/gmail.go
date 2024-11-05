@@ -491,7 +491,8 @@ func (b *GmailBackend) LoadMessageContent(m *models.Message) (*models.MessageCon
 	}
 
 	response := models.MessageContent{
-		Parts: []models.MessageContentPart{},
+		Mailer: content.Header.Get("X-Mailer"),
+		Parts:  []models.MessageContentPart{},
 	}
 
 	if mr := content.MultipartReader(); mr != nil {
