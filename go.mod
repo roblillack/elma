@@ -12,8 +12,8 @@ require (
 	github.com/gdamore/tcell/v2 v2.7.4
 	github.com/mitchellh/go-homedir v1.1.0
 	github.com/pelletier/go-toml v1.9.5
-	github.com/rivo/tview v0.0.0-20241030223020-e34b54cd4c27
-	github.com/roblillack/ftml v0.0.0-20241101123641-d4bcfb9f125f
+	github.com/rivo/tview v0.0.0-20241103174730-c76f7879f592
+	github.com/roblillack/ftml v0.0.0-20241104225530-a5819c728818
 )
 
 require github.com/emersion/go-message v0.18.1
