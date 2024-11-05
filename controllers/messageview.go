@@ -11,18 +11,20 @@ import (
 
 	"github.com/roblillack/elma/models"
 	"github.com/roblillack/elma/styles"
+	"github.com/roblillack/elma/views"
 	"github.com/roblillack/elma/views/formatters"
 	"github.com/roblillack/ftml/html"
 )
 
 type MessageViewController struct {
-	App       *Application
-	TextView  *tview.TextView
-	ActionBar *tview.TextView
-	InfoBar   *tview.TextView
-	Message   *models.Message
-	Content   *models.MessageContent
-	Keymap    []KeymapEntry
+	App         *Application
+	TextView    *tview.TextView
+	ActionBar   *tview.TextView
+	InfoBar     *tview.TextView
+	Message     *models.Message
+	Content     *models.MessageContent
+	Keymap      []KeymapEntry
+	Unformatted bool
 }
 
 var _ Controller = &MessageViewController{}
@@ -63,8 +65,15 @@ func getContentType(content *models.MessageContent, contentType string) []byte {
 	return nil
 }
 
-func writeContent(w io.Writer, content *models.MessageContent) error {
+func writeContent(w io.Writer, content *models.MessageContent, unformatted bool) error {
 	if rawHTML := getContentType(content, "text/html"); rawHTML != nil {
+		if unformatted {
+			if _, err := io.WriteString(w, string(rawHTML)); err != nil {
+				return fmt.Errorf("Failed to write raw HTML: %v", err)
+			}
+			return nil
+		}
+
 		doc, err := html.Parse(bytes.NewReader(rawHTML))
 		if err != nil {
 			return fmt.Errorf("Failed to parse HTML: %v", err)
@@ -118,7 +127,7 @@ func (c *MessageViewController) renderMessage(w *tview.TextView, msg *models.Mes
 	}
 	io.WriteString(w, "\n")
 
-	if err := writeContent(w, content); err != nil {
+	if err := writeContent(w, content, c.Unformatted); err != nil {
 		fmt.Fprintf(w, "Failed to render message content: %v", err)
 		return nil
 	}
@@ -159,6 +168,26 @@ func (c *MessageViewController) View() tview.Primitive {
 			event.Key() == tcell.KeyLeft || event.Rune() == 'q' || event.Rune() == 'Q' {
 			c.App.PopScreen()
 			return nil
+		}
+
+		if event.Rune() == '.' {
+			options := []views.MenuItem{}
+			if c.Unformatted {
+				options = append(options,
+					views.MenuItem{
+						Key:         'u',
+						Title:       "Formatted",
+						Description: "Shows formatted message content",
+						OnActivate:  func() { c.Unformatted = !c.Unformatted }})
+			} else {
+				options = append(options,
+					views.MenuItem{
+						Key:         'u',
+						Title:       "Unformatted",
+						Description: "Shows unformatted message content",
+						OnActivate:  func() { c.Unformatted = !c.Unformatted }})
+			}
+			c.App.ShowMenu("Message", options)
 		}
 
 		for _, e := range c.Keymap {

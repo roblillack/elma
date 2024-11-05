@@ -10,12 +10,14 @@ import (
 
 	"github.com/roblillack/elma/backend"
 	"github.com/roblillack/elma/events"
+	"github.com/roblillack/elma/views"
 )
 
 type Application struct {
-	Backend backend.Backend
-	View    *tview.Application
-	Screens []Controller
+	Backend  backend.Backend
+	View     *tview.Application
+	Screens  []Controller
+	Overlays []tview.Primitive
 }
 
 func (a *Application) GotoInbox() error {
@@ -53,6 +55,36 @@ func (a *Application) PushScreen(c Controller) {
 func (a *Application) ReplaceScreens(c Controller) {
 	a.Screens = []Controller{c}
 	a.View.SetRoot(c.View(), true)
+}
+
+func (a *Application) Overlay(p tview.Primitive) {
+	topScreen := a.Screens[len(a.Screens)-1]
+	pages := tview.NewPages().
+		AddPage("background", topScreen.View(), true, true).
+		AddPage("modal", p, true, true)
+	a.View.SetRoot(pages, true)
+}
+
+func (a *Application) RemoveOverlay() {
+	log.Println("RemoveOverlay")
+	topScreen := a.Screens[len(a.Screens)-1]
+	a.View.SetRoot(topScreen.View(), true)
+}
+
+func (a *Application) ShowMenu(title string, items []views.MenuItem) {
+	wrappedItems := make([]views.MenuItem, len(items))
+	for idx, item := range items {
+		wrappedItems[idx] = item
+		if item.OnActivate != nil {
+			wrappedItems[idx].OnActivate = func() {
+				item.OnActivate()
+				a.RemoveOverlay()
+			}
+		}
+	}
+
+	menu := views.Menu(title, wrappedItems, a.RemoveOverlay)
+	a.Overlay(menu)
 }
 
 func (a *Application) PopScreen(unhandledKeybinding ...rune) {
