@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
 	tcell "github.com/gdamore/tcell/v2"
@@ -25,6 +26,7 @@ type MessageViewController struct {
 	Content     *models.MessageContent
 	Keymap      []KeymapEntry
 	Unformatted bool
+	InfoText    string
 }
 
 var _ Controller = &MessageViewController{}
@@ -159,6 +161,10 @@ func (c *MessageViewController) View() tview.Primitive {
 		SetWrap(false).
 		SetTextStyle(styles.InfoBarStyle)
 
+	if c.InfoText != "" {
+		fmt.Fprintf(c.InfoBar, "[::b]%s[::]", c.InfoText)
+	}
+
 	c.TextView = tview.NewTextView().SetDynamicColors(true).SetTextStyle(styles.MessageViewStyle)
 	if err := c.renderMessage(c.TextView, c.Message, c.Content); err != nil {
 		fmt.Fprintf(c.TextView, "Failed to render message: %v", err)
@@ -187,6 +193,22 @@ func (c *MessageViewController) View() tview.Primitive {
 						Description: "Shows unformatted message content",
 						OnActivate:  func() { c.Unformatted = !c.Unformatted }})
 			}
+			options = append(options,
+				views.MenuItem{
+					Key:         'd',
+					Title:       "Download & debug",
+					Description: "Save message to /tmp for debugging",
+					OnActivate: func() {
+						for _, part := range c.Content.Parts {
+							if part.ContentType == "text/html" {
+								os.WriteFile("/tmp/message.html", part.Content, 0644)
+							}
+							if part.ContentType == "text/plain" {
+								os.WriteFile("/tmp/message.txt", part.Content, 0644)
+							}
+						}
+						c.InfoText = "Message saved to /tmp/message.*"
+					}})
 			c.App.ShowMenu("Message", options)
 		}
 
