@@ -428,7 +428,7 @@ func (b *GmailBackend) LoadInbox() ([]*models.Message, chan events.Event, error)
 }
 
 func getMessageParts(e *message.Entity, msg *models.Message, level int) ([]models.MessageContentPart, error) {
-	if level >= 3 {
+	if level >= 5 {
 		return nil, errors.New("Too many levels of nesting")
 	}
 
@@ -450,17 +450,17 @@ func getMessageParts(e *message.Entity, msg *models.Message, level int) ([]model
 			}
 			list = append(list, parts...)
 		}
+
 		return list, nil
 	}
 
-	t, _, _ := e.Header.ContentType()
-
+	contentType, _, _ := e.Header.ContentType()
 	rawContent, err := io.ReadAll(e.Body)
 	if err != nil {
 		return nil, err
 	}
 
-	return []models.MessageContentPart{{ContentType: t, Content: rawContent}}, nil
+	return []models.MessageContentPart{{ContentType: contentType, Content: rawContent}}, nil
 }
 
 func (b *GmailBackend) LoadMessageContent(m *models.Message) (*models.MessageContent, error) {
