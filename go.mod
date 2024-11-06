@@ -13,7 +13,7 @@ require (
 	github.com/mitchellh/go-homedir v1.1.0
 	github.com/pelletier/go-toml v1.9.5
 	github.com/rivo/tview v0.0.0-20241103174730-c76f7879f592
-	github.com/roblillack/ftml v0.0.0-20241106081518-ac29e6de9673
+	github.com/roblillack/ftml v0.0.0-20241106151054-92d7d69902f4
 )
 
 require github.com/emersion/go-message v0.18.1
