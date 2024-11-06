@@ -58,6 +58,10 @@ github.com/roblillack/ftml v0.0.0-20241105083559-d19410496171 h1:tGlSHdKUW3pZCFP
 github.com/roblillack/ftml v0.0.0-20241105083559-d19410496171/go.mod h1:fpH+RdStXTkJSJFcrFdvCBAnJwwuR2Ba1iMmWtIGMEE=
 github.com/roblillack/ftml v0.0.0-20241105094221-500cd294cb57 h1:sDvuPzGV7FDctaYaXLaViSLmhkNZ6O6CjmQAQLKaHog=
 github.com/roblillack/ftml v0.0.0-20241105094221-500cd294cb57/go.mod h1:fpH+RdStXTkJSJFcrFdvCBAnJwwuR2Ba1iMmWtIGMEE=
+github.com/roblillack/ftml v0.0.0-20241106061407-a33b11a1eac4 h1:yWjeljAwkxeiNu401jtQhzOvcnCcrxV1GaOMDPzZxy8=
+github.com/roblillack/ftml v0.0.0-20241106061407-a33b11a1eac4/go.mod h1:fpH+RdStXTkJSJFcrFdvCBAnJwwuR2Ba1iMmWtIGMEE=
+github.com/roblillack/ftml v0.0.0-20241106081518-ac29e6de9673 h1:Pbgn3xsyHwn2+re6BAY6+1TqcIYRWeeX9YpgPnTeX08=
+github.com/roblillack/ftml v0.0.0-20241106081518-ac29e6de9673/go.mod h1:fpH+RdStXTkJSJFcrFdvCBAnJwwuR2Ba1iMmWtIGMEE=
 github.com/roblillack/gockl v1.1.0 h1:1MhJd3icqIspp8kiSQ8DoWtJ9QYB5KRqJY214oEjVBE=
 github.com/roblillack/gockl v1.1.0/go.mod h1:pOVcdqbv1yQ8iED72k9Hq272K0k10nq8FGp5rRdbBJU=
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
