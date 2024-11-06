@@ -427,6 +427,42 @@ func (b *GmailBackend) LoadInbox() ([]*models.Message, chan events.Event, error)
 	return list, eventQueue, err
 }
 
+func getMessageParts(e *message.Entity, msg *models.Message, level int) ([]models.MessageContentPart, error) {
+	if level >= 3 {
+		return nil, errors.New("Too many levels of nesting")
+	}
+
+	if r := e.MultipartReader(); r != nil {
+		// This is a multipart message
+		list := []models.MessageContentPart{}
+		for {
+			p, err := r.NextPart()
+			if errors.Is(err, io.EOF) {
+				break
+			} else if err != nil {
+				log.Printf("Unable to read part of multipart message %v from %s: %s", msg.ID, msg.Sent.Format(time.RFC3339), err)
+				break
+			}
+
+			parts, err := getMessageParts(p, msg, level+1)
+			if err != nil {
+				return nil, err
+			}
+			list = append(list, parts...)
+		}
+		return list, nil
+	}
+
+	t, _, _ := e.Header.ContentType()
+
+	rawContent, err := io.ReadAll(e.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	return []models.MessageContentPart{{ContentType: t, Content: rawContent}}, nil
+}
+
 func (b *GmailBackend) LoadMessageContent(m *models.Message) (*models.MessageContent, error) {
 	log.Println("GmailBackend.LoadMessageContent")
 
@@ -490,51 +526,15 @@ func (b *GmailBackend) LoadMessageContent(m *models.Message) (*models.MessageCon
 		log.Fatalf("Unable to read message %v from %s: %s", m.ID, m.Sent.Format(time.RFC3339), err)
 	}
 
-	response := models.MessageContent{
+	parts, err := getMessageParts(content, m, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	return &models.MessageContent{
 		Mailer: content.Header.Get("X-Mailer"),
-		Parts:  []models.MessageContentPart{},
-	}
-
-	if mr := content.MultipartReader(); mr != nil {
-		// This is a multipart message
-		log.Println("This is a multipart message containing:")
-		for {
-			p, err := mr.NextPart()
-			if errors.Is(err, io.EOF) {
-				break
-			} else if err != nil {
-				log.Printf("Unable to read part of multipart message %v from %s: %s", m.ID, m.Sent.Format(time.RFC3339), err)
-				break
-			}
-
-			rawContent, err := io.ReadAll(p.Body)
-			if err != nil {
-				return nil, err
-			}
-
-			t, _, _ := p.Header.ContentType()
-			log.Println("A part with type", t)
-			response.Parts = append(response.Parts, models.MessageContentPart{
-				ContentType: t,
-				Content:     rawContent,
-			})
-		}
-	} else {
-		t, _, _ := content.Header.ContentType()
-		log.Println("This is a non-multipart message with type", t)
-
-		rawContent, err := io.ReadAll(content.Body)
-		if err != nil {
-			return nil, err
-		}
-
-		response.Parts = append(response.Parts, models.MessageContentPart{
-			ContentType: t,
-			Content:     rawContent,
-		})
-	}
-
-	return &response, nil
+		Parts:  parts,
+	}, nil
 }
 
 func (b *GmailBackend) loadMessages(seqSet *imap.SeqSet) ([]*models.Message, error) {

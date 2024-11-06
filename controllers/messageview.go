@@ -92,6 +92,7 @@ func writeContent(w io.Writer, content *models.MessageContent, unformatted bool)
 		if _, err := io.WriteString(w, tview.Escape(string(txt))); err != nil {
 			return fmt.Errorf("Failed to write plain text: %v", err)
 		}
+		return nil
 	}
 
 	return fmt.Errorf("No known content types found")
@@ -131,11 +132,10 @@ func (c *MessageViewController) renderMessage(w *tview.TextView, msg *models.Mes
 
 	if err := writeContent(w, content, c.Unformatted); err != nil {
 		fmt.Fprintf(w, "Failed to render message content: %v", err)
-		return nil
 	}
 
 	footer := &strings.Builder{}
-	footer.WriteString("---\nMessage parts:\n")
+	footer.WriteString("\n---\nMessage parts:\n")
 	for _, parts := range content.Parts {
 		fmt.Fprintf(footer, "- %s: %d bytes\n", parts.ContentType, len(parts.Content))
 	}
@@ -202,9 +202,10 @@ func (c *MessageViewController) View() tview.Primitive {
 						for _, part := range c.Content.Parts {
 							if part.ContentType == "text/html" {
 								os.WriteFile("/tmp/message.html", part.Content, 0644)
-							}
-							if part.ContentType == "text/plain" {
+							} else if part.ContentType == "text/plain" {
 								os.WriteFile("/tmp/message.txt", part.Content, 0644)
+							} else {
+								os.WriteFile(fmt.Sprintf("/tmp/message.%s", strings.ReplaceAll(part.ContentType, "/", "-")), part.Content, 0644)
 							}
 						}
 						c.InfoText = "Message saved to /tmp/message.*"
