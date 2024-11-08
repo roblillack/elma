@@ -67,7 +67,7 @@ func getContentType(content *models.MessageContent, contentType string) []byte {
 	return nil
 }
 
-func writeContent(w io.Writer, content *models.MessageContent, unformatted bool) error {
+func writeContent(w io.Writer, content *models.MessageContent, width int, unformatted bool) error {
 	if rawHTML := getContentType(content, "text/html"); rawHTML != nil {
 		if unformatted {
 			if _, err := io.WriteString(w, string(rawHTML)); err != nil {
@@ -81,7 +81,7 @@ func writeContent(w io.Writer, content *models.MessageContent, unformatted bool)
 			return fmt.Errorf("Failed to parse HTML: %v", err)
 		}
 
-		if err := formatters.WriteFTML(w, doc); err != nil {
+		if err := formatters.WriteFTML(w, doc, width); err != nil {
 			return fmt.Errorf("Failed to format FTML: %v", err)
 		}
 
@@ -130,7 +130,11 @@ func (c *MessageViewController) renderMessage(w *tview.TextView, msg *models.Mes
 	}
 	io.WriteString(w, "\n")
 
-	if err := writeContent(w, content, c.Unformatted); err != nil {
+	msgWidth := width
+	if width > 80 {
+		msgWidth = 80
+	}
+	if err := writeContent(w, content, msgWidth, c.Unformatted); err != nil {
 		fmt.Fprintf(w, "Failed to render message content: %v", err)
 	}
 
