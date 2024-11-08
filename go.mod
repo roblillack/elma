@@ -13,7 +13,7 @@ require (
 	github.com/mitchellh/go-homedir v1.1.0
 	github.com/pelletier/go-toml v1.9.5
 	github.com/rivo/tview v0.0.0-20241103174730-c76f7879f592
-	github.com/roblillack/ftml v0.0.0-20241106151054-92d7d69902f4
+	github.com/roblillack/ftml v0.0.0-20241108072218-03c900ea65f7
 )
 
 require github.com/emersion/go-message v0.18.1
@@ -26,11 +26,13 @@ require (
 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
 	github.com/mattn/go-runewidth v0.0.16 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
-	github.com/roblillack/gockl v1.1.0 // indirect
+	github.com/roblillack/gockl v1.1.1 // indirect
 	golang.org/x/crypto v0.28.0 // indirect
 	golang.org/x/sys v0.26.0 // indirect
 	golang.org/x/term v0.25.0 // indirect
 	golang.org/x/text v0.19.0 // indirect
 )
 
-// replace github.com/roblillack/ftml v0.0.0-20241030170330-a8d7d9c7ac74 => ../ftml
+// replace github.com/roblillack/ftml => ../ftml
+
+// replace github.com/roblillack/gockl => ../gockl
