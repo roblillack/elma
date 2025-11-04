@@ -50,6 +50,26 @@ few seconds to keep the inbox active.
 - `$` commits scheduled actions (removing archived/deleted messages from the list).
 - Arrow keys, `PageUp`/`PageDown`, `Home`, `End` move the cursor in the inbox.
 - While a message is open, `j` / `k` jump to the next/previous message and `.` toggles raw HTML.
+- `g` go to mailbox:
+  - `i` Inbox
+  - `a` Archive
+  - `s` Starred
+  - `d` Drafts
+  - `t` Sent
+  - `T` Trash
+
+### Todo
+
+- [ ] Add `!` to report as spam
+- [ ] Add `g` `S` to go to spam mailbox
+- [ ] Implement `r` to reply to message
+- [ ] Implement `a` to reply all
+- [ ] Implement `f` to forward message
+- [ ] `=`/`+` and `-` to mark as important/unimportant
+- [ ] Implement search (`/` and `n`/`N`)
+- [ ] Implement composing new message (`c`)
+- [ ] Make sure to
+- [ ] Implement help overlay (`?`)
 
 ## Project layout
 

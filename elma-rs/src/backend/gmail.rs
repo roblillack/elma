@@ -812,7 +812,7 @@ fn build_message_from_fetch(fetch: &Fetch) -> Result<Option<StoredMessage>> {
         .unwrap_or_else(OffsetDateTime::now_utc);
 
     let sender = extract_sender(envelope);
-    let subject = decode_header(envelope.subject.as_ref());
+    let subject = decode_header(envelope.subject.as_ref(), "Subject");
     let size = fetch.size.unwrap_or_default() as usize;
     let flags: Vec<_> = fetch.flags().collect();
 
@@ -862,9 +862,17 @@ fn collect_parts(
 
     if mail.subparts.is_empty() {
         let content_type = mail.ctype.mimetype.clone();
-        let data = mail
-            .get_body_raw()
-            .context("reading message body segment")?;
+        let data = if mail.ctype.mimetype.starts_with("text/") {
+            match mail.get_body() {
+                Ok(text) => text.into_bytes(),
+                Err(_) => mail
+                    .get_body_raw()
+                    .context("reading message body segment")?,
+            }
+        } else {
+            mail.get_body_raw()
+                .context("reading message body segment")?
+        };
         parts.push(MessageContentPart {
             content_type,
             content: data,
@@ -890,7 +898,7 @@ fn convert_internal_date(dt: chrono::DateTime<chrono::FixedOffset>) -> Option<Of
     OffsetDateTime::from_unix_timestamp(dt.timestamp()).ok()
 }
 
-fn decode_header(value: Option<&std::borrow::Cow<'_, [u8]>>) -> String {
+fn decode_header(value: Option<&std::borrow::Cow<'_, [u8]>>, field_name: &str) -> String {
     let Some(raw) = value else {
         return String::new();
     };
@@ -901,8 +909,9 @@ fn decode_header(value: Option<&std::borrow::Cow<'_, [u8]>>) -> String {
 
     // Use mailparse's header parser so RFC 2047 encoded words are decoded
     // consistently with full message parsing.
-    let mut header_bytes = Vec::with_capacity(b"Subject: \r\n".len() + raw.len());
-    header_bytes.extend_from_slice(b"Subject: ");
+    let mut header_bytes = Vec::with_capacity(field_name.len() + 4 + raw.len());
+    header_bytes.extend_from_slice(field_name.as_bytes());
+    header_bytes.extend_from_slice(b": ");
     header_bytes.extend_from_slice(raw.as_ref());
     header_bytes.extend_from_slice(b"\r\n");
 
@@ -916,10 +925,10 @@ fn extract_sender(envelope: &imap_proto::types::Envelope<'_>) -> String {
     if let Some(addresses) = &envelope.from {
         if let Some(address) = addresses.first() {
             if let Some(name) = &address.name {
-                if let Ok(text) = str::from_utf8(name.as_ref()) {
-                    return text.to_string();
+                let decoded = decode_header(Some(name), "From");
+                if !decoded.is_empty() {
+                    return decoded;
                 }
-                return String::from_utf8_lossy(name.as_ref()).into_owned();
             }
 
             let mailbox = address

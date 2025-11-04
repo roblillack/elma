@@ -108,7 +108,7 @@ impl MessageContent {
     pub fn part(&self, content_type: &str) -> Option<&MessageContentPart> {
         self.parts
             .iter()
-            .find(|part| part.content_type == content_type)
+            .find(|part| part.content_type.eq_ignore_ascii_case(content_type))
     }
 }
 

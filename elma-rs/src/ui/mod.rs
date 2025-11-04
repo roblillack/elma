@@ -423,7 +423,8 @@ fn style_for_row(row: &crate::app::MessageRow) -> Style {
 }
 
 fn plain_text(content: &crate::model::MessageContent) -> Option<String> {
-    content
-        .part("text/plain")
-        .and_then(|part| String::from_utf8(part.content.clone()).ok())
+    content.part("text/plain").map(|part| {
+        String::from_utf8(part.content.clone())
+            .unwrap_or_else(|_| String::from_utf8_lossy(&part.content).into_owned())
+    })
 }
