@@ -7,13 +7,60 @@ use anyhow::{Context, Result, anyhow};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::{
     cmp::{max, min},
+    collections::VecDeque,
     io::Cursor,
-    sync::mpsc::{Receiver, TryRecvError},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender, TryRecvError},
+    },
+    thread,
 };
 use tdoc::{Document, html};
 use time::OffsetDateTime;
 
 const PAGE_JUMP: isize = 5;
+const PROGRESS_SEGMENTS: usize = 5;
+
+#[derive(Debug)]
+enum CommitCommand {
+    Enqueue(Vec<Action>),
+    Shutdown,
+}
+
+#[derive(Debug)]
+enum CommitEvent {
+    ActionFinished {
+        action: Action,
+        result: std::result::Result<(), String>,
+    },
+}
+
+#[derive(Debug)]
+struct CommitBatchState {
+    actions: Vec<Action>,
+    completed: usize,
+    failed: Vec<(Action, String)>,
+}
+
+impl CommitBatchState {
+    fn new(actions: Vec<Action>) -> Self {
+        Self {
+            actions,
+            completed: 0,
+            failed: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.actions.len()
+    }
+}
+
+#[derive(Debug)]
+struct CommitProgress {
+    total: usize,
+    completed: usize,
+}
 
 pub enum ActiveView {
     Inbox,
@@ -21,10 +68,14 @@ pub enum ActiveView {
 }
 
 pub struct App {
-    backend: Box<dyn MailBackend>,
+    backend: Arc<dyn MailBackend>,
     inbox: InboxState,
     message_view: Option<MessageViewState>,
     should_quit: bool,
+    commit_tx: Sender<CommitCommand>,
+    commit_events: Receiver<CommitEvent>,
+    commit_batches: VecDeque<CommitBatchState>,
+    commit_progress: Option<CommitProgress>,
 }
 
 struct InboxState {
@@ -51,6 +102,8 @@ pub(crate) struct MessageViewState {
 
 impl App {
     pub fn new(backend: Box<dyn MailBackend>) -> Result<Self> {
+        let backend: Arc<dyn MailBackend> = Arc::from(backend);
+
         let (messages, events) = backend
             .load_inbox()
             .context("failed to load inbox from backend")?;
@@ -73,11 +126,24 @@ impl App {
             scroll_top: 0,
         };
 
+        let (commit_tx, command_rx) = mpsc::channel();
+        let (event_tx, commit_events) = mpsc::channel();
+
+        let worker_backend = Arc::clone(&backend);
+        thread::Builder::new()
+            .name("commit-worker".into())
+            .spawn(move || run_commit_worker(worker_backend, command_rx, event_tx))
+            .context("failed to spawn commit worker")?;
+
         Ok(Self {
             backend,
             inbox,
             message_view: None,
             should_quit: false,
+            commit_tx,
+            commit_events,
+            commit_batches: VecDeque::new(),
+            commit_progress: None,
         })
     }
 
@@ -103,6 +169,8 @@ impl App {
     }
 
     pub fn poll_backend_events(&mut self) {
+        self.poll_commit_events();
+
         let mut resort = false;
         let mut refresh = false;
         let current_id = self.message_view.as_ref().map(|view| view.message_id);
@@ -166,6 +234,93 @@ impl App {
         }
     }
 
+    fn poll_commit_events(&mut self) {
+        loop {
+            match self.commit_events.try_recv() {
+                Ok(event) => self.handle_commit_event(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn handle_commit_event(&mut self, event: CommitEvent) {
+        match event {
+            CommitEvent::ActionFinished { action, result } => {
+                if let Some(progress) = self.commit_progress.as_mut() {
+                    progress.completed = progress.completed.saturating_add(1);
+                    if progress.completed > progress.total {
+                        progress.completed = progress.total;
+                    }
+                }
+
+                if let Some(batch) = self.commit_batches.front_mut() {
+                    batch.completed += 1;
+                    if let Err(error) = result {
+                        batch.failed.push((action, error));
+                    }
+                }
+
+                self.finalize_commit_batches();
+            }
+        }
+    }
+
+    fn finalize_commit_batches(&mut self) {
+        loop {
+            let ready = match self.commit_batches.front() {
+                Some(batch) if batch.completed >= batch.len() => true,
+                _ => false,
+            };
+
+            if !ready {
+                break;
+            }
+
+            let Some(batch) = self.commit_batches.pop_front() else {
+                break;
+            };
+
+            if batch.failed.is_empty() {
+                self.inbox.messages.retain(|msg| {
+                    msg.status != MessageStatus::Archived && msg.status != MessageStatus::Deleted
+                });
+                self.inbox.status_line = Some("Actions committed.".to_string());
+            } else {
+                let summary = format!("Failed to apply {} actions.", batch.failed.len());
+                self.inbox.status_line = Some(summary);
+                self.inbox
+                    .scheduled
+                    .extend(batch.failed.into_iter().map(|(action, _error)| action));
+            }
+
+            self.sync_message_view_state();
+            if let Some(idx) = self.inbox.selected {
+                if idx >= self.inbox.messages.len() && !self.inbox.messages.is_empty() {
+                    self.inbox.selected = Some(self.inbox.messages.len() - 1);
+                }
+            }
+
+            if self.inbox.messages.is_empty() {
+                self.inbox.selected = None;
+                self.message_view = None;
+            }
+
+            self.normalize_scroll();
+        }
+
+        if self.commit_batches.is_empty() {
+            let reset = self
+                .commit_progress
+                .as_ref()
+                .map(|progress| progress.completed >= progress.total)
+                .unwrap_or(false);
+            if reset {
+                self.commit_progress = None;
+            }
+        }
+    }
+
     pub fn on_resize(&mut self) {
         if let Some(view) = &mut self.message_view {
             view.scroll = 0;
@@ -207,6 +362,28 @@ impl App {
         }
 
         text
+    }
+
+    pub(crate) fn commit_indicator(&self) -> Option<String> {
+        let progress = self.commit_progress.as_ref()?;
+        if progress.total == 0 {
+            return None;
+        }
+
+        let capped_completed = progress.completed.min(progress.total);
+        let filled = (capped_completed * PROGRESS_SEGMENTS + progress.total - 1) / progress.total;
+
+        let mut indicator = String::from("[");
+        for idx in 0..PROGRESS_SEGMENTS {
+            if idx < filled {
+                indicator.push('#');
+            } else {
+                indicator.push(' ');
+            }
+        }
+        indicator.push(']');
+
+        Some(indicator)
     }
 
     pub(crate) fn inbox_info_bar(&self) -> String {
@@ -422,41 +599,45 @@ impl App {
         }
 
         let actions = std::mem::take(&mut self.inbox.scheduled);
-        let mut failed = Vec::new();
-        for action in &actions {
-            if let Err(err) = self.backend.apply_action(action) {
-                failed.push((action.message_id, err));
-            }
+        if actions.is_empty() {
+            return Ok(());
         }
 
-        if failed.is_empty() {
-            self.inbox.messages.retain(|msg| {
-                msg.status != MessageStatus::Archived && msg.status != MessageStatus::Deleted
-            });
-            self.inbox.status_line = Some("Actions committed.".to_string());
+        let action_count = actions.len();
+        if let Some(progress) = self.commit_progress.as_mut() {
+            progress.total += action_count;
         } else {
-            let summary = format!("Failed to apply {} actions.", failed.len());
-            self.inbox.status_line = Some(summary);
-            self.inbox.scheduled.extend(
-                actions
-                    .into_iter()
-                    .filter(|action| failed.iter().any(|(id, _)| *id == action.message_id)),
-            );
+            self.commit_progress = Some(CommitProgress {
+                total: action_count,
+                completed: 0,
+            });
         }
 
-        self.sync_message_view_state();
-        if let Some(idx) = self.inbox.selected {
-            if idx >= self.inbox.messages.len() && !self.inbox.messages.is_empty() {
-                self.inbox.selected = Some(self.inbox.messages.len() - 1);
+        let queue_actions = actions.clone();
+        self.commit_batches
+            .push_back(CommitBatchState::new(actions));
+
+        if let Err(err) = self.commit_tx.send(CommitCommand::Enqueue(queue_actions)) {
+            if let Some(batch) = self.commit_batches.pop_back() {
+                self.inbox.scheduled.extend(batch.actions);
             }
-        }
 
-        if self.inbox.messages.is_empty() {
-            self.inbox.selected = None;
-            self.message_view = None;
-        }
+            if let Some(progress) = self.commit_progress.as_mut() {
+                progress.total = progress.total.saturating_sub(action_count);
+                progress.completed = progress.completed.min(progress.total);
+                if progress.total == 0 {
+                    self.commit_progress = None;
+                }
+            }
 
-        self.normalize_scroll();
+            if let CommitCommand::Enqueue(returned_actions) = err.0 {
+                drop(returned_actions);
+            }
+
+            return Err(anyhow!(
+                "failed to queue actions for commit: worker unavailable"
+            ));
+        }
 
         Ok(())
     }
@@ -606,6 +787,39 @@ impl App {
             if self.inbox.scroll_top > max_top {
                 self.inbox.scroll_top = max_top;
             }
+        }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        let _ = self.commit_tx.send(CommitCommand::Shutdown);
+    }
+}
+
+fn run_commit_worker(
+    backend: Arc<dyn MailBackend>,
+    commands: Receiver<CommitCommand>,
+    events: Sender<CommitEvent>,
+) {
+    while let Ok(command) = commands.recv() {
+        match command {
+            CommitCommand::Enqueue(actions) => {
+                for action in actions {
+                    let outcome = backend.apply_action(&action).map_err(|err| err.to_string());
+
+                    if events
+                        .send(CommitEvent::ActionFinished {
+                            action,
+                            result: outcome,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            CommitCommand::Shutdown => break,
         }
     }
 }

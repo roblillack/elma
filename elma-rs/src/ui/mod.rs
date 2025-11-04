@@ -21,6 +21,44 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
+fn render_action_bar(frame: &mut Frame<'_>, area: Rect, text: String, indicator: Option<String>) {
+    if area.width == 0 {
+        return;
+    }
+
+    if let Some(indicator) = indicator {
+        let indicator_width = indicator.chars().count() as u16;
+
+        if indicator_width >= area.width {
+            let indicator_widget = Paragraph::new(indicator)
+                .style(Style::default().fg(Color::White).bg(Color::Red))
+                .block(Block::default().style(Style::default().bg(Color::Red)));
+            frame.render_widget(indicator_widget, area);
+            return;
+        }
+
+        let segments = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(indicator_width)])
+            .split(area);
+
+        let action_bar = Paragraph::new(text)
+            .style(action_bar_style())
+            .block(Block::default());
+        frame.render_widget(action_bar, segments[0]);
+
+        let indicator_widget = Paragraph::new(indicator)
+            .style(Style::default().fg(Color::White).bg(Color::Red))
+            .block(Block::default().style(Style::default().bg(Color::Red)));
+        frame.render_widget(indicator_widget, segments[1]);
+    } else {
+        let action_bar = Paragraph::new(text)
+            .style(action_bar_style())
+            .block(Block::default());
+        frame.render_widget(action_bar, area);
+    }
+}
+
 fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -31,10 +69,12 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
         ])
         .split(frame.size());
 
-    let action_bar = Paragraph::new(app.inbox_action_bar())
-        .style(action_bar_style())
-        .block(Block::default());
-    frame.render_widget(action_bar, layout[0]);
+    render_action_bar(
+        frame,
+        layout[0],
+        app.inbox_action_bar(),
+        app.commit_indicator(),
+    );
 
     render_message_table(frame, app, layout[1]);
 
@@ -67,10 +107,7 @@ fn render_message(frame: &mut Frame<'_>, app: &mut App) {
         .split(frame.size());
 
     let action_bar_text = message_action_bar(app, view);
-    let action_bar = Paragraph::new(action_bar_text)
-        .style(action_bar_style())
-        .block(Block::default());
-    frame.render_widget(action_bar, layout[0]);
+    render_action_bar(frame, layout[0], action_bar_text, app.commit_indicator());
 
     render_message_body(frame, view, layout[1]);
 
