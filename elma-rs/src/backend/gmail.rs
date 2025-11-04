@@ -1,5 +1,5 @@
 use crate::{
-    backend::{BackendEvent, MailBackend},
+    backend::{ActionStatus, BackendEvent, MailBackend},
     model::{
         Action, ActionType, Message, MessageContent, MessageContentPart, MessageId, MessageStatus,
     },
@@ -190,16 +190,24 @@ impl MailBackend for GmailBackend {
         })
     }
 
-    fn apply_action(&self, action: &Action) -> Result<()> {
-        self.inner.runtime.block_on(async {
-            self.inner.pause_idle().await?;
-            self.inner
-                .apply_action_internal(action)
-                .await
-                .with_context(|| format!("applying action {:?}", action.action_type))?;
-            self.inner.start_idle_loop().await?;
-            Ok(())
-        })
+    fn apply_actions(&self, actions: Vec<Action>) -> Result<mpsc::Receiver<ActionStatus>> {
+        let (tx, rx) = mpsc::channel();
+        let runtime = Arc::clone(&self.inner.runtime);
+        let inner = Arc::clone(&self.inner);
+
+        runtime.spawn(async move {
+            for action in actions {
+                let result = Arc::clone(&inner)
+                    .process_action(action.clone())
+                    .await
+                    .map_err(|err| err.to_string());
+                if tx.send(ActionStatus { action, result }).is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(rx)
     }
 }
 
@@ -320,6 +328,19 @@ impl GmailInner {
         }
 
         Ok(())
+    }
+
+    async fn process_action(self: Arc<Self>, action: Action) -> Result<()> {
+        self.pause_idle().await?;
+        let result = self
+            .apply_action_internal(&action)
+            .await
+            .with_context(|| format!("applying action {:?}", action.action_type));
+        let restart = self.start_idle_loop().await;
+        if let Err(err) = restart {
+            return Err(err);
+        }
+        result
     }
 
     async fn idle_task(self: Arc<Self>, mut stop_rx: oneshot::Receiver<()>) {

@@ -1,5 +1,5 @@
 use crate::{
-    backend::{BackendEvent, MailBackend},
+    backend::{ActionStatus, BackendEvent, MailBackend},
     model::{
         Action, ActionType, Message, MessageContent, MessageContentPart, MessageId, MessageStatus,
     },
@@ -104,33 +104,14 @@ impl MockBackend {
     fn next_id(&self) -> MessageId {
         self.id_counter.fetch_add(1, Ordering::SeqCst) + 1
     }
-}
 
-impl MailBackend for MockBackend {
-    fn load_inbox(&self) -> Result<(Vec<Message>, Receiver<BackendEvent>)> {
-        let mut receiver_guard = self.receiver.lock().expect("receiver mutex poisoned");
-        let receiver = receiver_guard
-            .take()
-            .ok_or_else(|| anyhow!("Inbox already loaded"))?;
-
-        let mut messages = self.messages.lock().expect("messages mutex poisoned");
-        messages.sort_by_key(|msg| msg.message.sent);
-        let list = messages.iter().map(|msg| msg.message.clone()).collect();
-
-        Ok((list, receiver))
-    }
-
-    fn load_message(&self, message_id: MessageId) -> Result<MessageContent> {
-        let contents = self.contents.lock().expect("contents mutex poisoned");
-        contents
-            .get(&message_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("message {message_id} not found"))
-    }
-
-    fn apply_action(&self, action: &Action) -> Result<()> {
-        let mut messages = self.messages.lock().expect("messages mutex poisoned");
-        let mut contents = self.contents.lock().expect("contents mutex poisoned");
+    fn apply_action_now(
+        messages: &Arc<Mutex<Vec<MockMessage>>>,
+        contents: &Arc<Mutex<HashMap<MessageId, MessageContent>>>,
+        action: &Action,
+    ) -> Result<()> {
+        let mut messages = messages.lock().expect("messages mutex poisoned");
+        let mut contents = contents.lock().expect("contents mutex poisoned");
 
         if let Some(msg) = messages
             .iter_mut()
@@ -157,6 +138,51 @@ impl MailBackend for MockBackend {
         } else {
             Err(anyhow!("message {} not found", action.message_id))
         }
+    }
+}
+
+impl MailBackend for MockBackend {
+    fn load_inbox(&self) -> Result<(Vec<Message>, Receiver<BackendEvent>)> {
+        let mut receiver_guard = self.receiver.lock().expect("receiver mutex poisoned");
+        let receiver = receiver_guard
+            .take()
+            .ok_or_else(|| anyhow!("Inbox already loaded"))?;
+
+        let mut messages = self.messages.lock().expect("messages mutex poisoned");
+        messages.sort_by_key(|msg| msg.message.sent);
+        let list = messages.iter().map(|msg| msg.message.clone()).collect();
+
+        Ok((list, receiver))
+    }
+
+    fn load_message(&self, message_id: MessageId) -> Result<MessageContent> {
+        let contents = self.contents.lock().expect("contents mutex poisoned");
+        contents
+            .get(&message_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("message {message_id} not found"))
+    }
+
+    fn apply_actions(&self, actions: Vec<Action>) -> Result<Receiver<ActionStatus>> {
+        let (tx, rx) = mpsc::channel();
+        let messages = Arc::clone(&self.messages);
+        let contents = Arc::clone(&self.contents);
+
+        thread::spawn(move || {
+            let mut delay_rng = SimpleRng::new(random_seed() ^ 0xa511f93acb5d7a77);
+            for action in actions {
+                let delay_ms = delay_rng.gen_range_usize_inclusive(50, 500) as u64;
+                thread::sleep(Duration::from_millis(delay_ms));
+
+                let result = MockBackend::apply_action_now(&messages, &contents, &action)
+                    .map_err(|err| err.to_string());
+                if tx.send(ActionStatus { action, result }).is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(rx)
     }
 }
 
