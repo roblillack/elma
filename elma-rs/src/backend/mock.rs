@@ -5,7 +5,7 @@
 //! the UI logic without relying on an external mail provider.
 
 use crate::{
-    backend::{ActionStatus, BackendEvent, MailBackend},
+    backend::{ActionStatus, BackendEvent, MailBackend, OutgoingMessage},
     model::{
         Action, ActionType, MailboxKind, Message, MessageContent, MessageContentPart, MessageId,
         MessageStatus,
@@ -27,6 +27,7 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 
 const INITIAL_MESSAGE_COUNT: usize = 250;
 const MAILER_NAME: &str = "MockMailer/tdoc-demo";
+const DEFAULT_SENDER: &str = "user@mock.example";
 
 /// Simple in-memory backend for demos and integration tests.
 ///
@@ -352,6 +353,70 @@ impl MockBackend {
     }
 }
 
+impl MockBackend {
+    fn store_composed_message(
+        &self,
+        outgoing: OutgoingMessage,
+        mailbox: MailboxKind,
+        status: MessageStatus,
+        label: &'static str,
+    ) -> Result<()> {
+        let id = self.next_id();
+        let sent = OffsetDateTime::now_utc();
+
+        let OutgoingMessage {
+            to,
+            cc,
+            bcc,
+            subject,
+            content,
+        } = outgoing;
+
+        let mut recipients = Vec::new();
+        recipients.extend(to.into_iter());
+        recipients.extend(cc.into_iter());
+        recipients.extend(bcc.into_iter());
+
+        let size = content.len() + subject.len();
+
+        let mut message = Message {
+            id,
+            sent,
+            sender: DEFAULT_SENDER.to_string(),
+            recipients,
+            subject,
+            size,
+            starred: false,
+            answered: false,
+            forwarded: false,
+            status,
+            labels: Vec::new(),
+            uid: id as u32,
+        };
+
+        if !label.is_empty() {
+            message.labels.push(label.to_string());
+        }
+
+        let mut content_state = MessageContent::default();
+        content_state.mailer = format!("{MAILER_NAME} compose");
+        content_state.parts.push(MessageContentPart {
+            content_type: "text/plain".to_string(),
+            content: content.into_bytes(),
+        });
+
+        let mut mailboxes = self.mailboxes.lock().expect("mailboxes mutex poisoned");
+        let mut contents = self.contents.lock().expect("contents mutex poisoned");
+        contents.insert(id, content_state);
+
+        let entry = mailboxes.entry(mailbox).or_insert_with(Vec::new);
+        entry.push(MockMessage { message });
+        entry.sort_by_key(|mock| mock.message.sent);
+
+        Ok(())
+    }
+}
+
 impl MailBackend for MockBackend {
     /// Return the current mailbox snapshot and subscribe to future events.
     fn load_mailbox(&self, mailbox: MailboxKind) -> Result<(Vec<Message>, Receiver<BackendEvent>)> {
@@ -419,6 +484,14 @@ impl MailBackend for MockBackend {
         });
 
         Ok(rx)
+    }
+
+    fn send_message(&self, message: OutgoingMessage) -> Result<()> {
+        self.store_composed_message(message, MailboxKind::Sent, MessageStatus::Read, "Sent")
+    }
+
+    fn save_draft(&self, message: OutgoingMessage) -> Result<()> {
+        self.store_composed_message(message, MailboxKind::Drafts, MessageStatus::New, "Draft")
     }
 }
 

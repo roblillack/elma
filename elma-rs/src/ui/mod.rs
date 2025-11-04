@@ -4,12 +4,15 @@
 //! widgets.  All layout decisions are centralised here so the controller logic in
 //! [`crate::app`] remains agnostic of the terminal representation.
 
-use crate::app::{ActiveView, App, MessageViewState, ShortcutMenu};
+use crate::app::{
+    ActiveView, App, ComposeButton, ComposeField, ComposeFocus, ComposeState, MessageViewState,
+    ShortcutMenu,
+};
 use crate::model::MessageStatus;
 use crate::viewer;
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
@@ -22,9 +25,19 @@ const ARCHIVED_FG: Color = Color::Rgb(0, 139, 139);
 
 /// Render the entire UI based on the currently active view.
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
+    if app.compose_state().is_some() {
+        render_inbox(frame, app);
+        render_compose(frame, app);
+        if let Some(menu) = app.shortcut_menu() {
+            render_shortcut_menu(frame, menu);
+        }
+        return;
+    }
+
     match app.active_view() {
         ActiveView::Mailbox => render_inbox(frame, app),
         ActiveView::Message => render_message(frame, app),
+        ActiveView::Compose => render_compose(frame, app),
     }
 
     if let Some(menu) = app.shortcut_menu() {
@@ -102,6 +115,286 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
         .style(action_bar_style())
         .block(Block::default());
     frame.render_widget(info_bar, layout[2]);
+}
+
+fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
+    let Some(state) = app.compose_state() else {
+        render_inbox(frame, app);
+        return;
+    };
+
+    let frame_area = frame.size();
+    let dialog_width = if frame_area.width >= 90 {
+        80u16.min(frame_area.width)
+    } else {
+        frame_area.width
+    };
+    let dialog_height = if frame_area.height > 30 {
+        ((frame_area.height as u32 * 80) / 100).max(1) as u16
+    } else {
+        frame_area.height
+    };
+
+    let offset_x = frame_area
+        .width
+        .saturating_sub(dialog_width)
+        .saturating_div(2);
+    let offset_y = frame_area
+        .height
+        .saturating_sub(dialog_height)
+        .saturating_div(2);
+
+    let modal_area = Rect::new(
+        frame_area.x + offset_x,
+        frame_area.y + offset_y,
+        dialog_width,
+        dialog_height,
+    );
+
+    let popup_style = Style::default().bg(Color::Black).fg(Color::White);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(popup_style)
+        .border_style(Style::default().fg(Color::Gray));
+    let inner = block.inner(modal_area);
+
+    frame.render_widget(Clear, modal_area);
+    frame.render_widget(block, modal_area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(4),
+            Constraint::Min(4),
+            Constraint::Length(2),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let header = Paragraph::new(app.compose_action_bar())
+        .style(popup_style)
+        .alignment(Alignment::Center);
+    frame.render_widget(header, layout[0]);
+
+    let field_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(layout[1]);
+
+    let mut cursor_pos = None;
+
+    for (area, label, field) in [
+        (field_rows[0], "To", ComposeField::To),
+        (field_rows[1], "Cc", ComposeField::Cc),
+        (field_rows[2], "Bcc", ComposeField::Bcc),
+        (field_rows[3], "Subject", ComposeField::Subject),
+    ] {
+        if cursor_pos.is_none() {
+            cursor_pos = render_compose_field(frame, area, state, label, field);
+        } else {
+            render_compose_field(frame, area, state, label, field);
+        }
+    }
+
+    if cursor_pos.is_none() {
+        cursor_pos = render_compose_content(frame, layout[2], state);
+    } else {
+        render_compose_content(frame, layout[2], state);
+    }
+    render_compose_buttons(frame, layout[3], state);
+
+    let status_text = app
+        .compose_status_line()
+        .map(|text| text.to_string())
+        .unwrap_or_else(|| "Tab to move between fields; Enter activates a button.".to_string());
+    let status = Paragraph::new(status_text)
+        .style(popup_style)
+        .alignment(Alignment::Center);
+    frame.render_widget(status, layout[4]);
+
+    if let Some((x, y)) = cursor_pos {
+        frame.set_cursor(x, y);
+    } else {
+        frame.set_cursor(modal_area.x + 1, modal_area.y + 1);
+    }
+}
+
+fn render_compose_field(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &ComposeState,
+    label: &str,
+    field: ComposeField,
+) -> Option<(u16, u16)> {
+    if area.height == 0 || area.width == 0 {
+        return None;
+    }
+
+    let focused = state.is_field_focused(field);
+    let (value, _) = state.field_data(field);
+    let (before, _) = state.field_parts(field);
+
+    let label_text = format!("{label}: ");
+    let label_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let placeholder_style = Style::default().fg(Color::DarkGray);
+    let value_style = if focused {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+
+    let mut spans = vec![Span::styled(label_text.clone(), label_style)];
+    if value.is_empty() {
+        spans.push(Span::styled("<empty>".to_string(), placeholder_style));
+    } else {
+        spans.push(Span::styled(value.to_string(), value_style));
+    }
+
+    let base_style = if focused {
+        Style::default().bg(Color::DarkGray)
+    } else {
+        Style::default().bg(Color::Black)
+    };
+
+    let paragraph = Paragraph::new(Line::from(spans))
+        .style(base_style)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+
+    if !focused {
+        return None;
+    }
+
+    let label_width = label_text.chars().count() as u16;
+    let before_width = before.chars().count() as u16;
+    let max_x = area.x + area.width.saturating_sub(1);
+    let mut cursor_x = area.x + label_width + before_width;
+    if cursor_x > max_x {
+        cursor_x = max_x;
+    }
+
+    Some((cursor_x, area.y))
+}
+
+fn render_compose_content(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &ComposeState,
+) -> Option<(u16, u16)> {
+    if area.height == 0 || area.width == 0 {
+        return None;
+    }
+
+    let focused = state.is_field_focused(ComposeField::Content);
+    let (value, _) = state.field_data(ComposeField::Content);
+    let (before, _) = state.field_parts(ComposeField::Content);
+    let placeholder_style = Style::default().fg(Color::DarkGray);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if value.is_empty() {
+        lines.push(Line::styled("<type your message>", placeholder_style));
+    } else {
+        for line in value.lines() {
+            lines.push(Line::raw(line.to_string()));
+        }
+        if value.ends_with('\n') {
+            lines.push(Line::raw(String::new()));
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::raw(String::new()));
+    }
+
+    let base_style = if focused {
+        Style::default()
+            .fg(Color::Yellow)
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White).bg(Color::Black)
+    };
+
+    let paragraph = Paragraph::new(lines)
+        .style(base_style)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+
+    if !focused {
+        return None;
+    }
+
+    let mut row: u16 = 0;
+    let mut col: u16 = 0;
+    for ch in before.chars() {
+        if ch == '\n' {
+            row = row.saturating_add(1);
+            col = 0;
+        } else {
+            col = col.saturating_add(1);
+        }
+    }
+
+    let max_y = area.y + area.height.saturating_sub(1);
+    let max_x = area.x + area.width.saturating_sub(1);
+    let cursor_y = (area.y + row).min(max_y);
+    let cursor_x = (area.x + col).min(max_x);
+
+    Some((cursor_x, cursor_y))
+}
+
+fn render_compose_buttons(frame: &mut Frame<'_>, area: Rect, state: &ComposeState) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let buttons = [
+        (ComposeButton::Cancel, "Cancel"),
+        (ComposeButton::Draft, "Draft"),
+        (ComposeButton::Send, "Send"),
+    ];
+
+    let mut spans = Vec::new();
+    for (idx, (button, label)) in buttons.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw("   "));
+        }
+        let focused = matches!(state.focus(), ComposeFocus::Button(active) if active == *button);
+        if focused {
+            spans.push(Span::styled(
+                format!("[{label}]"),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(
+                format!("[{label}]"),
+                Style::default().fg(Color::White),
+            ));
+        }
+    }
+
+    let paragraph = Paragraph::new(Line::from(spans))
+        .style(Style::default().bg(Color::Black))
+        .alignment(Alignment::Center);
+
+    frame.render_widget(paragraph, area);
 }
 
 /// Render the message view, falling back to the inbox if no message is open.

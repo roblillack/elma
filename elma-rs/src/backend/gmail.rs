@@ -5,7 +5,7 @@
 //! so the terminal UI never blocks while Gmail applies flag and mailbox updates.
 
 use crate::{
-    backend::{ActionStatus, BackendEvent, MailBackend},
+    backend::{ActionStatus, BackendEvent, MailBackend, OutgoingMessage},
     model::{
         Action, ActionType, MailboxKind, Message, MessageContent, MessageContentPart, MessageId,
         MessageStatus,
@@ -20,6 +20,10 @@ use async_imap::{
 use async_native_tls::{TlsStream, connect as tls_connect};
 use futures::TryStreamExt;
 use imap_proto::types::{AttributeValue, MailboxDatum, NameAttribute, Response};
+use lettre::{
+    Message as LettreEmail, SmtpTransport, Transport, message::Mailbox as LettreMailbox,
+    transport::smtp::authentication::Credentials,
+};
 use mailparse::{self, MailHeaderMap, ParsedMail};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -235,6 +239,18 @@ impl MailBackend for GmailBackend {
 
         Ok(rx)
     }
+
+    fn send_message(&self, message: OutgoingMessage) -> Result<()> {
+        let runtime = Arc::clone(&self.inner.runtime);
+        let inner = Arc::clone(&self.inner);
+        runtime.block_on(async move { inner.send_via_smtp(message).await })
+    }
+
+    fn save_draft(&self, message: OutgoingMessage) -> Result<()> {
+        let runtime = Arc::clone(&self.inner.runtime);
+        let inner = Arc::clone(&self.inner);
+        runtime.block_on(async move { inner.save_draft(message).await })
+    }
 }
 
 impl GmailInner {
@@ -403,6 +419,118 @@ impl GmailInner {
             }
         }
 
+        Ok(())
+    }
+
+    async fn send_via_smtp(self: Arc<Self>, outgoing: OutgoingMessage) -> Result<()> {
+        let email = self
+            .build_compose_email(outgoing)
+            .context("building SMTP message")?;
+        let account = self.email.clone();
+        let password = self.password.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let creds = Credentials::new(account, password);
+            let transport = SmtpTransport::relay("smtp.gmail.com")
+                .context("configuring Gmail SMTP relay")?
+                .credentials(creds)
+                .build();
+            transport
+                .send(&email)
+                .map_err(|err| anyhow!("SMTP send failed: {err}"))?;
+            Ok(())
+        })
+        .await
+        .context("joining SMTP sender task")??;
+
+        Ok(())
+    }
+
+    async fn save_draft(self: Arc<Self>, outgoing: OutgoingMessage) -> Result<()> {
+        let email = self
+            .build_compose_email(outgoing)
+            .context("building draft message")?;
+        let raw = email.formatted();
+
+        self.pause_idle().await?;
+        let append_result = self
+            .append_raw_message(MailboxKind::Drafts, &raw, &["\\Draft"])
+            .await;
+        let restart_result = self.start_idle_loop().await;
+        append_result?;
+        restart_result?;
+        Ok(())
+    }
+
+    fn build_compose_email(&self, outgoing: OutgoingMessage) -> Result<LettreEmail> {
+        let OutgoingMessage {
+            to,
+            cc,
+            bcc,
+            subject,
+            content,
+        } = outgoing;
+
+        if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+            return Err(anyhow!("message must have at least one recipient"));
+        }
+
+        let from_mailbox: LettreMailbox = self
+            .email
+            .parse()
+            .with_context(|| format!("invalid Gmail address: {}", self.email))?;
+
+        let mut builder = LettreEmail::builder().from(from_mailbox);
+
+        for addr in to {
+            let mailbox: LettreMailbox = addr
+                .parse()
+                .with_context(|| format!("invalid To address: {addr}"))?;
+            builder = builder.to(mailbox);
+        }
+
+        for addr in cc {
+            let mailbox: LettreMailbox = addr
+                .parse()
+                .with_context(|| format!("invalid Cc address: {addr}"))?;
+            builder = builder.cc(mailbox);
+        }
+
+        for addr in bcc {
+            let mailbox: LettreMailbox = addr
+                .parse()
+                .with_context(|| format!("invalid Bcc address: {addr}"))?;
+            builder = builder.bcc(mailbox);
+        }
+
+        builder = builder.subject(subject);
+
+        builder
+            .body(content)
+            .context("serialising compose body for SMTP")
+    }
+
+    async fn append_raw_message(
+        &self,
+        mailbox: MailboxKind,
+        raw: &[u8],
+        flags: &[&str],
+    ) -> Result<()> {
+        self.ensure_connected().await?;
+        let name = self.mailbox_name(mailbox).await?;
+        let mut guard = self.session.lock().await;
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("IMAP session is not available"))?;
+        let flags_literal = if flags.is_empty() {
+            None
+        } else {
+            Some(format!("({})", flags.join(" ")))
+        };
+        session
+            .append(&name, flags_literal.as_deref(), None, raw)
+            .await
+            .context("appending message to mailbox")?;
         Ok(())
     }
 

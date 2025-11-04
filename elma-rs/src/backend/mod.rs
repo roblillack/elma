@@ -35,6 +35,16 @@ pub struct ActionStatus {
     pub result: std::result::Result<(), String>,
 }
 
+/// Data associated with an outgoing message created from the compose view.
+#[derive(Clone, Debug, Default)]
+pub struct OutgoingMessage {
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub subject: String,
+    pub content: String,
+}
+
 /// Abstraction over a mail provider implementation.
 ///
 /// The trait is purposely synchronous from the caller's perspective while the
@@ -86,4 +96,8 @@ pub trait MailBackend: Send + Sync {
     fn load_message(&self, message_id: MessageId) -> Result<MessageContent>;
     /// Begin processing a batch of actions and return a channel with completion updates.
     fn apply_actions(&self, actions: Vec<Action>) -> Result<Receiver<ActionStatus>>;
+    /// Send a fully composed message.
+    fn send_message(&self, message: OutgoingMessage) -> Result<()>;
+    /// Store a draft message.
+    fn save_draft(&self, message: OutgoingMessage) -> Result<()>;
 }

@@ -72,6 +72,9 @@ few seconds to keep the inbox active.
 - [ ] Implement help overlay (`?`)
 - [ ] Implement `j` and `k` to move to next/previous message in mailbox view
 - [ ] Implement `.` to open context menu for selected message
+- [ ] Add support for multiple accounts/backends (`G` to Go to different account?)
+- [ ] In "Drafts" mailbox, show recipients in the message list
+- [ ] Allow continued editing of drafts (Enter to open draft in compose view again)
 
 ## Project layout
 
