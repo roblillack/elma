@@ -100,6 +100,7 @@ impl MockBackend {
             (MailboxKind::Sent, 25usize, MessageStatus::Read),
             (MailboxKind::Drafts, 12usize, MessageStatus::New),
             (MailboxKind::Archive, 35usize, MessageStatus::Read),
+            (MailboxKind::Spam, 22usize, MessageStatus::Read),
             (MailboxKind::Trash, 18usize, MessageStatus::Read),
         ];
 
@@ -129,6 +130,13 @@ impl MockBackend {
                         message.labels = vec!["Archive".to_string()];
                         message.starred = rng.one_in(5);
                         if rng.one_in(6) {
+                            message.status = MessageStatus::New;
+                        }
+                    }
+                    MailboxKind::Spam => {
+                        message.labels = vec!["Spam".to_string()];
+                        message.starred = false;
+                        if rng.one_in(4) {
                             message.status = MessageStatus::New;
                         }
                     }
@@ -274,17 +282,35 @@ impl MockBackend {
                 };
                 target_kind = MailboxKind::Trash;
             }
+            ActionType::MoveToSpam => {
+                mock.message.labels.retain(|label| {
+                    !label.eq_ignore_ascii_case("Archive")
+                        && !label.eq_ignore_ascii_case("Trash")
+                        && !label.eq_ignore_ascii_case("Spam")
+                });
+                mock.message.labels.push("Spam".to_string());
+                mock.message.status = if was_new {
+                    MessageStatus::New
+                } else {
+                    MessageStatus::Read
+                };
+                target_kind = MailboxKind::Spam;
+            }
             ActionType::MoveToInboxUnread => {
                 mock.message.status = MessageStatus::New;
                 mock.message.labels.retain(|label| {
-                    !label.eq_ignore_ascii_case("Archive") && !label.eq_ignore_ascii_case("Trash")
+                    !label.eq_ignore_ascii_case("Archive")
+                        && !label.eq_ignore_ascii_case("Trash")
+                        && !label.eq_ignore_ascii_case("Spam")
                 });
                 target_kind = MailboxKind::Inbox;
             }
             ActionType::MoveToInboxRead => {
                 mock.message.status = MessageStatus::Read;
                 mock.message.labels.retain(|label| {
-                    !label.eq_ignore_ascii_case("Archive") && !label.eq_ignore_ascii_case("Trash")
+                    !label.eq_ignore_ascii_case("Archive")
+                        && !label.eq_ignore_ascii_case("Trash")
+                        && !label.eq_ignore_ascii_case("Spam")
                 });
                 target_kind = MailboxKind::Inbox;
             }

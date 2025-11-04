@@ -42,6 +42,7 @@ const GMAIL_HOST: &str = "imap.gmail.com";
 const GMAIL_PORT: u16 = 993;
 const DEFAULT_STARRED_LABEL: &str = "[Gmail]/Starred";
 const DEFAULT_ARCHIVE_LABEL: &str = "[Gmail]/All Mail";
+const DEFAULT_SPAM_LABEL: &str = "[Gmail]/Spam";
 const DEFAULT_SENT_LABEL: &str = "[Gmail]/Sent Mail";
 const DEFAULT_DRAFTS_LABEL: &str = "[Gmail]/Drafts";
 const DEFAULT_TRASH_LABEL: &str = "[Gmail]/Trash";
@@ -93,6 +94,7 @@ struct StoredMessage {
 struct SpecialMailboxes {
     starred: String,
     archive: String,
+    spam: String,
     sent: String,
     drafts: String,
     trash: String,
@@ -103,6 +105,7 @@ impl Default for SpecialMailboxes {
         Self {
             starred: DEFAULT_STARRED_LABEL.to_string(),
             archive: DEFAULT_ARCHIVE_LABEL.to_string(),
+            spam: DEFAULT_SPAM_LABEL.to_string(),
             sent: DEFAULT_SENT_LABEL.to_string(),
             drafts: DEFAULT_DRAFTS_LABEL.to_string(),
             trash: DEFAULT_TRASH_LABEL.to_string(),
@@ -277,6 +280,7 @@ impl GmailInner {
             MailboxKind::Sent => labels.sent.clone(),
             MailboxKind::Drafts => labels.drafts.clone(),
             MailboxKind::Archive => labels.archive.clone(),
+            MailboxKind::Spam => labels.spam.clone(),
             MailboxKind::Trash => labels.trash.clone(),
         };
         Ok(name)
@@ -341,6 +345,7 @@ impl GmailInner {
 
         let mut archive = None;
         let mut trash = None;
+        let mut spam = None;
         let mut starred = None;
         let mut sent = None;
         let mut drafts = None;
@@ -355,6 +360,9 @@ impl GmailInner {
                 .any(|attr| matches!(attr, NameAttribute::Trash))
             {
                 trash = Some(name.name().to_string());
+            }
+            if attrs.iter().any(|attr| matches!(attr, NameAttribute::Junk)) {
+                spam = Some(name.name().to_string());
             }
             if attrs
                 .iter()
@@ -380,6 +388,9 @@ impl GmailInner {
             }
             if let Some(value) = trash {
                 labels.trash = value;
+            }
+            if let Some(value) = spam {
+                labels.spam = value;
             }
             if let Some(value) = starred {
                 labels.starred = value;
@@ -624,6 +635,13 @@ impl GmailInner {
                 let mailbox = {
                     let labels = self.labels.lock().await;
                     labels.trash.clone()
+                };
+                self.move_message(action.message_id, &mailbox).await
+            }
+            ActionType::MoveToSpam => {
+                let mailbox = {
+                    let labels = self.labels.lock().await;
+                    labels.spam.clone()
                 };
                 self.move_message(action.message_id, &mailbox).await
             }

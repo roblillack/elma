@@ -10,6 +10,7 @@ pub enum MessageStatus {
     Deleted,
     Archived,
     PendingInbox,
+    Spam,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -19,16 +20,18 @@ pub enum MailboxKind {
     Sent,
     Drafts,
     Archive,
+    Spam,
     Trash,
 }
 
 impl MailboxKind {
-    pub const ALL: [MailboxKind; 6] = [
+    pub const ALL: [MailboxKind; 7] = [
         MailboxKind::Inbox,
         MailboxKind::Starred,
         MailboxKind::Sent,
         MailboxKind::Drafts,
         MailboxKind::Archive,
+        MailboxKind::Spam,
         MailboxKind::Trash,
     ];
 
@@ -40,6 +43,7 @@ impl MailboxKind {
             MailboxKind::Sent => "Sent",
             MailboxKind::Drafts => "Drafts",
             MailboxKind::Archive => "Archive",
+            MailboxKind::Spam => "Spam",
             MailboxKind::Trash => "Trash",
         }
     }
@@ -71,6 +75,7 @@ impl Message {
             MessageStatus::New => 'N',
             MessageStatus::Read => ' ',
             MessageStatus::PendingInbox => 'I',
+            MessageStatus::Spam => '!',
         };
 
         if self.starred {
@@ -137,6 +142,7 @@ pub enum ActionType {
     MoveToInboxRead,
     MarkAsStarred,
     MarkAsUnstarred,
+    MoveToSpam,
 }
 
 #[derive(Clone, Debug)]
@@ -191,6 +197,7 @@ impl fmt::Display for MessageStatus {
             MessageStatus::Deleted => "Deleted",
             MessageStatus::Archived => "Archived",
             MessageStatus::PendingInbox => "Pending inbox",
+            MessageStatus::Spam => "Spam",
         };
         f.write_str(text)
     }

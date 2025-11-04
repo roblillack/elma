@@ -153,6 +153,7 @@ impl ShortcutMenuState {
             ShortcutItem::new('t', "Sent", MailboxKind::Sent),
             ShortcutItem::new('d', "Drafts", MailboxKind::Drafts),
             ShortcutItem::new('a', "Archive", MailboxKind::Archive),
+            ShortcutItem::new('S', "Spam", MailboxKind::Spam),
             ShortcutItem::new('T', "Trash", MailboxKind::Trash),
         ];
 
@@ -490,6 +491,7 @@ impl App {
                     msg.status != MessageStatus::Archived
                         && msg.status != MessageStatus::Deleted
                         && msg.status != MessageStatus::PendingInbox
+                        && msg.status != MessageStatus::Spam
                 });
                 self.mailbox.status_line = Some("Actions committed.".to_string());
             } else {
@@ -547,6 +549,7 @@ impl App {
 
                 let in_archive = self.current_mailbox == MailboxKind::Archive;
                 let in_trash = self.current_mailbox == MailboxKind::Trash;
+                let in_spam = self.current_mailbox == MailboxKind::Spam;
                 match msg.status {
                     MessageStatus::New | MessageStatus::Read => {
                         text.push_str(" r:Reply y:Archive d:Delete");
@@ -567,6 +570,17 @@ impl App {
                     }
                     MessageStatus::PendingInbox => {
                         text.push_str(" r:Reply");
+                    }
+                    MessageStatus::Spam => {
+                        text.push_str(" r:Reply y:Archive d:Delete");
+                    }
+                }
+
+                if msg.status != MessageStatus::PendingInbox {
+                    if matches!(msg.status, MessageStatus::Spam) || in_spam {
+                        text.push_str(" !:NoSpam");
+                    } else {
+                        text.push_str(" !:Spam");
                     }
                 }
             }
@@ -649,6 +663,19 @@ impl App {
             KeyCode::Char('s') | KeyCode::Char('S') => self.toggle_star(),
             KeyCode::Char('y') | KeyCode::Char('Y') => self.schedule_archive(),
             KeyCode::Char('u') | KeyCode::Char('U') => self.toggle_unread(),
+            KeyCode::Char('!') => {
+                if let Some(idx) = self.mailbox.selected {
+                    if let Some(msg) = self.mailbox.messages.get(idx) {
+                        if self.current_mailbox == MailboxKind::Spam
+                            || msg.status == MessageStatus::Spam
+                        {
+                            self.schedule_move_to_inbox();
+                        } else {
+                            self.schedule_move_to_spam();
+                        }
+                    }
+                }
+            }
             KeyCode::Char('$') => self.commit_actions()?,
             KeyCode::Enter | KeyCode::Right => self.open_selected_message()?,
             KeyCode::Char('d') | KeyCode::Char('D') => self.schedule_delete(),
@@ -793,6 +820,19 @@ impl App {
         }
     }
 
+    fn schedule_move_to_spam(&mut self) {
+        if let Some(idx) = self.mailbox.selected {
+            if let Some(msg) = self.mailbox.messages.get_mut(idx) {
+                msg.status = MessageStatus::Spam;
+                self.scheduled_actions
+                    .push(Action::new(ActionType::MoveToSpam, msg.id));
+                self.advance_selection_after_action(idx);
+                self.mailbox.status_line = None;
+                self.sync_message_view_state();
+            }
+        }
+    }
+
     fn schedule_move_to_inbox(&mut self) {
         if let Some(idx) = self.mailbox.selected {
             if let Some(msg) = self.mailbox.messages.get_mut(idx) {
@@ -803,8 +843,10 @@ impl App {
                 } else {
                     ActionType::MoveToInboxRead
                 };
-                self.scheduled_actions.push(Action::new(action_type, msg.id));
+                self.scheduled_actions
+                    .push(Action::new(action_type, msg.id));
                 self.advance_selection_after_action(idx);
+                self.mailbox.status_line = None;
                 self.sync_message_view_state();
             }
         }
@@ -818,7 +860,7 @@ impl App {
                         msg.status = MessageStatus::New;
                         ActionType::MoveToInboxUnread
                     }
-                    MessageStatus::Deleted | MessageStatus::Archived => {
+                    MessageStatus::Deleted | MessageStatus::Archived | MessageStatus::Spam => {
                         msg.status = MessageStatus::Read;
                         ActionType::MoveToInboxRead
                     }

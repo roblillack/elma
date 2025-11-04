@@ -413,6 +413,7 @@ fn style_for_row(row: &crate::app::MessageRow) -> Style {
         MessageStatus::Archived => style.fg(ARCHIVED_FG).add_modifier(Modifier::ITALIC),
         MessageStatus::Deleted => style.add_modifier(Modifier::CROSSED_OUT | Modifier::DIM),
         MessageStatus::PendingInbox => style.add_modifier(Modifier::DIM),
+        MessageStatus::Spam => style.fg(Color::Magenta).add_modifier(Modifier::DIM),
         MessageStatus::Read => style,
     };
 
