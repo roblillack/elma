@@ -1,0 +1,49 @@
+# elma-rs
+
+`elma-rs` is a Ratatui-based experimental port of the ELMA terminal mail agent. This prototype
+focuses on re-creating the classic inbox and message views while relying on the
+[`tdoc`](https://crates.io/crates/tdoc) toolkit to parse HTML into FTML documents for terminal
+rendering.
+
+## Features
+
+- Ratatui inbox layout with action bar, tview-style message table, and matching colours.
+- Full-screen message view with FTML formatting and message part summaries rendered by `tdoc`.
+- Mock backend that continually injects fresh sample messages with realistic senders and dates.
+- Keybindings mirror the Go implementation (star/archive/delete/commit, `j`/`k` navigation, etc.).
+
+## Differences from the Go implementation
+
+- Only the inbox view is implemented; modal dialogs, menus, and the multi-screen controller stack from the Go code are not yet ported.
+- The Rust build always runs against the mock backend (there is no Gmail/IMAP integration or configuration loader).
+- Message actions are simulated in-memory; archive/delete just update the local list and do not persist between runs.
+- FTML rendering uses the `tdoc` crate directly rather than the Go `ftml` bindings, so styling may vary on edge cases.
+- Help overlays, context menus (the Go `.` menu), and mouse interactions beyond basic selection are not implemented.
+- Logging/debug output differs: the Rust version does not emit action/event logs compatible with `elma.log`.
+- Configuration, theming, and clipboard/web integration hooks from the Go app are currently missing.
+
+## Running
+
+```bash
+cargo run -- --demo
+```
+
+The mock backend is the default, so you can also omit `--demo`. New messages arrive every few
+seconds to keep the inbox active.
+
+### Key bindings
+
+- `Ctrl+Q` quits to the shell.
+- `Enter`/`Right` opens the selected message; `Esc`/`Left` closes the viewer.
+- `d`, `Delete`, or `Backspace` schedule the message for deletion.
+- `y` schedules the message for archival.
+- `s` toggles the star flag; `u` toggles unread/read state.
+- `$` commits scheduled actions (removing archived/deleted messages from the list).
+- Arrow keys, `PageUp`/`PageDown`, `Home`, `End` move the cursor in the inbox.
+- While a message is open, `j` / `k` jump to the next/previous message and `.` toggles raw HTML.
+
+## Project layout
+
+- `src/backend`: backend trait and the mock implementation.
+- `src/ui`: Ratatui widgets and layout code.
+- `src/viewer.rs`: FTML rendering helpers backed by `tdoc`.
