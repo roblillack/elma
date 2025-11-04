@@ -7,8 +7,8 @@
 
 use crate::backend::{ActionStatus, BackendEvent, MailBackend, OutgoingMessage};
 use crate::model::{
-    Action, ActionType, MailboxKind, Message, MessageContent, MessageId, MessageStatus,
-    format_size, padded_sender,
+    Action, ActionType, MailboxKind, Message, MessageContent, MessageContentPart, MessageId,
+    MessageStatus, format_size, padded_sender,
 };
 use anyhow::{Context, Result, anyhow};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -160,6 +160,7 @@ pub(crate) struct ComposeState {
     bcc: TextFieldState,
     subject: TextFieldState,
     content: TextAreaState,
+    draft_id: Option<MessageId>,
     focus: ComposeFocus,
     status: Option<String>,
 }
@@ -172,6 +173,7 @@ impl Default for ComposeState {
             bcc: TextFieldState::default(),
             subject: TextFieldState::default(),
             content: TextAreaState::default(),
+            draft_id: None,
             focus: ComposeFocus::Field(ComposeField::To),
             status: None,
         }
@@ -195,6 +197,30 @@ const COMPOSE_BUTTON_SEQUENCE: [ComposeButton; 3] = [
 impl ComposeState {
     fn new() -> Self {
         Self::default()
+    }
+
+    fn from_draft(
+        draft_id: MessageId,
+        to: String,
+        cc: String,
+        bcc: String,
+        subject: String,
+        body: String,
+    ) -> Self {
+        let mut state = Self::default();
+        state.draft_id = Some(draft_id);
+        state.to.value = to;
+        state.to.cursor = text_len(&state.to.value);
+        state.cc.value = cc;
+        state.cc.cursor = text_len(&state.cc.value);
+        state.bcc.value = bcc;
+        state.bcc.cursor = text_len(&state.bcc.value);
+        state.subject.value = subject;
+        state.subject.cursor = text_len(&state.subject.value);
+        state.content.value = body;
+        state.content.cursor = text_len(&state.content.value);
+        state.focus = ComposeFocus::Field(ComposeField::Content);
+        state
     }
 
     pub(crate) fn focus(&self) -> ComposeFocus {
@@ -312,6 +338,14 @@ impl ComposeState {
 
     pub(crate) fn status(&self) -> Option<&str> {
         self.status.as_deref()
+    }
+
+    pub(crate) fn draft_id(&self) -> Option<MessageId> {
+        self.draft_id
+    }
+
+    pub(crate) fn is_editing_draft(&self) -> bool {
+        self.draft_id.is_some()
     }
 
     pub(crate) fn field_data(&self, field: ComposeField) -> (&str, usize) {
@@ -443,6 +477,34 @@ impl TextAreaState {
 enum FieldStateMut<'a> {
     Text(&'a mut TextFieldState),
     Area(&'a mut TextAreaState),
+}
+
+fn compose_body_from_content(content: &MessageContent) -> String {
+    if let Some(plain) = content
+        .parts
+        .iter()
+        .find(|part| mime_type_matches(part, "text/plain"))
+    {
+        return String::from_utf8_lossy(&plain.content).into_owned();
+    }
+
+    if let Some(html) = content
+        .parts
+        .iter()
+        .find(|part| mime_type_matches(part, "text/html"))
+    {
+        return String::from_utf8_lossy(&html.content).into_owned();
+    }
+
+    String::new()
+}
+
+fn mime_type_matches(part: &MessageContentPart, expected: &str) -> bool {
+    part.content_type
+        .split(';')
+        .next()
+        .map(|value| value.trim())
+        .map_or(false, |value| value.eq_ignore_ascii_case(expected))
 }
 
 fn split_addresses(input: &str) -> Vec<String> {
@@ -800,6 +862,38 @@ impl App {
         self.pending_shortcut.as_ref().map(|state| state.menu())
     }
 
+    fn remove_message_from_mailbox(&mut self, id: MessageId) -> bool {
+        let position = match self.mailbox.messages.iter().position(|msg| msg.id == id) {
+            Some(pos) => pos,
+            None => return false,
+        };
+
+        self.mailbox.messages.remove(position);
+
+        if let Some(selected) = self.mailbox.selected {
+            if self.mailbox.messages.is_empty() {
+                self.mailbox.selected = None;
+            } else if selected >= self.mailbox.messages.len() {
+                self.mailbox.selected = Some(self.mailbox.messages.len() - 1);
+            } else if position <= selected && selected > 0 {
+                self.mailbox.selected = Some(selected.saturating_sub(1));
+            }
+        }
+
+        self.normalize_scroll();
+
+        let should_close = self
+            .message_view
+            .as_ref()
+            .map(|view| view.message_id == id)
+            .unwrap_or(false);
+        if should_close {
+            self.message_view = None;
+        }
+
+        true
+    }
+
     /// Drain backend event channels and merge them into local state.
     pub fn poll_backend_events(&mut self) {
         self.poll_commit_updates();
@@ -829,29 +923,9 @@ impl App {
                     }
                 }
                 Ok(BackendEvent::MessageDeleted(id)) => {
-                    if let Some(position) =
-                        self.mailbox.messages.iter().position(|msg| msg.id == id)
-                    {
-                        self.mailbox.messages.remove(position);
+                    if self.remove_message_from_mailbox(id) {
                         self.mailbox.event_count += 1;
-
-                        if let Some(selected) = self.mailbox.selected {
-                            if self.mailbox.messages.is_empty() {
-                                self.mailbox.selected = None;
-                            } else if selected >= self.mailbox.messages.len() {
-                                self.mailbox.selected = Some(self.mailbox.messages.len() - 1);
-                            } else if position <= selected && selected > 0 {
-                                self.mailbox.selected = Some(selected.saturating_sub(1));
-                            }
-                        }
-
                         refresh = true;
-                    }
-
-                    if let Some(view) = &self.message_view {
-                        if view.message_id == id {
-                            self.message_view = None;
-                        }
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -1092,7 +1166,11 @@ impl App {
     }
 
     pub(crate) fn compose_action_bar(&self) -> String {
-        String::from("Compose - Tab:Next Shift+Tab:Prev Esc:Cancel Enter:Activate")
+        let label = match self.compose.as_ref().and_then(|state| state.draft_id()) {
+            Some(_) => "Edit Draft",
+            None => "Compose",
+        };
+        format!("{label} - Tab:Next Shift+Tab:Prev Esc:Cancel Enter:Activate")
     }
 
     pub(crate) fn compose_status_line(&self) -> Option<&str> {
@@ -1130,7 +1208,12 @@ impl App {
                 }
             }
             KeyCode::Char('$') => self.commit_actions()?,
-            KeyCode::Enter | KeyCode::Right => self.open_selected_message()?,
+            KeyCode::Enter => {
+                if !self.try_open_selected_draft()? {
+                    self.open_selected_message()?;
+                }
+            }
+            KeyCode::Right => self.open_selected_message()?,
             KeyCode::Char('d') | KeyCode::Char('D') => self.schedule_delete(),
             KeyCode::Char('#') => self.schedule_delete(),
             KeyCode::Backspace | KeyCode::Delete => self.schedule_delete(),
@@ -1407,15 +1490,19 @@ impl App {
     }
 
     fn cancel_compose(&mut self) {
-        if self.compose.is_some() {
-            self.compose = None;
-            self.mailbox.status_line = Some("Compose cancelled.".to_string());
+        if let Some(state) = self.compose.take() {
+            let message = if state.is_editing_draft() {
+                "Draft edit cancelled."
+            } else {
+                "Compose cancelled."
+            };
+            self.mailbox.status_line = Some(message.to_string());
         }
     }
 
     fn send_current_compose(&mut self) -> Result<()> {
-        let message = match self.compose.as_ref() {
-            Some(compose) => compose.to_outgoing(),
+        let (draft_id, message) = match self.compose.as_ref() {
+            Some(compose) => (compose.draft_id(), compose.to_outgoing()),
             None => return Ok(()),
         };
 
@@ -1428,8 +1515,16 @@ impl App {
 
         match self.backend.send_message(message) {
             Ok(()) => {
+                let mut status = "Message sent.".to_string();
+                if let Some(id) = draft_id {
+                    self.remove_message_from_mailbox(id);
+                    if let Err(err) = self.submit_actions(vec![Action::new(ActionType::Delete, id)])
+                    {
+                        status = format!("Message sent but failed to remove draft: {err}");
+                    }
+                }
                 self.compose = None;
-                self.mailbox.status_line = Some("Message sent.".to_string());
+                self.mailbox.status_line = Some(status);
             }
             Err(err) => {
                 if let Some(compose) = self.compose.as_mut() {
@@ -1441,15 +1536,29 @@ impl App {
     }
 
     fn save_current_draft(&mut self) -> Result<()> {
-        let message = match self.compose.as_ref() {
-            Some(compose) => compose.to_outgoing(),
+        let (draft_id, message) = match self.compose.as_ref() {
+            Some(compose) => (compose.draft_id(), compose.to_outgoing()),
             None => return Ok(()),
         };
 
         match self.backend.save_draft(message) {
             Ok(()) => {
+                let mut status = if draft_id.is_some() {
+                    "Draft updated.".to_string()
+                } else {
+                    "Draft saved.".to_string()
+                };
+
+                if let Some(id) = draft_id {
+                    self.remove_message_from_mailbox(id);
+                    if let Err(err) = self.submit_actions(vec![Action::new(ActionType::Delete, id)])
+                    {
+                        status = format!("Draft saved but failed to remove previous copy: {err}");
+                    }
+                }
+
                 self.compose = None;
-                self.mailbox.status_line = Some("Draft saved.".to_string());
+                self.mailbox.status_line = Some(status);
             }
             Err(err) => {
                 if let Some(compose) = self.compose.as_mut() {
@@ -1458,6 +1567,53 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn try_open_selected_draft(&mut self) -> Result<bool> {
+        let idx = match self.mailbox.selected {
+            Some(idx) => idx,
+            None => return Ok(false),
+        };
+
+        let Some(message) = self.mailbox.messages.get(idx).cloned() else {
+            return Ok(false);
+        };
+
+        if !self.is_draft_message(&message) {
+            return Ok(false);
+        }
+
+        let content = self
+            .backend
+            .load_message(message.id)
+            .with_context(|| format!("failed to load draft {}", message.id))?;
+
+        let body = compose_body_from_content(&content);
+
+        let compose = ComposeState::from_draft(
+            message.id,
+            message.recipients.join(", "),
+            String::new(),
+            String::new(),
+            message.subject.clone(),
+            body,
+        );
+
+        self.compose = Some(compose);
+        self.message_view = None;
+        self.mailbox.status_line = Some("Editing draft.".to_string());
+        Ok(true)
+    }
+
+    fn is_draft_message(&self, message: &Message) -> bool {
+        if self.current_mailbox == MailboxKind::Drafts {
+            return true;
+        }
+
+        message
+            .labels
+            .iter()
+            .any(|label| label.to_ascii_lowercase().contains("draft"))
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -1613,12 +1769,7 @@ impl App {
     /// The backend responds via the channel returned from
     /// [`MailBackend::apply_actions`]; until those updates arrive the UI can
     /// continue scheduling new work.
-    fn commit_actions(&mut self) -> Result<()> {
-        if self.scheduled_actions.is_empty() {
-            return Ok(());
-        }
-
-        let actions = std::mem::take(&mut self.scheduled_actions);
+    fn submit_actions(&mut self, actions: Vec<Action>) -> Result<()> {
         if actions.is_empty() {
             return Ok(());
         }
@@ -1636,8 +1787,6 @@ impl App {
         let receiver = match self.backend.apply_actions(actions.clone()) {
             Ok(receiver) => receiver,
             Err(err) => {
-                self.scheduled_actions.extend(actions);
-
                 if let Some(progress) = self.commit_progress.as_mut() {
                     progress.total = progress.total.saturating_sub(action_count);
                     progress.completed = progress.completed.min(progress.total);
@@ -1646,12 +1795,26 @@ impl App {
                     }
                 }
 
-                return Err(err.context("failed to queue actions with backend"));
+                return Err(err);
             }
         };
 
         self.commit_batches
             .push_back(CommitBatchState::new(actions, receiver));
+
+        Ok(())
+    }
+
+    fn commit_actions(&mut self) -> Result<()> {
+        if self.scheduled_actions.is_empty() {
+            return Ok(());
+        }
+
+        let actions = std::mem::take(&mut self.scheduled_actions);
+        if let Err(err) = self.submit_actions(actions.clone()) {
+            self.scheduled_actions.extend(actions);
+            return Err(err.context("failed to queue actions with backend"));
+        }
 
         Ok(())
     }
