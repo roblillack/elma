@@ -764,9 +764,25 @@ fn convert_internal_date(dt: chrono::DateTime<chrono::FixedOffset>) -> Option<Of
 }
 
 fn decode_header(value: Option<&std::borrow::Cow<'_, [u8]>>) -> String {
-    value
-        .map(|raw| String::from_utf8_lossy(raw.as_ref()).into_owned())
-        .unwrap_or_default()
+    let Some(raw) = value else {
+        return String::new();
+    };
+
+    if raw.is_empty() {
+        return String::new();
+    }
+
+    // Use mailparse's header parser so RFC 2047 encoded words are decoded
+    // consistently with full message parsing.
+    let mut header_bytes = Vec::with_capacity(b"Subject: \r\n".len() + raw.len());
+    header_bytes.extend_from_slice(b"Subject: ");
+    header_bytes.extend_from_slice(raw.as_ref());
+    header_bytes.extend_from_slice(b"\r\n");
+
+    match mailparse::parse_header(&header_bytes) {
+        Ok((parsed, _)) => parsed.get_value(),
+        Err(_) => String::from_utf8_lossy(raw.as_ref()).into_owned(),
+    }
 }
 
 fn extract_sender(envelope: &imap_proto::types::Envelope<'_>) -> String {
