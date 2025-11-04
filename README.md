@@ -15,12 +15,13 @@
 - [ ] Right-clicking should also open the context menu
 - [ ] We should try out centered modal dialogs, instead of a command prompt at the bottom
 - [ ] "toolbar buttons" should flash before the action is executed
-- We commands to:
-  - [ ] Open the current view (message or folder) in a web view (specific to the used backend)
+- We need commands to:
+  - [ ] Open the current view (message or folder) in a web view (specific to the used backend) (`o`?)
   - [ ] View this message in a browser for selected extensions and/or use xdg-open to open the current message part using the default application
 - Nice to have:
   - Build website/tool to compare html2txt/links/lynx/elinks vs. FTML import for random websites
-  
+- We should also look at these tools:
+  - Newsboat: https://github.com/newsboat/newsboat
 
 ## User Manual
 
