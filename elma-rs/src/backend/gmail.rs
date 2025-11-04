@@ -1,3 +1,9 @@
+//! Gmail backend built on the IMAP protocol.
+//!
+//! The implementation shares the same public contract as the mock backend but runs
+//! all network I/O on an internal Tokio runtime.  Actions are processed asynchronously
+//! so the terminal UI never blocks while Gmail applies flag and mailbox updates.
+
 use crate::{
     backend::{ActionStatus, BackendEvent, MailBackend},
     model::{
@@ -37,10 +43,19 @@ const DEFAULT_ARCHIVE_LABEL: &str = "[Gmail]/All Mail";
 const DEFAULT_TRASH_LABEL: &str = "[Gmail]/Trash";
 const MAX_PART_DEPTH: usize = 5;
 
+/// Production backend that communicates with Gmail over IMAP.
+///
+/// A small Tokio runtime is embedded inside the struct so the rest of the
+/// application can stay synchronous.  All long-running work (IDLE loop, action
+/// commits, message downloads) is scheduled onto that runtime.
 pub struct GmailBackend {
     inner: Arc<GmailInner>,
 }
 
+/// Shared state for the Gmail backend.
+///
+/// `GmailInner` owns the runtime, caches, and mutable data structures so tasks can
+/// coordinate through `Arc` and async locks.
 struct GmailInner {
     email: String,
     password: String,
@@ -53,6 +68,7 @@ struct GmailInner {
     idle_handle: AsyncMutex<Option<JoinHandle<()>>>,
 }
 
+/// Cached view of the Gmail mailbox.
 #[derive(Default)]
 struct SharedState {
     messages: HashMap<MessageId, StoredMessage>,
@@ -60,12 +76,14 @@ struct SharedState {
     uid_to_id: HashMap<u32, MessageId>,
 }
 
+/// Metadata we retain for every message Gmail reports.
 struct StoredMessage {
     message: Message,
     seq: u32,
     uid: u32,
 }
 
+/// User-specific Gmail labels that correspond to archive/trash.
 #[derive(Clone)]
 struct SpecialMailboxes {
     archive: String,
@@ -82,6 +100,10 @@ impl Default for SpecialMailboxes {
 }
 
 impl GmailBackend {
+    /// Create a Gmail backend bound to the given account.
+    ///
+    /// A dedicated Tokio runtime is created up front so subsequent operations can
+    /// spawn tasks without blocking the caller.
     pub fn new<E, P>(email: E, password: P) -> Result<Self>
     where
         E: Into<String>,
@@ -107,6 +129,7 @@ impl GmailBackend {
 }
 
 impl MailBackend for GmailBackend {
+    /// Fetch the initial inbox and subscribe to Gmail's IDLE notifications.
     fn load_inbox(&self) -> Result<(Vec<Message>, mpsc::Receiver<BackendEvent>)> {
         let (sender, receiver) = mpsc::channel();
 
@@ -153,6 +176,7 @@ impl MailBackend for GmailBackend {
         Ok((messages, receiver))
     }
 
+    /// Download the full MIME body for `message_id`.
     fn load_message(&self, message_id: MessageId) -> Result<MessageContent> {
         self.inner.runtime.block_on(async {
             self.inner.pause_idle().await?;
@@ -190,6 +214,11 @@ impl MailBackend for GmailBackend {
         })
     }
 
+    /// Schedule a batch of Gmail actions on the internal runtime.
+    ///
+    /// Each action is processed sequentially so we can interleave the IMAP commands
+    /// with pauses in the IDLE loop.  The returned channel yields an [`ActionStatus`]
+    /// per action, mirroring the contract defined in [`MailBackend`].
     fn apply_actions(&self, actions: Vec<Action>) -> Result<mpsc::Receiver<ActionStatus>> {
         let (tx, rx) = mpsc::channel();
         let runtime = Arc::clone(&self.inner.runtime);
@@ -212,6 +241,7 @@ impl MailBackend for GmailBackend {
 }
 
 impl GmailInner {
+    /// Ensure we have an authenticated IMAP session ready to use.
     async fn ensure_connected(&self) -> Result<()> {
         let mut guard = self.session.lock().await;
         if guard.is_some() {
@@ -244,6 +274,7 @@ impl GmailInner {
         Ok(())
     }
 
+    /// Select the `INBOX` mailbox so subsequent fetches operate on the right context.
     async fn select_inbox(&self) -> Result<()> {
         let mut guard = self.session.lock().await;
         let session = guard
@@ -253,6 +284,7 @@ impl GmailInner {
         Ok(())
     }
 
+    /// Discover the Gmail archive and trash mailboxes so we can move messages later.
     async fn determine_special_mailboxes(&self) -> Result<()> {
         let mut guard = self.session.lock().await;
         let session = guard
@@ -293,6 +325,7 @@ impl GmailInner {
         Ok(())
     }
 
+    /// Spawn the IDLE task that listens for new Gmail events.
     async fn start_idle_loop(self: &Arc<Self>) -> Result<()> {
         let mut handle_guard = self.idle_handle.lock().await;
         if handle_guard.is_some() {
@@ -314,6 +347,7 @@ impl GmailInner {
         Ok(())
     }
 
+    /// Tear down the IDLE loop so another task can operate on the IMAP session.
     async fn pause_idle(&self) -> Result<()> {
         let stop = {
             let mut guard = self.idle_stop.lock().await;
@@ -330,6 +364,7 @@ impl GmailInner {
         Ok(())
     }
 
+    /// Pause the IDLE worker, apply `action`, then restart listening for updates.
     async fn process_action(self: Arc<Self>, action: Action) -> Result<()> {
         self.pause_idle().await?;
         let result = self
@@ -343,6 +378,7 @@ impl GmailInner {
         result
     }
 
+    /// Long-lived task that keeps Gmail notifications flowing via the IDLE extension.
     async fn idle_task(self: Arc<Self>, mut stop_rx: oneshot::Receiver<()>) {
         loop {
             if let Err(err) = self.ensure_connected().await {

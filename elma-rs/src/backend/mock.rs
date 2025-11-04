@@ -1,3 +1,9 @@
+//! Mock backend used for demo mode and manual testing.
+//!
+//! This implementation keeps all data in-memory and simulates asynchronous behaviour
+//! by introducing small random delays when applying actions.  The goal is to exercise
+//! the UI logic without relying on an external mail provider.
+
 use crate::{
     backend::{ActionStatus, BackendEvent, MailBackend},
     model::{
@@ -21,6 +27,10 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 const INITIAL_MESSAGE_COUNT: usize = 250;
 const MAILER_NAME: &str = "MockMailer/tdoc-demo";
 
+/// Simple in-memory backend for demos and integration tests.
+///
+/// Messages are generated deterministically at startup so the UI can exercise the
+/// same flows as the Gmail backend without network access.
 pub struct MockBackend {
     messages: Arc<Mutex<Vec<MockMessage>>>,
     contents: Arc<Mutex<HashMap<MessageId, MessageContent>>>,
@@ -34,10 +44,17 @@ struct MockMessage {
 }
 
 impl MockBackend {
+    /// Build the default mock backend, pre-populating the inbox and starting the
+    /// background generator that drip-feeds new messages.
     pub fn default() -> Self {
         Self::demo()
     }
 
+    /// Create a mock backend configured for the CLI demo mode.
+    ///
+    /// The builder loads a stock set of messages, spins up a background thread that
+    /// periodically injects new mail, and returns immediately so the UI stays
+    /// responsive.
     pub fn demo() -> Self {
         let (sender, receiver) = mpsc::channel();
         let messages = Arc::new(Mutex::new(Vec::new()));
@@ -105,6 +122,12 @@ impl MockBackend {
         self.id_counter.fetch_add(1, Ordering::SeqCst) + 1
     }
 
+    /// Update the mock data structures to reflect a single action.
+    ///
+    /// This helper runs synchronously inside the worker thread spawned by
+    /// [`MailBackend::apply_actions`].  It mutates the shared message and content
+    /// collections and mirrors the behaviour of the real Gmail backend closely
+    /// enough for UI testing.
     fn apply_action_now(
         messages: &Arc<Mutex<Vec<MockMessage>>>,
         contents: &Arc<Mutex<HashMap<MessageId, MessageContent>>>,
@@ -142,6 +165,7 @@ impl MockBackend {
 }
 
 impl MailBackend for MockBackend {
+    /// Return the current inbox snapshot and subscribe to future events.
     fn load_inbox(&self) -> Result<(Vec<Message>, Receiver<BackendEvent>)> {
         let mut receiver_guard = self.receiver.lock().expect("receiver mutex poisoned");
         let receiver = receiver_guard
@@ -155,6 +179,7 @@ impl MailBackend for MockBackend {
         Ok((list, receiver))
     }
 
+    /// Fetch the MIME content for an individual message.
     fn load_message(&self, message_id: MessageId) -> Result<MessageContent> {
         let contents = self.contents.lock().expect("contents mutex poisoned");
         contents
@@ -163,6 +188,10 @@ impl MailBackend for MockBackend {
             .ok_or_else(|| anyhow!("message {message_id} not found"))
     }
 
+    /// Spawn a worker that applies each action with a short random delay.
+    ///
+    /// The jitter (50–500 ms) mimics the round trips that the Gmail backend incurs,
+    /// giving the UI a realistic opportunity to render progress.
     fn apply_actions(&self, actions: Vec<Action>) -> Result<Receiver<ActionStatus>> {
         let (tx, rx) = mpsc::channel();
         let messages = Arc::clone(&self.messages);
@@ -352,18 +381,22 @@ const SUMMARIES: &[&str] = &[
 
 const CLOSINGS: &[&str] = &["Best regards,", "Cheers,", "Thanks!", "See you soon,"];
 
+/// Tiny deterministic RNG used to keep mock timings reproducible.
 struct SimpleRng(u64);
 
 impl SimpleRng {
+    /// Construct a new generator from a seed.
     fn new(seed: u64) -> Self {
         Self(seed)
     }
 
+    /// Produce the next pseudo-random 32-bit value.
     fn next_u32(&mut self) -> u32 {
         self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
         (self.0 >> 32) as u32
     }
 
+    /// Return a value uniformly sampled from the half-open `range`.
     fn gen_range_usize(&mut self, range: Range<usize>) -> usize {
         if range.start >= range.end {
             range.start
@@ -373,6 +406,7 @@ impl SimpleRng {
         }
     }
 
+    /// Return a value uniformly sampled from the inclusive range `[start, end]`.
     fn gen_range_usize_inclusive(&mut self, start: usize, end: usize) -> usize {
         if start >= end {
             start
@@ -381,6 +415,7 @@ impl SimpleRng {
         }
     }
 
+    /// Pick an item from `slice`, cycling uniformly.
     fn choose_str<'a>(&mut self, slice: &'a [&'a str]) -> &'a str {
         let idx = self.gen_range_usize(0..slice.len());
         slice[idx]

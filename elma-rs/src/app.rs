@@ -1,3 +1,10 @@
+//! Core application state and controller logic.
+//!
+//! [`App`] encapsulates all user interface state (selected message, scheduled
+//! actions, progress indicators) and synchronises with the configured backend.
+//! The type is intentionally synchronous from the TUI's perspective yet internally
+//! manages asynchronous commit results via channels so the UI thread never blocks.
+
 use crate::backend::{ActionStatus, BackendEvent, MailBackend};
 use crate::model::{
     Action, ActionType, Message, MessageContent, MessageId, MessageStatus, format_size,
@@ -17,6 +24,7 @@ use time::OffsetDateTime;
 const PAGE_JUMP: isize = 5;
 const PROGRESS_SEGMENTS: usize = 5;
 
+/// Tracks the lifecycle of a batch currently being committed.
 struct CommitBatchState {
     actions: Vec<Action>,
     receiver: Receiver<ActionStatus>,
@@ -26,6 +34,7 @@ struct CommitBatchState {
 }
 
 impl CommitBatchState {
+    /// Create a new batch around `actions` with progress updates streaming from `receiver`.
     fn new(actions: Vec<Action>, receiver: Receiver<ActionStatus>) -> Self {
         Self {
             actions,
@@ -36,22 +45,44 @@ impl CommitBatchState {
         }
     }
 
+    /// Number of actions contained in the batch.
     fn len(&self) -> usize {
         self.actions.len()
     }
 }
 
+/// Aggregate progress across all active batches.
 #[derive(Debug)]
 struct CommitProgress {
     total: usize,
     completed: usize,
 }
 
+/// Which screen the UI is currently rendering.
 pub enum ActiveView {
     Inbox,
     Message,
 }
 
+/// Central controller that wires backend state into the TUI.
+///
+/// `App` owns the inbox cache, scheduled actions, and message viewer.  It reacts
+/// to backend events every tick, meaning the UI can remain event-driven without
+/// juggling shared mutable state.
+///
+/// # Examples
+///
+/// ```
+/// # use elma_rs::app::App;
+/// # use elma_rs::backend::mock::MockBackend;
+/// # fn demo() -> anyhow::Result<()> {
+/// let backend = Box::new(MockBackend::default());
+/// let mut app = App::new(backend)?;
+/// // Drive a single key press; normally the main loop handles this.
+/// use crossterm::event::{KeyCode, KeyEvent};
+/// app.handle_key(KeyEvent::from(KeyCode::Char('$')))?;
+/// # Ok(()) }
+/// ```
 pub struct App {
     backend: Box<dyn MailBackend>,
     inbox: InboxState,
@@ -61,6 +92,7 @@ pub struct App {
     commit_progress: Option<CommitProgress>,
 }
 
+/// Cached inbox view derived from backend events.
 struct InboxState {
     messages: Vec<Message>,
     selected: Option<usize>,
@@ -71,6 +103,7 @@ struct InboxState {
     scroll_top: usize,
 }
 
+/// Snapshot of the currently opened message.
 pub(crate) struct MessageViewState {
     pub(crate) message_id: MessageId,
     pub(crate) message_index: usize,
@@ -84,6 +117,7 @@ pub(crate) struct MessageViewState {
 }
 
 impl App {
+    /// Build the application state around the provided backend.
     pub fn new(backend: Box<dyn MailBackend>) -> Result<Self> {
         let (messages, events) = backend
             .load_inbox()
@@ -117,10 +151,12 @@ impl App {
         })
     }
 
+    /// Whether the main loop should terminate.
     pub fn should_quit(&self) -> bool {
         self.should_quit
     }
 
+    /// Determine which view should be rendered by the UI.
     pub fn active_view(&self) -> ActiveView {
         if self.message_view.is_some() {
             ActiveView::Message
@@ -129,6 +165,10 @@ impl App {
         }
     }
 
+    /// Entry point for keyboard handling used by the main event loop.
+    ///
+    /// The method polls backend state before dispatching so the UI reacts to new
+    /// messages even while the user is idle.
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         self.poll_backend_events();
 
@@ -138,6 +178,7 @@ impl App {
         }
     }
 
+    /// Drain backend event channels and merge them into local state.
     pub fn poll_backend_events(&mut self) {
         self.poll_commit_updates();
 
@@ -204,6 +245,7 @@ impl App {
         }
     }
 
+    /// Poll every active commit batch for recently completed actions.
     fn poll_commit_updates(&mut self) {
         if self.commit_batches.is_empty() {
             return;
@@ -235,6 +277,7 @@ impl App {
         self.finalize_commit_batches();
     }
 
+    /// Integrate any finished batches back into the inbox state.
     fn finalize_commit_batches(&mut self) {
         loop {
             let ready = match self.commit_batches.front() {
@@ -336,6 +379,7 @@ impl App {
         text
     }
 
+    /// Renderable text indicator reflecting aggregate commit progress.
     pub(crate) fn commit_indicator(&self) -> Option<String> {
         let progress = self.commit_progress.as_ref()?;
         if progress.total == 0 {
@@ -565,6 +609,11 @@ impl App {
         self.inbox.selected = Some(next);
     }
 
+    /// Hand the current batch of scheduled actions to the backend.
+    ///
+    /// The backend responds via the channel returned from
+    /// [`MailBackend::apply_actions`]; until those updates arrive the UI can
+    /// continue scheduling new work.
     fn commit_actions(&mut self) -> Result<()> {
         if self.inbox.scheduled.is_empty() {
             return Ok(());

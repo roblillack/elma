@@ -1,3 +1,9 @@
+//! Ratatui rendering helpers for the Elma mail client.
+//!
+//! The module contains a thin layer that maps the abstract application state to
+//! widgets.  All layout decisions are centralised here so the controller logic in
+//! [`crate::app`] remains agnostic of the terminal representation.
+
 use crate::app::{ActiveView, App, MessageViewState};
 use crate::model::MessageStatus;
 use crate::viewer;
@@ -14,6 +20,7 @@ const ACTION_BAR_BG: Color = Color::Rgb(211, 211, 211);
 const ACTION_BAR_FG: Color = Color::Rgb(105, 105, 105);
 const ARCHIVED_FG: Color = Color::Rgb(0, 139, 139);
 
+/// Render the entire UI based on the currently active view.
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     match app.active_view() {
         ActiveView::Inbox => render_inbox(frame, app),
@@ -21,6 +28,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
+/// Draw the action bar, optionally reserving space for the commit indicator.
 fn render_action_bar(frame: &mut Frame<'_>, area: Rect, text: String, indicator: Option<String>) {
     if area.width == 0 {
         return;
@@ -59,6 +67,7 @@ fn render_action_bar(frame: &mut Frame<'_>, area: Rect, text: String, indicator:
     }
 }
 
+/// Render the inbox list together with action and status bars.
 fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -91,6 +100,7 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(info_bar, layout[2]);
 }
 
+/// Render the message view, falling back to the inbox if no message is open.
 fn render_message(frame: &mut Frame<'_>, app: &mut App) {
     let Some(view) = app.message_view() else {
         render_inbox(frame, app);
@@ -118,6 +128,7 @@ fn render_message(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(info_bar, layout[2]);
 }
 
+/// Build the inbox table, handling scrolling and selection.
 fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let messages = app.inbox_messages().to_vec();
     let total = messages.len();
@@ -192,6 +203,7 @@ fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
+/// Render the message body pane, including metadata and FTML/HTML content.
 fn render_message_body(frame: &mut Frame<'_>, view: &MessageViewState, area: Rect) {
     let width = area.width.max(2) - 2;
     let content_width = width.min(80);
