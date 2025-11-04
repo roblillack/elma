@@ -15,12 +15,11 @@ rendering.
 ## Differences from the Go implementation
 
 - Only the inbox view is implemented; modal dialogs, menus, and the multi-screen controller stack from the Go code are not yet ported.
-- The Rust build always runs against the mock backend (there is no Gmail/IMAP integration or configuration loader).
 - Message actions are simulated in-memory; archive/delete just update the local list and do not persist between runs.
 - FTML rendering uses the `tdoc` crate directly rather than the Go `ftml` bindings, so styling may vary on edge cases.
 - Help overlays, context menus (the Go `.` menu), and mouse interactions beyond basic selection are not implemented.
 - Logging/debug output differs: the Rust version does not emit action/event logs compatible with `elma.log`.
-- Configuration, theming, and clipboard/web integration hooks from the Go app are currently missing.
+- Theming and clipboard/web integration hooks from the Go app are currently missing.
 
 ## Running
 
@@ -28,8 +27,18 @@ rendering.
 cargo run -- --demo
 ```
 
-The mock backend is the default, so you can also omit `--demo`. New messages arrive every few
-seconds to keep the inbox active.
+The mock backend remains available via `--demo`. Without that flag the application looks for a
+Gmail configuration in `~/.elmarc` and connects through Gmail's IMAP endpoint:
+
+```toml
+[gmail]
+email = "user@gmail.com"
+password = "app-specific-password"
+```
+
+If the configuration file (or the `gmail` section) is missing, the client falls back to the mock
+backend so you can continue exploring the UI without network access. New mock messages arrive every
+few seconds to keep the inbox active.
 
 ### Key bindings
 

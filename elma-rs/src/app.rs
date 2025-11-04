@@ -103,23 +103,65 @@ impl App {
     }
 
     pub fn poll_backend_events(&mut self) {
-        let mut updated = false;
+        let mut resort = false;
+        let mut refresh = false;
         let current_id = self.message_view.as_ref().map(|view| view.message_id);
 
         loop {
             match self.inbox.events.try_recv() {
                 Ok(BackendEvent::NewMessage(message)) => {
-                    self.inbox.messages.push(message);
                     self.inbox.event_count += 1;
-                    updated = true;
+                    self.inbox.messages.push(message);
+                    resort = true;
+                    refresh = true;
+                }
+                Ok(BackendEvent::MessageFlagsChanged(message)) => {
+                    if let Some(existing) = self
+                        .inbox
+                        .messages
+                        .iter_mut()
+                        .find(|msg| msg.id == message.id)
+                    {
+                        *existing = message;
+                        self.inbox.event_count += 1;
+                        refresh = true;
+                    }
+                }
+                Ok(BackendEvent::MessageDeleted(id)) => {
+                    if let Some(position) = self.inbox.messages.iter().position(|msg| msg.id == id)
+                    {
+                        self.inbox.messages.remove(position);
+                        self.inbox.event_count += 1;
+
+                        if let Some(selected) = self.inbox.selected {
+                            if self.inbox.messages.is_empty() {
+                                self.inbox.selected = None;
+                            } else if selected >= self.inbox.messages.len() {
+                                self.inbox.selected = Some(self.inbox.messages.len() - 1);
+                            } else if position <= selected && selected > 0 {
+                                self.inbox.selected = Some(selected.saturating_sub(1));
+                            }
+                        }
+
+                        refresh = true;
+                    }
+
+                    if let Some(view) = &self.message_view {
+                        if view.message_id == id {
+                            self.message_view = None;
+                        }
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
-            };
+            }
         }
 
-        if updated {
+        if resort {
             self.inbox.messages.sort_by_key(|msg| msg.sent);
+        }
+
+        if refresh {
             self.update_selection_after_refresh(current_id);
         }
     }

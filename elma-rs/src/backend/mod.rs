@@ -2,11 +2,14 @@ use crate::model::{Action, Message, MessageContent, MessageId};
 use anyhow::Result;
 use std::sync::mpsc::Receiver;
 
+pub mod gmail;
 pub mod mock;
 
 #[derive(Clone, Debug)]
 pub enum BackendEvent {
     NewMessage(Message),
+    MessageFlagsChanged(Message),
+    MessageDeleted(MessageId),
 }
 
 pub trait MailBackend: Send + Sync {

@@ -9,3 +9,12 @@ crossterm = "0.27"
 ratatui = { version = "0.27", default-features = false, features = ["crossterm"] }
 tdoc = "0.6"
 time = { version = "0.3", features = ["formatting"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+async-native-tls = { version = "0.5", default-features = false, features = ["runtime-tokio"] }
+futures = "0.3"
+mailparse = "0.15"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+imap-proto = "0.16"

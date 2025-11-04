@@ -5,16 +5,17 @@ mod ui;
 mod viewer;
 
 use crate::app::App;
-use crate::backend::mock::MockBackend;
-use anyhow::{Context, Result};
+use crate::backend::{MailBackend, gmail::GmailBackend, mock::MockBackend};
+use anyhow::{Context, Result, anyhow};
 use crossterm::{
     event::{self, Event},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, prelude::CrosstermBackend};
+use serde::Deserialize;
 use std::io::{self, Stdout};
-use std::time::Duration;
+use std::{fs, path::PathBuf, time::Duration};
 
 const TICK_RATE: Duration = Duration::from_millis(100);
 
@@ -37,13 +38,9 @@ fn main() -> Result<()> {
         }
     }
 
-    let backend = if demo_mode {
-        MockBackend::demo()
-    } else {
-        MockBackend::default()
-    };
+    let backend = select_backend(demo_mode)?;
 
-    let mut app = App::new(Box::new(backend)).context("failed to initialize application state")?;
+    let mut app = App::new(backend).context("failed to initialize application state")?;
     run(&mut app).context("failed while running application loop")
 }
 
@@ -97,4 +94,59 @@ fn print_usage() {
     println!("OPTIONS:");
     println!("    -D, --demo    Run with the built-in mock backend (default)");
     println!("    -h, --help    Show this help message");
+}
+
+fn select_backend(demo_mode: bool) -> Result<Box<dyn MailBackend>> {
+    if demo_mode {
+        return Ok(Box::new(MockBackend::demo()));
+    }
+
+    match load_gmail_config()? {
+        Some(cfg) => {
+            let password = cfg
+                .password
+                .ok_or_else(|| anyhow!("gmail.password missing in configuration file"))?;
+            let backend = GmailBackend::new(cfg.email, password)
+                .context("failed to initialize Gmail backend")?;
+            Ok(Box::new(backend))
+        }
+        None => {
+            eprintln!(
+                "No Gmail configuration found; using mock backend (pass --demo to hide this message)."
+            );
+            Ok(Box::new(MockBackend::default()))
+        }
+    }
+}
+
+fn load_gmail_config() -> Result<Option<GmailConfig>> {
+    let path = config_path();
+    let Some(path) = path else {
+        return Ok(None);
+    };
+
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("unable to read configuration file {}", path.display()))?;
+    let config: Config = toml::from_str(&raw)
+        .with_context(|| format!("unable to parse configuration file {}", path.display()))?;
+    Ok(config.gmail)
+}
+
+fn config_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".elmarc"))
+}
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    gmail: Option<GmailConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GmailConfig {
+    email: String,
+    password: Option<String>,
 }
