@@ -99,8 +99,8 @@ impl MockBackend {
             (MailboxKind::Starred, 40usize, MessageStatus::Read),
             (MailboxKind::Sent, 25usize, MessageStatus::Read),
             (MailboxKind::Drafts, 12usize, MessageStatus::New),
-            (MailboxKind::Archive, 35usize, MessageStatus::Archived),
-            (MailboxKind::Trash, 18usize, MessageStatus::Deleted),
+            (MailboxKind::Archive, 35usize, MessageStatus::Read),
+            (MailboxKind::Trash, 18usize, MessageStatus::Read),
         ];
 
         for (kind, count, status) in templates {
@@ -128,10 +128,16 @@ impl MockBackend {
                     MailboxKind::Archive => {
                         message.labels = vec!["Archive".to_string()];
                         message.starred = rng.one_in(5);
+                        if rng.one_in(6) {
+                            message.status = MessageStatus::New;
+                        }
                     }
                     MailboxKind::Trash => {
                         message.labels = vec!["Trash".to_string()];
                         message.starred = false;
+                        if rng.one_in(6) {
+                            message.status = MessageStatus::New;
+                        }
                     }
                     MailboxKind::Inbox => {}
                 }
@@ -209,36 +215,111 @@ impl MockBackend {
         let mut mailboxes = mailboxes.lock().expect("mailboxes mutex poisoned");
         let mut contents = contents.lock().expect("contents mutex poisoned");
 
-        let mut target = None;
-        for list in mailboxes.values_mut() {
-            if let Some(msg) = list
-                .iter_mut()
-                .find(|mock| mock.message.id == action.message_id)
-            {
-                target = Some(msg);
-                break;
+        let mut removed = None;
+        for kind in MailboxKind::ALL {
+            if let Some(list) = mailboxes.get_mut(&kind) {
+                if let Some(index) = list
+                    .iter()
+                    .position(|mock| mock.message.id == action.message_id)
+                {
+                    let mock = list.remove(index);
+                    removed = Some((kind, mock));
+                    break;
+                }
             }
         }
 
-        let Some(msg) = target else {
+        let Some((source_kind, mut mock)) = removed else {
             return Err(anyhow!("message {} not found", action.message_id));
         };
 
+        let mut target_kind = source_kind;
+        let was_new = matches!(mock.message.status, MessageStatus::New);
         match action.action_type {
-            ActionType::Archive => msg.message.status = MessageStatus::Archived,
-            ActionType::Delete => msg.message.status = MessageStatus::Deleted,
-            ActionType::MoveToInboxUnread => msg.message.status = MessageStatus::New,
-            ActionType::MoveToInboxRead => msg.message.status = MessageStatus::Read,
-            ActionType::MarkAsStarred => msg.message.starred = true,
-            ActionType::MarkAsUnstarred => msg.message.starred = false,
+            ActionType::Archive => {
+                mock.message
+                    .labels
+                    .retain(|label| !label.eq_ignore_ascii_case("Trash"));
+                if !mock
+                    .message
+                    .labels
+                    .iter()
+                    .any(|label| label.eq_ignore_ascii_case("Archive"))
+                {
+                    mock.message.labels.push("Archive".to_string());
+                }
+                mock.message.status = if was_new {
+                    MessageStatus::New
+                } else {
+                    MessageStatus::Read
+                };
+                target_kind = MailboxKind::Archive;
+            }
+            ActionType::Delete => {
+                mock.message
+                    .labels
+                    .retain(|label| !label.eq_ignore_ascii_case("Archive"));
+                if !mock
+                    .message
+                    .labels
+                    .iter()
+                    .any(|label| label.eq_ignore_ascii_case("Trash"))
+                {
+                    mock.message.labels.push("Trash".to_string());
+                }
+                mock.message.status = if was_new {
+                    MessageStatus::New
+                } else {
+                    MessageStatus::Read
+                };
+                target_kind = MailboxKind::Trash;
+            }
+            ActionType::MoveToInboxUnread => {
+                mock.message.status = MessageStatus::New;
+                mock.message.labels.retain(|label| {
+                    !label.eq_ignore_ascii_case("Archive") && !label.eq_ignore_ascii_case("Trash")
+                });
+                target_kind = MailboxKind::Inbox;
+            }
+            ActionType::MoveToInboxRead => {
+                mock.message.status = MessageStatus::Read;
+                mock.message.labels.retain(|label| {
+                    !label.eq_ignore_ascii_case("Archive") && !label.eq_ignore_ascii_case("Trash")
+                });
+                target_kind = MailboxKind::Inbox;
+            }
+            ActionType::MarkAsStarred => {
+                mock.message.starred = true;
+                if !mock
+                    .message
+                    .labels
+                    .iter()
+                    .any(|label| label.eq_ignore_ascii_case("Starred"))
+                {
+                    mock.message.labels.push("Starred".to_string());
+                }
+            }
+            ActionType::MarkAsUnstarred => {
+                mock.message.starred = false;
+                mock.message
+                    .labels
+                    .retain(|label| !label.eq_ignore_ascii_case("Starred"));
+            }
         }
 
         if let Some(content) = contents.get_mut(&action.message_id) {
-            if msg.message.status == MessageStatus::New {
+            if mock.message.status == MessageStatus::New {
                 content.mailer = format!("{MAILER_NAME} (unread)");
             } else {
                 content.mailer = MAILER_NAME.to_string();
             }
+        }
+
+        if let Some(list) = mailboxes.get_mut(&target_kind) {
+            list.push(mock);
+            list.sort_by_key(|entry| entry.message.sent);
+        } else {
+            return Err(anyhow!("mailbox {target_kind:?} not found"));
         }
 
         Ok(())

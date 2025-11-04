@@ -9,6 +9,7 @@ pub enum MessageStatus {
     New,
     Deleted,
     Archived,
+    PendingInbox,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -69,6 +70,7 @@ impl Message {
             MessageStatus::Deleted => 'D',
             MessageStatus::New => 'N',
             MessageStatus::Read => ' ',
+            MessageStatus::PendingInbox => 'I',
         };
 
         if self.starred {
@@ -188,6 +190,7 @@ impl fmt::Display for MessageStatus {
             MessageStatus::New => "New",
             MessageStatus::Deleted => "Deleted",
             MessageStatus::Archived => "Archived",
+            MessageStatus::PendingInbox => "Pending inbox",
         };
         f.write_str(text)
     }

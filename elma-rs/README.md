@@ -56,19 +56,18 @@ few seconds to keep the inbox active.
   - `s` Starred
   - `d` Drafts
   - `t` Sent
-  - `T` Trash
+  - `T` Trash (Should be `g` `r` or even `g` `#`?)
 
 ### Todo
 
 - [ ] Add `!` to report as spam
-- [ ] Add `g` `S` to go to spam mailbox
+- [ ] Add `g` `S` (Should be `g` `j` or even `g` `!`) to go to spam mailbox
 - [ ] Implement `r` to reply to message
 - [ ] Implement `a` to reply all
 - [ ] Implement `f` to forward message
 - [ ] `=`/`+` and `-` to mark as important/unimportant
 - [ ] Implement search (`/` and `n`/`N`)
 - [ ] Implement composing new message (`c`)
-- [ ] Make sure to
 - [ ] Implement help overlay (`?`)
 
 ## Project layout

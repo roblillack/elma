@@ -487,7 +487,9 @@ impl App {
 
             if batch.failed.is_empty() {
                 self.mailbox.messages.retain(|msg| {
-                    msg.status != MessageStatus::Archived && msg.status != MessageStatus::Deleted
+                    msg.status != MessageStatus::Archived
+                        && msg.status != MessageStatus::Deleted
+                        && msg.status != MessageStatus::PendingInbox
                 });
                 self.mailbox.status_line = Some("Actions committed.".to_string());
             } else {
@@ -543,12 +545,29 @@ impl App {
                     text.push_str(" s:Star");
                 }
 
+                let in_archive = self.current_mailbox == MailboxKind::Archive;
+                let in_trash = self.current_mailbox == MailboxKind::Trash;
                 match msg.status {
                     MessageStatus::New | MessageStatus::Read => {
                         text.push_str(" r:Reply y:Archive d:Delete");
                     }
-                    MessageStatus::Deleted => text.push_str(" r:Reply y:Archive u:Undelete"),
-                    MessageStatus::Archived => text.push_str(" r:Reply u:Unarchive d:Delete"),
+                    MessageStatus::Deleted => {
+                        if in_trash {
+                            text.push_str(" r:Reply y:Archive d:Undelete");
+                        } else {
+                            text.push_str(" r:Reply y:Archive u:Undelete");
+                        }
+                    }
+                    MessageStatus::Archived => {
+                        if in_archive {
+                            text.push_str(" r:Reply y:Unarchive d:Delete");
+                        } else {
+                            text.push_str(" r:Reply u:Unarchive d:Delete");
+                        }
+                    }
+                    MessageStatus::PendingInbox => {
+                        text.push_str(" r:Reply");
+                    }
                 }
             }
         }
@@ -633,6 +652,7 @@ impl App {
             KeyCode::Char('$') => self.commit_actions()?,
             KeyCode::Enter | KeyCode::Right => self.open_selected_message()?,
             KeyCode::Char('d') | KeyCode::Char('D') => self.schedule_delete(),
+            KeyCode::Char('#') => self.schedule_delete(),
             KeyCode::Backspace | KeyCode::Delete => self.schedule_delete(),
             _ => {}
         }
@@ -740,6 +760,11 @@ impl App {
     }
 
     fn schedule_archive(&mut self) {
+        if self.current_mailbox == MailboxKind::Archive {
+            self.schedule_move_to_inbox();
+            return;
+        }
+
         if let Some(idx) = self.mailbox.selected {
             if let Some(msg) = self.mailbox.messages.get_mut(idx) {
                 msg.status = MessageStatus::Archived;
@@ -752,11 +777,33 @@ impl App {
     }
 
     fn schedule_delete(&mut self) {
+        if self.current_mailbox == MailboxKind::Trash {
+            self.schedule_move_to_inbox();
+            return;
+        }
+
         if let Some(idx) = self.mailbox.selected {
             if let Some(msg) = self.mailbox.messages.get_mut(idx) {
                 msg.status = MessageStatus::Deleted;
                 self.scheduled_actions
                     .push(Action::new(ActionType::Delete, msg.id));
+                self.advance_selection_after_action(idx);
+                self.sync_message_view_state();
+            }
+        }
+    }
+
+    fn schedule_move_to_inbox(&mut self) {
+        if let Some(idx) = self.mailbox.selected {
+            if let Some(msg) = self.mailbox.messages.get_mut(idx) {
+                let restore_unread = matches!(msg.status, MessageStatus::New);
+                msg.status = MessageStatus::PendingInbox;
+                let action_type = if restore_unread {
+                    ActionType::MoveToInboxUnread
+                } else {
+                    ActionType::MoveToInboxRead
+                };
+                self.scheduled_actions.push(Action::new(action_type, msg.id));
                 self.advance_selection_after_action(idx);
                 self.sync_message_view_state();
             }
@@ -774,6 +821,11 @@ impl App {
                     MessageStatus::Deleted | MessageStatus::Archived => {
                         msg.status = MessageStatus::Read;
                         ActionType::MoveToInboxRead
+                    }
+                    MessageStatus::PendingInbox => {
+                        self.mailbox.status_line =
+                            Some("Message already scheduled to move to inbox.".to_string());
+                        return;
                     }
                 };
                 self.scheduled_actions
