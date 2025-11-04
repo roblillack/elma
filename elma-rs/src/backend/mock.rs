@@ -322,6 +322,7 @@ fn new_random_message(
 ) -> (Message, MessageContent) {
     let subject = generate_subject(rng);
     let sender = generate_sender(rng);
+    let recipients = generate_recipients(rng);
     let body = random_body(&sender, &subject, rng);
     let html = format!("<html><body><h1>{subject}</h1>{body}</body></html>");
     let plain = html2text::from_read(html.as_bytes(), 80);
@@ -342,6 +343,7 @@ fn new_random_message(
         id,
         sent,
         sender,
+        recipients,
         subject,
         size,
         starred: false,
@@ -394,6 +396,15 @@ fn generate_sender(rng: &mut SimpleRng) -> String {
     }
     parts.push(rng.choose_str(LAST_NAMES).to_string());
     parts.join(" ")
+}
+
+fn generate_recipients(rng: &mut SimpleRng) -> Vec<String> {
+    let count = rng.gen_range_usize_inclusive(1, 3);
+    let mut recipients = Vec::with_capacity(count);
+    for _ in 0..count {
+        recipients.push(generate_sender(rng));
+    }
+    recipients
 }
 
 fn generate_subject(rng: &mut SimpleRng) -> String {

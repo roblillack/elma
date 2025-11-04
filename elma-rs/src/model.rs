@@ -49,6 +49,7 @@ pub struct Message {
     pub id: MessageId,
     pub sent: OffsetDateTime,
     pub sender: String,
+    pub recipients: Vec<String>,
     pub subject: String,
     pub size: usize,
     pub starred: bool,
@@ -94,6 +95,14 @@ impl Message {
         } else {
             let year = self.sent.year();
             format!("[{month} {day:02}, {year}]")
+        }
+    }
+
+    pub fn recipients_display(&self) -> String {
+        if self.recipients.is_empty() {
+            "Unknown recipient".to_string()
+        } else {
+            self.recipients.join(", ")
         }
     }
 }

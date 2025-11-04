@@ -812,6 +812,7 @@ fn build_message_from_fetch(fetch: &Fetch) -> Result<Option<StoredMessage>> {
         .unwrap_or_else(OffsetDateTime::now_utc);
 
     let sender = extract_sender(envelope);
+    let recipients = extract_recipients(envelope);
     let subject = decode_header(envelope.subject.as_ref(), "Subject");
     let size = fetch.size.unwrap_or_default() as usize;
     let flags: Vec<_> = fetch.flags().collect();
@@ -829,6 +830,7 @@ fn build_message_from_fetch(fetch: &Fetch) -> Result<Option<StoredMessage>> {
         id: uid as u64,
         sent,
         sender,
+        recipients,
         subject,
         size,
         starred,
@@ -922,29 +924,52 @@ fn decode_header(value: Option<&std::borrow::Cow<'_, [u8]>>, field_name: &str) -
 }
 
 fn extract_sender(envelope: &imap_proto::types::Envelope<'_>) -> String {
-    if let Some(addresses) = &envelope.from {
-        if let Some(address) = addresses.first() {
-            if let Some(name) = &address.name {
-                let decoded = decode_header(Some(name), "From");
-                if !decoded.is_empty() {
-                    return decoded;
-                }
-            }
+    envelope
+        .from
+        .as_ref()
+        .and_then(|addresses| addresses.first())
+        .and_then(|address| decode_envelope_address(address, "From"))
+        .unwrap_or_else(|| "Unknown sender".to_string())
+}
 
-            let mailbox = address
-                .mailbox
-                .as_ref()
-                .and_then(|m| str::from_utf8(m.as_ref()).ok());
-            let host = address
-                .host
-                .as_ref()
-                .and_then(|h| str::from_utf8(h.as_ref()).ok());
-            if let (Some(mailbox), Some(host)) = (mailbox, host) {
-                return format!("{mailbox}@{host}");
-            }
+fn extract_recipients(envelope: &imap_proto::types::Envelope<'_>) -> Vec<String> {
+    envelope
+        .to
+        .as_ref()
+        .map(|addresses| {
+            addresses
+                .iter()
+                .filter_map(|address| decode_envelope_address(address, "To"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn decode_envelope_address(
+    address: &imap_proto::types::Address<'_>,
+    field_name: &str,
+) -> Option<String> {
+    if let Some(name) = &address.name {
+        let decoded = decode_header(Some(name), field_name);
+        if !decoded.is_empty() {
+            return Some(decoded);
         }
     }
-    "Unknown sender".to_string()
+
+    let mailbox = address
+        .mailbox
+        .as_ref()
+        .and_then(|m| str::from_utf8(m.as_ref()).ok());
+    let host = address
+        .host
+        .as_ref()
+        .and_then(|h| str::from_utf8(h.as_ref()).ok());
+
+    match (mailbox, host) {
+        (Some(mailbox), Some(host)) => Some(format!("{mailbox}@{host}")),
+        (Some(mailbox), None) => Some(mailbox.to_string()),
+        _ => None,
+    }
 }
 
 fn summarize_flags_from_names<'a, I>(flags: I) -> (MessageStatus, bool, bool, bool)

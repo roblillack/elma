@@ -948,10 +948,16 @@ impl App {
         message: &Message,
         now: OffsetDateTime,
     ) -> MessageRow {
+        let display_name = if self.current_mailbox == MailboxKind::Sent {
+            message.recipients_display()
+        } else {
+            message.sender.clone()
+        };
+
         MessageRow {
             flags: message.flag_string(),
             date: message.formatted_received(now),
-            sender: padded_sender(&message.sender),
+            sender: padded_sender(&display_name),
             size: format_size(message.size),
             subject: format_subject(message),
             status: message.status,
