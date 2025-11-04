@@ -7,7 +7,8 @@
 use crate::{
     backend::{ActionStatus, BackendEvent, MailBackend},
     model::{
-        Action, ActionType, Message, MessageContent, MessageContentPart, MessageId, MessageStatus,
+        Action, ActionType, MailboxKind, Message, MessageContent, MessageContentPart, MessageId,
+        MessageStatus,
     },
 };
 use anyhow::{Context, Result, anyhow};
@@ -39,7 +40,10 @@ type AsyncSession = Session<TlsStream<TcpStream>>;
 
 const GMAIL_HOST: &str = "imap.gmail.com";
 const GMAIL_PORT: u16 = 993;
+const DEFAULT_STARRED_LABEL: &str = "[Gmail]/Starred";
 const DEFAULT_ARCHIVE_LABEL: &str = "[Gmail]/All Mail";
+const DEFAULT_SENT_LABEL: &str = "[Gmail]/Sent Mail";
+const DEFAULT_DRAFTS_LABEL: &str = "[Gmail]/Drafts";
 const DEFAULT_TRASH_LABEL: &str = "[Gmail]/Trash";
 const MAX_PART_DEPTH: usize = 5;
 
@@ -63,6 +67,7 @@ struct GmailInner {
     session: AsyncMutex<Option<AsyncSession>>,
     state: AsyncMutex<SharedState>,
     labels: AsyncMutex<SpecialMailboxes>,
+    current_mailbox: AsyncMutex<MailboxKind>,
     events: Mutex<Option<mpsc::Sender<BackendEvent>>>,
     idle_stop: AsyncMutex<Option<oneshot::Sender<()>>>,
     idle_handle: AsyncMutex<Option<JoinHandle<()>>>,
@@ -86,14 +91,20 @@ struct StoredMessage {
 /// User-specific Gmail labels that correspond to archive/trash.
 #[derive(Clone)]
 struct SpecialMailboxes {
+    starred: String,
     archive: String,
+    sent: String,
+    drafts: String,
     trash: String,
 }
 
 impl Default for SpecialMailboxes {
     fn default() -> Self {
         Self {
+            starred: DEFAULT_STARRED_LABEL.to_string(),
             archive: DEFAULT_ARCHIVE_LABEL.to_string(),
+            sent: DEFAULT_SENT_LABEL.to_string(),
+            drafts: DEFAULT_DRAFTS_LABEL.to_string(),
             trash: DEFAULT_TRASH_LABEL.to_string(),
         }
     }
@@ -120,6 +131,7 @@ impl GmailBackend {
                 session: AsyncMutex::new(None),
                 state: AsyncMutex::new(SharedState::default()),
                 labels: AsyncMutex::new(SpecialMailboxes::default()),
+                current_mailbox: AsyncMutex::new(MailboxKind::Inbox),
                 events: Mutex::new(None),
                 idle_stop: AsyncMutex::new(None),
                 idle_handle: AsyncMutex::new(None),
@@ -129,8 +141,11 @@ impl GmailBackend {
 }
 
 impl MailBackend for GmailBackend {
-    /// Fetch the initial inbox and subscribe to Gmail's IDLE notifications.
-    fn load_inbox(&self) -> Result<(Vec<Message>, mpsc::Receiver<BackendEvent>)> {
+    /// Fetch `mailbox` and subscribe to Gmail's IDLE notifications for it.
+    fn load_mailbox(
+        &self,
+        mailbox: MailboxKind,
+    ) -> Result<(Vec<Message>, mpsc::Receiver<BackendEvent>)> {
         let (sender, receiver) = mpsc::channel();
 
         {
@@ -140,34 +155,13 @@ impl MailBackend for GmailBackend {
 
         let messages = self.inner.runtime.block_on(async {
             self.inner.ensure_connected().await?;
-            self.inner.select_inbox().await?;
-
-            let mut session_guard = self.inner.session.lock().await;
-            let session = session_guard
-                .as_mut()
-                .ok_or_else(|| anyhow!("IMAP session is not available"))?;
-
-            let query = "(FLAGS INTERNALDATE RFC822.SIZE ENVELOPE UID)";
-            let mut fetch_stream = session.fetch("1:*", query).await?;
-
-            let mut messages = Vec::new();
-            let mut new_state = SharedState::default();
-
-            while let Some(fetch) = fetch_stream.try_next().await? {
-                if let Some(stored) = build_message_from_fetch(&fetch)? {
-                    let message = stored.message.clone();
-                    new_state.insert(stored);
-                    messages.push(message);
-                }
-            }
-
-            messages.sort_by_key(|msg| msg.sent);
-
+            self.inner.pause_idle().await?;
+            self.inner.select_mailbox(mailbox).await?;
+            let messages = self.inner.refresh_selected_mailbox().await?;
             {
-                let mut state_guard = self.inner.state.lock().await;
-                *state_guard = new_state;
+                let mut current = self.inner.current_mailbox.lock().await;
+                *current = mailbox;
             }
-
             self.inner.start_idle_loop().await?;
 
             Ok::<_, anyhow::Error>(messages)
@@ -274,14 +268,63 @@ impl GmailInner {
         Ok(())
     }
 
-    /// Select the `INBOX` mailbox so subsequent fetches operate on the right context.
-    async fn select_inbox(&self) -> Result<()> {
+    /// Resolve the IMAP mailbox name for `mailbox`.
+    async fn mailbox_name(&self, mailbox: MailboxKind) -> Result<String> {
+        let labels = self.labels.lock().await;
+        let name = match mailbox {
+            MailboxKind::Inbox => "INBOX".to_string(),
+            MailboxKind::Starred => labels.starred.clone(),
+            MailboxKind::Sent => labels.sent.clone(),
+            MailboxKind::Drafts => labels.drafts.clone(),
+            MailboxKind::Archive => labels.archive.clone(),
+            MailboxKind::Trash => labels.trash.clone(),
+        };
+        Ok(name)
+    }
+
+    /// Select the given mailbox so subsequent fetches operate on the right context.
+    async fn select_mailbox(&self, mailbox: MailboxKind) -> Result<()> {
+        let name = self.mailbox_name(mailbox).await?;
         let mut guard = self.session.lock().await;
         let session = guard
             .as_mut()
             .ok_or_else(|| anyhow!("IMAP session is not available"))?;
-        session.select("INBOX").await.context("selecting INBOX")?;
+        session
+            .select(&name)
+            .await
+            .with_context(|| format!("selecting mailbox {name}"))?;
         Ok(())
+    }
+
+    /// Refresh the cached state for the currently selected mailbox.
+    async fn refresh_selected_mailbox(&self) -> Result<Vec<Message>> {
+        let query = "(FLAGS INTERNALDATE RFC822.SIZE ENVELOPE UID)";
+        let mut messages = Vec::new();
+        let mut new_state = SharedState::default();
+
+        {
+            let mut session_guard = self.session.lock().await;
+            let session = session_guard
+                .as_mut()
+                .ok_or_else(|| anyhow!("IMAP session is not available"))?;
+
+            let mut fetch_stream = session.fetch("1:*", query).await?;
+            while let Some(fetch) = fetch_stream.try_next().await? {
+                if let Some(stored) = build_message_from_fetch(&fetch)? {
+                    messages.push(stored.message.clone());
+                    new_state.insert(stored);
+                }
+            }
+        }
+
+        messages.sort_by_key(|msg| msg.sent);
+
+        {
+            let mut state_guard = self.state.lock().await;
+            *state_guard = new_state;
+        }
+
+        Ok(messages)
     }
 
     /// Discover the Gmail archive and trash mailboxes so we can move messages later.
@@ -298,6 +341,9 @@ impl GmailInner {
 
         let mut archive = None;
         let mut trash = None;
+        let mut starred = None;
+        let mut sent = None;
+        let mut drafts = None;
 
         while let Some(name) = list_stream.try_next().await? {
             let attrs = name.attributes();
@@ -310,6 +356,21 @@ impl GmailInner {
             {
                 trash = Some(name.name().to_string());
             }
+            if attrs
+                .iter()
+                .any(|attr| matches!(attr, NameAttribute::Flagged))
+            {
+                starred = Some(name.name().to_string());
+            }
+            if attrs.iter().any(|attr| matches!(attr, NameAttribute::Sent)) {
+                sent = Some(name.name().to_string());
+            }
+            if attrs
+                .iter()
+                .any(|attr| matches!(attr, NameAttribute::Drafts))
+            {
+                drafts = Some(name.name().to_string());
+            }
         }
 
         {
@@ -319,6 +380,15 @@ impl GmailInner {
             }
             if let Some(value) = trash {
                 labels.trash = value;
+            }
+            if let Some(value) = starred {
+                labels.starred = value;
+            }
+            if let Some(value) = sent {
+                labels.sent = value;
+            }
+            if let Some(value) = drafts {
+                labels.drafts = value;
             }
         }
 

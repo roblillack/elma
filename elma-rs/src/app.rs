@@ -7,8 +7,8 @@
 
 use crate::backend::{ActionStatus, BackendEvent, MailBackend};
 use crate::model::{
-    Action, ActionType, Message, MessageContent, MessageId, MessageStatus, format_size,
-    padded_sender,
+    Action, ActionType, MailboxKind, Message, MessageContent, MessageId, MessageStatus,
+    format_size, padded_sender,
 };
 use anyhow::{Context, Result, anyhow};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -60,7 +60,7 @@ struct CommitProgress {
 
 /// Which screen the UI is currently rendering.
 pub enum ActiveView {
-    Inbox,
+    Mailbox,
     Message,
 }
 
@@ -85,18 +85,20 @@ pub enum ActiveView {
 /// ```
 pub struct App {
     backend: Box<dyn MailBackend>,
-    inbox: InboxState,
+    mailbox: MailboxState,
     message_view: Option<MessageViewState>,
     should_quit: bool,
     commit_batches: VecDeque<CommitBatchState>,
     commit_progress: Option<CommitProgress>,
+    scheduled_actions: Vec<Action>,
+    current_mailbox: MailboxKind,
+    pending_shortcut: Option<ShortcutMenuState>,
 }
 
 /// Cached inbox view derived from backend events.
-struct InboxState {
+struct MailboxState {
     messages: Vec<Message>,
     selected: Option<usize>,
-    scheduled: Vec<Action>,
     events: Receiver<BackendEvent>,
     event_count: usize,
     status_line: Option<String>,
@@ -116,6 +118,99 @@ pub(crate) struct MessageViewState {
     pub(crate) info_line: Option<String>,
 }
 
+struct ShortcutMenuState {
+    menu: ShortcutMenu,
+}
+
+pub(crate) struct ShortcutMenu {
+    title: &'static str,
+    items: Vec<ShortcutItem>,
+}
+
+#[derive(Clone, Copy)]
+struct ShortcutItem {
+    key: char,
+    description: &'static str,
+    action: ShortcutAction,
+}
+
+#[derive(Clone, Copy)]
+enum ShortcutAction {
+    SwitchMailbox(MailboxKind),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ShortcutEntry {
+    pub(crate) key: char,
+    pub(crate) description: &'static str,
+}
+
+impl ShortcutMenuState {
+    fn go_to_menu() -> Self {
+        let items = vec![
+            ShortcutItem::new('i', "Inbox", MailboxKind::Inbox),
+            ShortcutItem::new('s', "Starred", MailboxKind::Starred),
+            ShortcutItem::new('t', "Sent", MailboxKind::Sent),
+            ShortcutItem::new('d', "Drafts", MailboxKind::Drafts),
+            ShortcutItem::new('a', "Archive", MailboxKind::Archive),
+            ShortcutItem::new('T', "Trash", MailboxKind::Trash),
+        ];
+
+        Self {
+            menu: ShortcutMenu {
+                title: "Go to",
+                items,
+            },
+        }
+    }
+
+    fn menu(&self) -> &ShortcutMenu {
+        &self.menu
+    }
+
+    fn action_for(&self, key: char) -> Option<ShortcutAction> {
+        self.menu
+            .items
+            .iter()
+            .find(|item| item.matches(key))
+            .map(|item| item.action)
+    }
+}
+
+impl ShortcutMenu {
+    pub(crate) fn title(&self) -> &'static str {
+        self.title
+    }
+
+    pub(crate) fn entries(&self) -> impl Iterator<Item = ShortcutEntry> + '_ {
+        self.items.iter().map(|item| ShortcutEntry {
+            key: item.key(),
+            description: item.description(),
+        })
+    }
+}
+
+impl ShortcutItem {
+    const fn new(key: char, description: &'static str, mailbox: MailboxKind) -> Self {
+        Self {
+            key,
+            description,
+            action: ShortcutAction::SwitchMailbox(mailbox),
+        }
+    }
+
+    fn matches(&self, key: char) -> bool {
+        self.key == key
+    }
+
+    fn key(&self) -> char {
+        self.key
+    }
+
+    fn description(&self) -> &'static str {
+        self.description
+    }
+}
 impl App {
     /// Build the application state around the provided backend.
     pub fn new(backend: Box<dyn MailBackend>) -> Result<Self> {
@@ -131,10 +226,9 @@ impl App {
             Some(sorted.len().saturating_sub(1))
         };
 
-        let inbox = InboxState {
+        let mailbox = MailboxState {
             messages: sorted,
             selected,
-            scheduled: Vec::new(),
             events,
             event_count: 0,
             status_line: None,
@@ -143,11 +237,14 @@ impl App {
 
         Ok(Self {
             backend,
-            inbox,
+            mailbox,
             message_view: None,
             should_quit: false,
             commit_batches: VecDeque::new(),
             commit_progress: None,
+            scheduled_actions: Vec::new(),
+            current_mailbox: MailboxKind::Inbox,
+            pending_shortcut: None,
         })
     }
 
@@ -161,7 +258,7 @@ impl App {
         if self.message_view.is_some() {
             ActiveView::Message
         } else {
-            ActiveView::Inbox
+            ActiveView::Mailbox
         }
     }
 
@@ -172,10 +269,94 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         self.poll_backend_events();
 
+        if self.process_pending_shortcut(key)? {
+            return Ok(());
+        }
+
+        if self.pending_shortcut.is_none()
+            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G'))
+        {
+            self.open_go_to_menu();
+            return Ok(());
+        }
+
         match self.active_view() {
-            ActiveView::Inbox => self.handle_inbox_key(key),
+            ActiveView::Mailbox => self.handle_mailbox_key(key),
             ActiveView::Message => self.handle_message_key(key),
         }
+    }
+
+    fn process_pending_shortcut(&mut self, key: KeyEvent) -> Result<bool> {
+        let Some(state) = self.pending_shortcut.as_ref() else {
+            return Ok(false);
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.pending_shortcut = None;
+                self.mailbox.status_line = Some("Shortcut cancelled.".to_string());
+                Ok(true)
+            }
+            KeyCode::Char(ch) => {
+                let action = state.action_for(ch);
+                self.pending_shortcut = None;
+                match action {
+                    Some(ShortcutAction::SwitchMailbox(target)) => {
+                        self.switch_mailbox(target)?;
+                    }
+                    None => {
+                        self.mailbox.status_line = Some(format!("Unknown go to target: {ch}"));
+                    }
+                }
+                Ok(true)
+            }
+            _ => {
+                self.pending_shortcut = None;
+                Ok(true)
+            }
+        }
+    }
+
+    fn open_go_to_menu(&mut self) {
+        self.pending_shortcut = Some(ShortcutMenuState::go_to_menu());
+        self.mailbox.status_line = Some("Go to: press the highlighted key.".to_string());
+    }
+
+    fn switch_mailbox(&mut self, target: MailboxKind) -> Result<()> {
+        if target == self.current_mailbox {
+            self.mailbox.status_line = Some(format!("Already viewing {target}."));
+            return Ok(());
+        }
+
+        let (mut messages, events) = self
+            .backend
+            .load_mailbox(target)
+            .with_context(|| format!("failed to load {target} mailbox"))?;
+        messages.sort_by_key(|msg| msg.sent);
+        let selected = if messages.is_empty() {
+            None
+        } else {
+            Some(messages.len().saturating_sub(1))
+        };
+
+        self.mailbox = MailboxState {
+            messages,
+            selected,
+            events,
+            event_count: 0,
+            status_line: Some(format!("Opened {target}.")),
+            scroll_top: 0,
+        };
+
+        self.current_mailbox = target;
+        self.message_view = None;
+        self.normalize_scroll();
+        Ok(())
+    }
+
+    pub(crate) fn shortcut_menu(&self) -> Option<&ShortcutMenu> {
+        self.pending_shortcut.as_ref().map(|state| state.menu())
     }
 
     /// Drain backend event channels and merge them into local state.
@@ -187,38 +368,39 @@ impl App {
         let current_id = self.message_view.as_ref().map(|view| view.message_id);
 
         loop {
-            match self.inbox.events.try_recv() {
+            match self.mailbox.events.try_recv() {
                 Ok(BackendEvent::NewMessage(message)) => {
-                    self.inbox.event_count += 1;
-                    self.inbox.messages.push(message);
+                    self.mailbox.event_count += 1;
+                    self.mailbox.messages.push(message);
                     resort = true;
                     refresh = true;
                 }
                 Ok(BackendEvent::MessageFlagsChanged(message)) => {
                     if let Some(existing) = self
-                        .inbox
+                        .mailbox
                         .messages
                         .iter_mut()
                         .find(|msg| msg.id == message.id)
                     {
                         *existing = message;
-                        self.inbox.event_count += 1;
+                        self.mailbox.event_count += 1;
                         refresh = true;
                     }
                 }
                 Ok(BackendEvent::MessageDeleted(id)) => {
-                    if let Some(position) = self.inbox.messages.iter().position(|msg| msg.id == id)
+                    if let Some(position) =
+                        self.mailbox.messages.iter().position(|msg| msg.id == id)
                     {
-                        self.inbox.messages.remove(position);
-                        self.inbox.event_count += 1;
+                        self.mailbox.messages.remove(position);
+                        self.mailbox.event_count += 1;
 
-                        if let Some(selected) = self.inbox.selected {
-                            if self.inbox.messages.is_empty() {
-                                self.inbox.selected = None;
-                            } else if selected >= self.inbox.messages.len() {
-                                self.inbox.selected = Some(self.inbox.messages.len() - 1);
+                        if let Some(selected) = self.mailbox.selected {
+                            if self.mailbox.messages.is_empty() {
+                                self.mailbox.selected = None;
+                            } else if selected >= self.mailbox.messages.len() {
+                                self.mailbox.selected = Some(self.mailbox.messages.len() - 1);
                             } else if position <= selected && selected > 0 {
-                                self.inbox.selected = Some(selected.saturating_sub(1));
+                                self.mailbox.selected = Some(selected.saturating_sub(1));
                             }
                         }
 
@@ -237,7 +419,7 @@ impl App {
         }
 
         if resort {
-            self.inbox.messages.sort_by_key(|msg| msg.sent);
+            self.mailbox.messages.sort_by_key(|msg| msg.sent);
         }
 
         if refresh {
@@ -304,27 +486,26 @@ impl App {
             }
 
             if batch.failed.is_empty() {
-                self.inbox.messages.retain(|msg| {
+                self.mailbox.messages.retain(|msg| {
                     msg.status != MessageStatus::Archived && msg.status != MessageStatus::Deleted
                 });
-                self.inbox.status_line = Some("Actions committed.".to_string());
+                self.mailbox.status_line = Some("Actions committed.".to_string());
             } else {
                 let summary = format!("Failed to apply {} actions.", batch.failed.len());
-                self.inbox.status_line = Some(summary);
-                self.inbox
-                    .scheduled
+                self.mailbox.status_line = Some(summary);
+                self.scheduled_actions
                     .extend(batch.failed.into_iter().map(|(action, _error)| action));
             }
 
             self.sync_message_view_state();
-            if let Some(idx) = self.inbox.selected {
-                if idx >= self.inbox.messages.len() && !self.inbox.messages.is_empty() {
-                    self.inbox.selected = Some(self.inbox.messages.len() - 1);
+            if let Some(idx) = self.mailbox.selected {
+                if idx >= self.mailbox.messages.len() && !self.mailbox.messages.is_empty() {
+                    self.mailbox.selected = Some(self.mailbox.messages.len() - 1);
                 }
             }
 
-            if self.inbox.messages.is_empty() {
-                self.inbox.selected = None;
+            if self.mailbox.messages.is_empty() {
+                self.mailbox.selected = None;
                 self.message_view = None;
             }
 
@@ -343,18 +524,18 @@ impl App {
     }
 
     pub(crate) fn inbox_messages(&self) -> &[Message] {
-        &self.inbox.messages
+        &self.mailbox.messages
     }
 
     pub(crate) fn inbox_selected(&self) -> Option<usize> {
-        self.inbox.selected
+        self.mailbox.selected
     }
 
     pub(crate) fn inbox_action_bar(&self) -> String {
-        let mut text = String::from("^Q:Quit");
+        let mut text = String::from("^Q:Quit g:GoTo");
 
-        if let Some(idx) = self.inbox.selected {
-            if let Some(msg) = self.inbox.messages.get(idx) {
+        if let Some(idx) = self.mailbox.selected {
+            if let Some(msg) = self.mailbox.messages.get(idx) {
                 text.push_str(" Enter:Open");
                 if msg.starred {
                     text.push_str(" s:Unstar");
@@ -372,7 +553,7 @@ impl App {
             }
         }
 
-        if !self.inbox.scheduled.is_empty() {
+        if !self.scheduled_actions.is_empty() {
             text.push_str(" $:Commit");
         }
 
@@ -403,36 +584,37 @@ impl App {
     }
 
     pub(crate) fn inbox_info_bar(&self) -> String {
-        let total = self.inbox.messages.len();
+        let total = self.mailbox.messages.len();
         let selected = self
-            .inbox
+            .mailbox
             .selected
             .map(|idx| format!("{}", idx + 1))
             .unwrap_or_else(|| "-".to_string());
         format!(
-            "Message {selected}/{total}, {} scheduled actions, got {} events",
-            self.inbox.scheduled.len(),
-            self.inbox.event_count
+            "{} — message {selected}/{total}, {} scheduled actions, got {} events",
+            self.current_mailbox,
+            self.scheduled_actions.len(),
+            self.mailbox.event_count
         )
     }
 
     pub(crate) fn inbox_status_line(&self) -> Option<&str> {
-        self.inbox.status_line.as_deref()
+        self.mailbox.status_line.as_deref()
     }
 
     pub(crate) fn inbox_scroll_top(&self) -> usize {
-        self.inbox.scroll_top
+        self.mailbox.scroll_top
     }
 
     pub(crate) fn set_inbox_scroll_top(&mut self, value: usize) {
-        self.inbox.scroll_top = value;
+        self.mailbox.scroll_top = value;
     }
 
     pub(crate) fn message_view(&self) -> Option<&MessageViewState> {
         self.message_view.as_ref()
     }
 
-    fn handle_inbox_key(&mut self, key: KeyEvent) -> Result<()> {
+    fn handle_mailbox_key(&mut self, key: KeyEvent) -> Result<()> {
         if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
             return Ok(());
@@ -465,8 +647,11 @@ impl App {
             if let Some(id) = current_id {
                 if let Some(view) = self.message_view.as_mut() {
                     if view.message_id == id {
-                        if let Some(msg) =
-                            self.inbox.messages.iter().find(|message| message.id == id)
+                        if let Some(msg) = self
+                            .mailbox
+                            .messages
+                            .iter()
+                            .find(|message| message.id == id)
                         {
                             view.message.starred = msg.starred;
                         }
@@ -511,55 +696,54 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let len = self.inbox.messages.len();
+        let len = self.mailbox.messages.len();
         if len == 0 {
-            self.inbox.selected = None;
+            self.mailbox.selected = None;
             return;
         }
-        let current = self.inbox.selected.unwrap_or(len.saturating_sub(1)) as isize;
+        let current = self.mailbox.selected.unwrap_or(len.saturating_sub(1)) as isize;
         let max_index = len as isize - 1;
         let next = min(max(0, current + delta), max_index) as usize;
-        self.inbox.selected = Some(next);
+        self.mailbox.selected = Some(next);
     }
 
     fn select_first(&mut self) {
-        if self.inbox.messages.is_empty() {
-            self.inbox.selected = None;
+        if self.mailbox.messages.is_empty() {
+            self.mailbox.selected = None;
         } else {
-            self.inbox.selected = Some(0);
+            self.mailbox.selected = Some(0);
         }
     }
 
     fn select_last(&mut self) {
-        if self.inbox.messages.is_empty() {
-            self.inbox.selected = None;
+        if self.mailbox.messages.is_empty() {
+            self.mailbox.selected = None;
         } else {
-            self.inbox.selected = Some(self.inbox.messages.len() - 1);
+            self.mailbox.selected = Some(self.mailbox.messages.len() - 1);
         }
     }
 
     fn toggle_star(&mut self) {
-        if let Some(idx) = self.inbox.selected {
-            if let Some(msg) = self.inbox.messages.get_mut(idx) {
+        if let Some(idx) = self.mailbox.selected {
+            if let Some(msg) = self.mailbox.messages.get_mut(idx) {
                 msg.starred = !msg.starred;
                 let ty = if msg.starred {
                     ActionType::MarkAsStarred
                 } else {
                     ActionType::MarkAsUnstarred
                 };
-                self.inbox.scheduled.push(Action::new(ty, msg.id));
-                self.inbox.status_line = None;
+                self.scheduled_actions.push(Action::new(ty, msg.id));
+                self.mailbox.status_line = None;
                 self.sync_message_view_state();
             }
         }
     }
 
     fn schedule_archive(&mut self) {
-        if let Some(idx) = self.inbox.selected {
-            if let Some(msg) = self.inbox.messages.get_mut(idx) {
+        if let Some(idx) = self.mailbox.selected {
+            if let Some(msg) = self.mailbox.messages.get_mut(idx) {
                 msg.status = MessageStatus::Archived;
-                self.inbox
-                    .scheduled
+                self.scheduled_actions
                     .push(Action::new(ActionType::Archive, msg.id));
                 self.advance_selection_after_action(idx);
                 self.sync_message_view_state();
@@ -568,11 +752,10 @@ impl App {
     }
 
     fn schedule_delete(&mut self) {
-        if let Some(idx) = self.inbox.selected {
-            if let Some(msg) = self.inbox.messages.get_mut(idx) {
+        if let Some(idx) = self.mailbox.selected {
+            if let Some(msg) = self.mailbox.messages.get_mut(idx) {
                 msg.status = MessageStatus::Deleted;
-                self.inbox
-                    .scheduled
+                self.scheduled_actions
                     .push(Action::new(ActionType::Delete, msg.id));
                 self.advance_selection_after_action(idx);
                 self.sync_message_view_state();
@@ -581,8 +764,8 @@ impl App {
     }
 
     fn toggle_unread(&mut self) {
-        if let Some(idx) = self.inbox.selected {
-            if let Some(msg) = self.inbox.messages.get_mut(idx) {
+        if let Some(idx) = self.mailbox.selected {
+            if let Some(msg) = self.mailbox.messages.get_mut(idx) {
                 let action_type = match msg.status {
                     MessageStatus::New | MessageStatus::Read => {
                         msg.status = MessageStatus::New;
@@ -593,20 +776,24 @@ impl App {
                         ActionType::MoveToInboxRead
                     }
                 };
-                self.inbox.scheduled.push(Action::new(action_type, msg.id));
-                self.inbox.status_line = None;
+                self.scheduled_actions
+                    .push(Action::new(action_type, msg.id));
+                self.mailbox.status_line = None;
                 self.sync_message_view_state();
             }
         }
     }
 
     fn advance_selection_after_action(&mut self, current_idx: usize) {
-        if self.inbox.messages.is_empty() {
-            self.inbox.selected = None;
+        if self.mailbox.messages.is_empty() {
+            self.mailbox.selected = None;
             return;
         }
-        let next = min(current_idx + 1, self.inbox.messages.len().saturating_sub(1));
-        self.inbox.selected = Some(next);
+        let next = min(
+            current_idx + 1,
+            self.mailbox.messages.len().saturating_sub(1),
+        );
+        self.mailbox.selected = Some(next);
     }
 
     /// Hand the current batch of scheduled actions to the backend.
@@ -615,11 +802,11 @@ impl App {
     /// [`MailBackend::apply_actions`]; until those updates arrive the UI can
     /// continue scheduling new work.
     fn commit_actions(&mut self) -> Result<()> {
-        if self.inbox.scheduled.is_empty() {
+        if self.scheduled_actions.is_empty() {
             return Ok(());
         }
 
-        let actions = std::mem::take(&mut self.inbox.scheduled);
+        let actions = std::mem::take(&mut self.scheduled_actions);
         if actions.is_empty() {
             return Ok(());
         }
@@ -637,7 +824,7 @@ impl App {
         let receiver = match self.backend.apply_actions(actions.clone()) {
             Ok(receiver) => receiver,
             Err(err) => {
-                self.inbox.scheduled.extend(actions);
+                self.scheduled_actions.extend(actions);
 
                 if let Some(progress) = self.commit_progress.as_mut() {
                     progress.total = progress.total.saturating_sub(action_count);
@@ -658,13 +845,13 @@ impl App {
     }
 
     fn open_selected_message(&mut self) -> Result<()> {
-        let idx = match self.inbox.selected {
+        let idx = match self.mailbox.selected {
             Some(idx) => idx,
             None => return Ok(()),
         };
 
         let message = self
-            .inbox
+            .mailbox
             .messages
             .get(idx)
             .cloned()
@@ -701,7 +888,7 @@ impl App {
         let Some(current) = self.message_view.as_ref() else {
             return Ok(());
         };
-        let len = self.inbox.messages.len() as isize;
+        let len = self.mailbox.messages.len() as isize;
         if len == 0 {
             return Ok(());
         }
@@ -709,14 +896,14 @@ impl App {
         if next_index < 0 || next_index >= len {
             return Ok(());
         }
-        self.inbox.selected = Some(next_index as usize);
+        self.mailbox.selected = Some(next_index as usize);
         self.open_selected_message()
     }
 
     fn sync_message_view_state(&mut self) {
         if let Some(view) = self.message_view.as_mut() {
             if let Some((idx, message)) = self
-                .inbox
+                .mailbox
                 .messages
                 .iter()
                 .enumerate()
@@ -731,25 +918,25 @@ impl App {
     }
 
     fn update_selection_after_refresh(&mut self, current_id: Option<MessageId>) {
-        if self.inbox.messages.is_empty() {
-            self.inbox.selected = None;
+        if self.mailbox.messages.is_empty() {
+            self.mailbox.selected = None;
             self.message_view = None;
-            self.inbox.scroll_top = 0;
+            self.mailbox.scroll_top = 0;
             return;
         }
 
         if let Some(id) = current_id {
             if let Some((idx, _)) = self
-                .inbox
+                .mailbox
                 .messages
                 .iter()
                 .enumerate()
                 .find(|(_, msg)| msg.id == id)
             {
-                self.inbox.selected = Some(idx);
+                self.mailbox.selected = Some(idx);
             }
-        } else if self.inbox.selected.is_none() {
-            self.inbox.selected = Some(self.inbox.messages.len() - 1);
+        } else if self.mailbox.selected.is_none() {
+            self.mailbox.selected = Some(self.mailbox.messages.len() - 1);
         }
 
         self.sync_message_view_state();
@@ -794,13 +981,13 @@ fn format_subject(message: &Message) -> String {
 
 impl App {
     fn normalize_scroll(&mut self) {
-        let len = self.inbox.messages.len();
+        let len = self.mailbox.messages.len();
         if len == 0 {
-            self.inbox.scroll_top = 0;
+            self.mailbox.scroll_top = 0;
         } else {
             let max_top = len.saturating_sub(1);
-            if self.inbox.scroll_top > max_top {
-                self.inbox.scroll_top = max_top;
+            if self.mailbox.scroll_top > max_top {
+                self.mailbox.scroll_top = max_top;
             }
         }
     }

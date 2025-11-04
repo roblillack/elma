@@ -3,12 +3,45 @@ use time::{Month, OffsetDateTime};
 
 pub type MessageId = u64;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MessageStatus {
     Read,
     New,
     Deleted,
     Archived,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MailboxKind {
+    Inbox,
+    Starred,
+    Sent,
+    Drafts,
+    Archive,
+    Trash,
+}
+
+impl MailboxKind {
+    pub const ALL: [MailboxKind; 6] = [
+        MailboxKind::Inbox,
+        MailboxKind::Starred,
+        MailboxKind::Sent,
+        MailboxKind::Drafts,
+        MailboxKind::Archive,
+        MailboxKind::Trash,
+    ];
+
+    /// User-visible name for the mailbox.
+    pub fn title(self) -> &'static str {
+        match self {
+            MailboxKind::Inbox => "Inbox",
+            MailboxKind::Starred => "Starred",
+            MailboxKind::Sent => "Sent",
+            MailboxKind::Drafts => "Drafts",
+            MailboxKind::Archive => "Archive",
+            MailboxKind::Trash => "Trash",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +181,12 @@ impl fmt::Display for MessageStatus {
             MessageStatus::Archived => "Archived",
         };
         f.write_str(text)
+    }
+}
+
+impl fmt::Display for MailboxKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.title())
     }
 }
 

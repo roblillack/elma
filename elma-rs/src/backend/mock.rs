@@ -7,7 +7,8 @@
 use crate::{
     backend::{ActionStatus, BackendEvent, MailBackend},
     model::{
-        Action, ActionType, Message, MessageContent, MessageContentPart, MessageId, MessageStatus,
+        Action, ActionType, MailboxKind, Message, MessageContent, MessageContentPart, MessageId,
+        MessageStatus,
     },
 };
 use anyhow::{Result, anyhow};
@@ -32,9 +33,9 @@ const MAILER_NAME: &str = "MockMailer/tdoc-demo";
 /// Messages are generated deterministically at startup so the UI can exercise the
 /// same flows as the Gmail backend without network access.
 pub struct MockBackend {
-    messages: Arc<Mutex<Vec<MockMessage>>>,
+    mailboxes: Arc<Mutex<HashMap<MailboxKind, Vec<MockMessage>>>>,
     contents: Arc<Mutex<HashMap<MessageId, MessageContent>>>,
-    receiver: Mutex<Option<Receiver<BackendEvent>>>,
+    event_sender: Arc<Mutex<Option<Sender<BackendEvent>>>>,
     id_counter: Arc<AtomicU64>,
 }
 
@@ -56,41 +57,100 @@ impl MockBackend {
     /// periodically injects new mail, and returns immediately so the UI stays
     /// responsive.
     pub fn demo() -> Self {
-        let (sender, receiver) = mpsc::channel();
-        let messages = Arc::new(Mutex::new(Vec::new()));
+        let mailboxes = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut guard = mailboxes.lock().expect("mailboxes mutex poisoned");
+            for kind in MailboxKind::ALL {
+                guard.insert(kind, Vec::new());
+            }
+        }
         let contents = Arc::new(Mutex::new(HashMap::new()));
+        let event_sender = Arc::new(Mutex::new(None));
         let id_counter = Arc::new(AtomicU64::new(0));
 
         let backend = Self {
-            messages: Arc::clone(&messages),
+            mailboxes: Arc::clone(&mailboxes),
             contents: Arc::clone(&contents),
-            receiver: Mutex::new(Some(receiver)),
+            event_sender: Arc::clone(&event_sender),
             id_counter: Arc::clone(&id_counter),
         };
 
-        backend.populate_initial_messages(INITIAL_MESSAGE_COUNT);
-        backend.spawn_incoming_mail_generator(messages, contents, sender, id_counter);
+        backend.populate_initial_mailboxes(INITIAL_MESSAGE_COUNT);
+        backend.spawn_incoming_mail_generator(mailboxes, contents, event_sender, id_counter);
         backend
     }
 
-    fn populate_initial_messages(&self, count: usize) {
+    fn populate_initial_mailboxes(&self, inbox_count: usize) {
         let mut rng = SimpleRng::new(random_seed());
-        let mut messages = self.messages.lock().expect("messages mutex poisoned");
+        let mut mailboxes = self.mailboxes.lock().expect("mailboxes mutex poisoned");
         let mut contents = self.contents.lock().expect("contents mutex poisoned");
 
-        for _ in 0..count {
+        for _ in 0..inbox_count {
             let id = self.next_id();
             let (message, content) = old_random_message(id, &mut rng);
             contents.insert(id, content);
-            messages.push(MockMessage { message });
+            mailboxes
+                .entry(MailboxKind::Inbox)
+                .or_insert_with(Vec::new)
+                .push(MockMessage { message });
+        }
+
+        let templates = [
+            (MailboxKind::Starred, 40usize, MessageStatus::Read),
+            (MailboxKind::Sent, 25usize, MessageStatus::Read),
+            (MailboxKind::Drafts, 12usize, MessageStatus::New),
+            (MailboxKind::Archive, 35usize, MessageStatus::Archived),
+            (MailboxKind::Trash, 18usize, MessageStatus::Deleted),
+        ];
+
+        for (kind, count, status) in templates {
+            let list = mailboxes.entry(kind).or_insert_with(Vec::new);
+            for _ in 0..count {
+                let id = self.next_id();
+                let sent = OffsetDateTime::now_utc()
+                    - TimeDuration::hours(rng.gen_range_usize(0..720) as i64)
+                    - TimeDuration::minutes(rng.gen_range_usize(0..60) as i64);
+                let (mut message, mut content) = new_random_message(id, sent, &mut rng);
+                message.status = status;
+                match kind {
+                    MailboxKind::Starred => {
+                        message.starred = true;
+                        message.labels = vec!["Starred".to_string()];
+                    }
+                    MailboxKind::Sent => {
+                        message.labels = vec!["Sent".to_string()];
+                        message.starred = false;
+                    }
+                    MailboxKind::Drafts => {
+                        message.labels = vec!["Draft".to_string()];
+                        message.starred = false;
+                    }
+                    MailboxKind::Archive => {
+                        message.labels = vec!["Archive".to_string()];
+                        message.starred = rng.one_in(5);
+                    }
+                    MailboxKind::Trash => {
+                        message.labels = vec!["Trash".to_string()];
+                        message.starred = false;
+                    }
+                    MailboxKind::Inbox => {}
+                }
+                update_mailer(&mut content, message.status);
+                contents.insert(id, content);
+                list.push(MockMessage { message });
+            }
+        }
+
+        for list in mailboxes.values_mut() {
+            list.sort_by_key(|mock| mock.message.sent);
         }
     }
 
     fn spawn_incoming_mail_generator(
         &self,
-        messages: Arc<Mutex<Vec<MockMessage>>>,
+        mailboxes: Arc<Mutex<HashMap<MailboxKind, Vec<MockMessage>>>>,
         contents: Arc<Mutex<HashMap<MessageId, MessageContent>>>,
-        sender: Sender<BackendEvent>,
+        event_sender: Arc<Mutex<Option<Sender<BackendEvent>>>>,
         id_counter: Arc<AtomicU64>,
     ) {
         thread::spawn(move || {
@@ -104,16 +164,29 @@ impl MockBackend {
                 let (message, content) = new_random_message(id, sent, &mut rng);
 
                 {
-                    let mut message_lock = messages.lock().expect("messages mutex poisoned");
+                    let mut message_lock = mailboxes.lock().expect("mailboxes mutex poisoned");
                     let mut content_lock = contents.lock().expect("contents mutex poisoned");
 
                     content_lock.insert(id, content);
-                    message_lock.push(MockMessage {
-                        message: message.clone(),
-                    });
+                    message_lock
+                        .entry(MailboxKind::Inbox)
+                        .or_insert_with(Vec::new)
+                        .push(MockMessage {
+                            message: message.clone(),
+                        });
                 }
 
-                let _ = sender.send(BackendEvent::NewMessage(message));
+                let sender = {
+                    let guard = event_sender.lock().expect("event sender mutex poisoned");
+                    guard.clone()
+                };
+
+                if let Some(sender) = sender {
+                    if sender.send(BackendEvent::NewMessage(message)).is_err() {
+                        let mut guard = event_sender.lock().expect("event sender mutex poisoned");
+                        *guard = None;
+                    }
+                }
             }
         });
     }
@@ -129,54 +202,81 @@ impl MockBackend {
     /// collections and mirrors the behaviour of the real Gmail backend closely
     /// enough for UI testing.
     fn apply_action_now(
-        messages: &Arc<Mutex<Vec<MockMessage>>>,
+        mailboxes: &Arc<Mutex<HashMap<MailboxKind, Vec<MockMessage>>>>,
         contents: &Arc<Mutex<HashMap<MessageId, MessageContent>>>,
         action: &Action,
     ) -> Result<()> {
-        let mut messages = messages.lock().expect("messages mutex poisoned");
+        let mut mailboxes = mailboxes.lock().expect("mailboxes mutex poisoned");
         let mut contents = contents.lock().expect("contents mutex poisoned");
 
-        if let Some(msg) = messages
-            .iter_mut()
-            .find(|mock| mock.message.id == action.message_id)
-        {
-            match action.action_type {
-                ActionType::Archive => msg.message.status = MessageStatus::Archived,
-                ActionType::Delete => msg.message.status = MessageStatus::Deleted,
-                ActionType::MoveToInboxUnread => msg.message.status = MessageStatus::New,
-                ActionType::MoveToInboxRead => msg.message.status = MessageStatus::Read,
-                ActionType::MarkAsStarred => msg.message.starred = true,
-                ActionType::MarkAsUnstarred => msg.message.starred = false,
+        let mut target = None;
+        for list in mailboxes.values_mut() {
+            if let Some(msg) = list
+                .iter_mut()
+                .find(|mock| mock.message.id == action.message_id)
+            {
+                target = Some(msg);
+                break;
             }
-
-            if let Some(content) = contents.get_mut(&action.message_id) {
-                if msg.message.status == MessageStatus::New {
-                    content.mailer = format!("{MAILER_NAME} (unread)");
-                } else {
-                    content.mailer = MAILER_NAME.to_string();
-                }
-            }
-
-            Ok(())
-        } else {
-            Err(anyhow!("message {} not found", action.message_id))
         }
+
+        let Some(msg) = target else {
+            return Err(anyhow!("message {} not found", action.message_id));
+        };
+
+        match action.action_type {
+            ActionType::Archive => msg.message.status = MessageStatus::Archived,
+            ActionType::Delete => msg.message.status = MessageStatus::Deleted,
+            ActionType::MoveToInboxUnread => msg.message.status = MessageStatus::New,
+            ActionType::MoveToInboxRead => msg.message.status = MessageStatus::Read,
+            ActionType::MarkAsStarred => msg.message.starred = true,
+            ActionType::MarkAsUnstarred => msg.message.starred = false,
+        }
+
+        if let Some(content) = contents.get_mut(&action.message_id) {
+            if msg.message.status == MessageStatus::New {
+                content.mailer = format!("{MAILER_NAME} (unread)");
+            } else {
+                content.mailer = MAILER_NAME.to_string();
+            }
+        }
+
+        Ok(())
     }
 }
 
 impl MailBackend for MockBackend {
-    /// Return the current inbox snapshot and subscribe to future events.
-    fn load_inbox(&self) -> Result<(Vec<Message>, Receiver<BackendEvent>)> {
-        let mut receiver_guard = self.receiver.lock().expect("receiver mutex poisoned");
-        let receiver = receiver_guard
-            .take()
-            .ok_or_else(|| anyhow!("Inbox already loaded"))?;
+    /// Return the current mailbox snapshot and subscribe to future events.
+    fn load_mailbox(&self, mailbox: MailboxKind) -> Result<(Vec<Message>, Receiver<BackendEvent>)> {
+        let mut messages = {
+            let mailboxes = self.mailboxes.lock().expect("mailboxes mutex poisoned");
+            let list = mailboxes
+                .get(&mailbox)
+                .ok_or_else(|| anyhow!("mailbox {mailbox:?} not found"))?
+                .iter()
+                .map(|mock| mock.message.clone())
+                .collect::<Vec<_>>();
+            list
+        };
 
-        let mut messages = self.messages.lock().expect("messages mutex poisoned");
-        messages.sort_by_key(|msg| msg.message.sent);
-        let list = messages.iter().map(|msg| msg.message.clone()).collect();
+        messages.sort_by_key(|msg| msg.sent);
 
-        Ok((list, receiver))
+        let receiver = if mailbox == MailboxKind::Inbox {
+            let (sender, receiver) = mpsc::channel();
+            {
+                let mut guard = self
+                    .event_sender
+                    .lock()
+                    .expect("event sender mutex poisoned");
+                *guard = Some(sender);
+            }
+            receiver
+        } else {
+            let (_sender, receiver) = mpsc::channel();
+            receiver
+        };
+
+        Ok((messages, receiver))
     }
 
     /// Fetch the MIME content for an individual message.
@@ -194,7 +294,7 @@ impl MailBackend for MockBackend {
     /// giving the UI a realistic opportunity to render progress.
     fn apply_actions(&self, actions: Vec<Action>) -> Result<Receiver<ActionStatus>> {
         let (tx, rx) = mpsc::channel();
-        let messages = Arc::clone(&self.messages);
+        let mailboxes = Arc::clone(&self.mailboxes);
         let contents = Arc::clone(&self.contents);
 
         thread::spawn(move || {
@@ -203,7 +303,7 @@ impl MailBackend for MockBackend {
                 let delay_ms = delay_rng.gen_range_usize_inclusive(50, 500) as u64;
                 thread::sleep(Duration::from_millis(delay_ms));
 
-                let result = MockBackend::apply_action_now(&messages, &contents, &action)
+                let result = MockBackend::apply_action_now(&mailboxes, &contents, &action)
                     .map_err(|err| err.to_string());
                 if tx.send(ActionStatus { action, result }).is_err() {
                     break;

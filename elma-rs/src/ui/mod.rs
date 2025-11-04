@@ -4,7 +4,7 @@
 //! widgets.  All layout decisions are centralised here so the controller logic in
 //! [`crate::app`] remains agnostic of the terminal representation.
 
-use crate::app::{ActiveView, App, MessageViewState};
+use crate::app::{ActiveView, App, MessageViewState, ShortcutMenu};
 use crate::model::MessageStatus;
 use crate::viewer;
 use ratatui::{
@@ -12,7 +12,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 use time::OffsetDateTime;
 
@@ -23,8 +23,12 @@ const ARCHIVED_FG: Color = Color::Rgb(0, 139, 139);
 /// Render the entire UI based on the currently active view.
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     match app.active_view() {
-        ActiveView::Inbox => render_inbox(frame, app),
+        ActiveView::Mailbox => render_inbox(frame, app),
         ActiveView::Message => render_message(frame, app),
+    }
+
+    if let Some(menu) = app.shortcut_menu() {
+        render_shortcut_menu(frame, menu);
     }
 }
 
@@ -201,6 +205,66 @@ fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
 
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn render_shortcut_menu(frame: &mut Frame<'_>, menu: &ShortcutMenu) {
+    let mut lines = Vec::new();
+    let header_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    lines.push(Line::from(vec![Span::styled(menu.title(), header_style)]));
+    lines.push(Line::raw(""));
+
+    let key_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+
+    for entry in menu.entries() {
+        let line = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(entry.key.to_string(), key_style),
+            Span::raw(format!("  {}", entry.description)),
+        ]);
+        lines.push(line);
+    }
+
+    let content_width = lines
+        .iter()
+        .map(|line| line.width() as u16)
+        .max()
+        .unwrap_or(0);
+    let inner_width = content_width.max(menu.title().len() as u16);
+    let inner_height = lines.len() as u16;
+
+    if inner_width == 0 || inner_height == 0 {
+        return;
+    }
+
+    let width = inner_width + 2;
+    let height = inner_height + 2;
+
+    let frame_area = frame.size();
+    if frame_area.width < width || frame_area.height < height {
+        return;
+    }
+
+    let x = frame_area.x + frame_area.width - width;
+    let y = frame_area.y + frame_area.height - height;
+    let area = Rect::new(x, y, width, height);
+
+    let popup_style = Style::default().bg(Color::Black).fg(Color::White);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(popup_style)
+        .border_style(Style::default().fg(Color::Gray));
+
+    frame.render_widget(Clear, area);
+    let paragraph = Paragraph::new(lines)
+        .style(popup_style)
+        .block(block)
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(paragraph, area);
 }
 
 /// Render the message body pane, including metadata and FTML/HTML content.

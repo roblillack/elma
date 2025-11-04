@@ -1,12 +1,12 @@
 //! Backend integration layer.
 //!
 //! The backend module defines the abstraction that the TUI uses to communicate with
-//! different mail providers.  Backends expose a push-based event stream for inbox
+//! different mail providers.  Backends expose a push-based event stream for mailbox
 //! updates and a pull-based channel for action completion status.  The contract is
 //! intentionally asynchronous so the UI thread never blocks on network or disk I/O.
 //! See [`MailBackend`] for details about the required behaviour.
 
-use crate::model::{Action, Message, MessageContent, MessageId};
+use crate::model::{Action, MailboxKind, Message, MessageContent, MessageId};
 use anyhow::Result;
 use std::sync::mpsc::Receiver;
 
@@ -15,7 +15,7 @@ pub mod mock;
 
 /// Notifications that backends emit when something about the mailbox changes.
 ///
-/// The UI subscribes to the channel returned by [`MailBackend::load_inbox`] and keeps
+/// The UI subscribes to the channel returned by [`MailBackend::load_mailbox`] and keeps
 /// its local state in sync with the events that arrive.
 #[derive(Clone, Debug)]
 pub enum BackendEvent {
@@ -75,8 +75,13 @@ pub struct ActionStatus {
 /// # Ok::<_, anyhow::Error>(())
 /// ```
 pub trait MailBackend: Send + Sync {
-    /// Load the initial inbox and return a channel that streams [`BackendEvent`] updates.
-    fn load_inbox(&self) -> Result<(Vec<Message>, Receiver<BackendEvent>)>;
+    /// Load `mailbox` and return a channel that streams [`BackendEvent`] updates.
+    fn load_mailbox(&self, mailbox: MailboxKind) -> Result<(Vec<Message>, Receiver<BackendEvent>)>;
+
+    /// Load the default inbox and return a channel that streams [`BackendEvent`] updates.
+    fn load_inbox(&self) -> Result<(Vec<Message>, Receiver<BackendEvent>)> {
+        self.load_mailbox(MailboxKind::Inbox)
+    }
     /// Load the full content for a single message.
     fn load_message(&self, message_id: MessageId) -> Result<MessageContent>;
     /// Begin processing a batch of actions and return a channel with completion updates.
