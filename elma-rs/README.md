@@ -81,13 +81,13 @@ Message status is indicated by a four symbol character prefix in the message lis
 2. Starred/unstarred and important status:
    - ` `: Regular message
    - `*`: Starred
-   - `+`: Marked as important
-   - `#`: Marked as important and starred
+   - `○`: Marked as important (ASCII mode: `+`)
+   - `⊛`: Marked as important and starred (ASCII mode: `#`)
 3. Reply/forward state:
    - ` `: No reply/forward
-   - `↩`: This message has been replied to
-   - `→`: This message has been forwarded
-   - `⇄`: This message has been both replied to and forwarded
+   - `↩`: This message has been replied to (ASCII mode: `r`)
+   - `→`: This message has been forwarded (ASCII mode: `f`)
+   - `⇄`: This message has been both replied to and forwarded (ASCII mode: `x`)
 4. Attachment indicator: (TODO)
    - ` `: No attachment
    - `@`: Message has one or more attachments
@@ -133,14 +133,14 @@ Message status is indicated by a four symbol character prefix in the message lis
 - [x] In "Drafts" mailbox, show recipients in the message list
 - [x] Allow continued editing of drafts (Enter to open draft in compose view again)
 - [ ] Add auto-complete for email addresses when composing messages based on the user's contacts or previously sent emails and last 1000 messages
-- [ ] Add showing labels in the message view
+- [x] Add showing labels in the message view
 - [ ] Show FTML-based preview in compose dialog -- for editing open the draft as Markdown in the user's $EDITOR
 - [ ] Add support for attachments when composing messages
 - [ ] Switch from hardcoded folder named in Gmail backend to standard "Special Use" folders via IMAP (See [RFC 6154](https://datatracker.ietf.org/doc/html/rfc6154)) as per [Google Developer Docs](https://developers.google.com/workspace/gmail/imap/imap-extensions#special-use_extension_of_the_list_command)
 - [ ] Add command (`o`?) to open the current message in the web interface
 - [ ] Add support to copy the current message's content to the clipboard as Markdown (context menu?)
 - [ ] Add theming support (light/dark mode, custom colours)
-- [ ] Log network actions and user events for debugging and compatibility with existing ELMA tools
+- [x] Log network actions and user events for debugging
 - [ ] Formatted date does not match web interface -- are we missing locale info somewhere?
 - [ ] Load mailbox while already showing it
 - [ ] Only start connecting to backends when the user first tries to access them
