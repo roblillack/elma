@@ -98,13 +98,15 @@ Message status is indicated by a three symbol character prefix in the message li
 - [ ] Implement `f` to forward message
 - [ ] `=`/`+` and `-` to mark as important/unimportant
 - [ ] Implement search (`/` and `n`/`N`)
-- [ ] Implement composing new message (`c`)
+- [x] Implement composing new message (`c`)
 - [ ] Implement help overlay (`?`)
-- [ ] Implement `j` and `k` to move to next/previous message in mailbox view
+- [x] Implement `j` and `k` to move to next/previous message in mailbox view
 - [ ] Implement `.` to open context menu for selected message
 - [x] Add support for multiple accounts/backends (`G` to Go to different account?)
-- [ ] In "Drafts" mailbox, show recipients in the message list
+- [x] In "Drafts" mailbox, show recipients in the message list
 - [x] Allow continued editing of drafts (Enter to open draft in compose view again)
+- [ ] Add auto-complete for email addresses when composing messages based on the user's contacts or previously sent emails and last 1000 messages
+- [ ] Add showing labels in the message view
 
 ## Project layout
 

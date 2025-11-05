@@ -2285,7 +2285,10 @@ impl App {
         message: &Message,
         now: OffsetDateTime,
     ) -> MessageRow {
-        let display_name = if self.current_mailbox == MailboxKind::Sent {
+        let display_name = if matches!(
+            self.current_mailbox,
+            MailboxKind::Sent | MailboxKind::Drafts
+        ) {
             message.recipients_display()
         } else {
             message.sender.clone()
