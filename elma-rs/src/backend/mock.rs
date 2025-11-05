@@ -392,6 +392,7 @@ impl MockBackend {
             status,
             labels: Vec::new(),
             uid: id as u32,
+            seq: 0,
         };
 
         if !label.is_empty() {
@@ -532,6 +533,7 @@ fn new_random_message(
         status: MessageStatus::New,
         labels: Vec::new(),
         uid: id as u32,
+        seq: 0,
     };
 
     update_mailer(&mut content, message.status);

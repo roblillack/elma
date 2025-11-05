@@ -116,6 +116,7 @@ Message status is indicated by a three symbol character prefix in the message li
 - [ ] Add support to copy the current message's content to the clipboard as Markdown (context menu?)
 - [ ] Add theming support (light/dark mode, custom colours)
 - [ ] Log network actions and user events for debugging and compatibility with existing ELMA tools
+- [ ] Formatted date does not match web interface -- are we missing locale info somewhere?
 
 ## Project layout
 

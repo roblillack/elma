@@ -63,6 +63,7 @@ pub struct Message {
     pub status: MessageStatus,
     pub labels: Vec<String>,
     pub uid: u32,
+    pub seq: u32,
 }
 
 impl Message {

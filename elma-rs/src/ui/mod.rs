@@ -456,6 +456,7 @@ fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     let now = OffsetDateTime::now_utc();
     let widths = [
+        Constraint::Length(6),
         Constraint::Length(3),
         Constraint::Length(14),
         Constraint::Length(21),
@@ -472,6 +473,7 @@ fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .map(|row| {
             let style = style_for_row(&row);
             Row::new(vec![
+                Cell::from(row.sequence),
                 Cell::from(row.flags),
                 Cell::from(row.date),
                 Cell::from(row.sender),

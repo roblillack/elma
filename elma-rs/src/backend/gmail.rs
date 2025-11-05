@@ -263,6 +263,12 @@ mod debug_logging {
     pub fn wrap_stream(stream: TlsStream<TcpStream>) -> Result<LoggedTlsStream> {
         LoggedTlsStream::new(stream)
     }
+
+    pub fn log_backend_event(label: &str, payload: &str) {
+        if let Ok(logger) = GmailImapLogger::global() {
+            logger.log_event(0, label, payload);
+        }
+    }
 }
 
 #[cfg(not(debug_assertions))]
@@ -275,9 +281,11 @@ mod debug_logging {
     pub fn wrap_stream(stream: TlsStream<TcpStream>) -> anyhow::Result<LoggedTlsStream> {
         Ok(stream)
     }
+
+    pub fn log_backend_event(_label: &str, _payload: &str) {}
 }
 
-use debug_logging::{LoggedTlsStream, wrap_stream};
+use debug_logging::{log_backend_event, LoggedTlsStream, wrap_stream};
 
 type AsyncSession = Session<LoggedTlsStream>;
 
@@ -928,19 +936,59 @@ impl GmailInner {
                         self.reinsert_session(sess).await;
                     }
                 }
-                Ok(IdleResponse::NewData(resp)) => match idle_handle.done().await {
-                    Ok(mut sess) => {
-                        if let Err(err) =
-                            self.handle_parsed_response(&mut sess, resp.parsed()).await
-                        {
-                            eprintln!("Gmail idle processing error: {err:?}");
+                Ok(IdleResponse::NewData(resp)) => {
+                    drop(stopper);
+
+                    let mut exists = Vec::new();
+                    if let Err(err) =
+                        self.process_idle_response(resp.parsed(), &mut exists).await
+                    {
+                        eprintln!("Gmail idle processing error: {err:?}");
+                    }
+
+                    loop {
+                        let (next_wait, next_stopper) =
+                            idle_handle.wait_with_timeout(Duration::from_millis(0));
+                        match next_wait.await {
+                            Ok(IdleResponse::NewData(resp)) => {
+                                if let Err(err) = self
+                                    .process_idle_response(resp.parsed(), &mut exists)
+                                    .await
+                                {
+                                    eprintln!("Gmail idle processing error: {err:?}");
+                                }
+                                drop(next_stopper);
+                            }
+                            Ok(IdleResponse::Timeout) | Ok(IdleResponse::ManualInterrupt) => {
+                                drop(next_stopper);
+                                break;
+                            }
+                            Err(err) => {
+                                drop(next_stopper);
+                                eprintln!("Gmail idle additional wait error: {err:?}");
+                                break;
+                            }
                         }
-                        self.reinsert_session(sess).await;
                     }
-                    Err(err) => {
-                        eprintln!("Gmail idle completion error: {err:?}");
+
+                    if exists.is_empty() {
+                        continue;
                     }
-                },
+
+                    match idle_handle.done().await {
+                        Ok(mut sess) => {
+                            for count in exists {
+                                if let Err(err) = self.handle_exists(&mut sess, count).await {
+                                    eprintln!("Gmail idle EXISTS handling error: {err:?}");
+                                }
+                            }
+                            self.reinsert_session(sess).await;
+                        }
+                        Err(err) => {
+                            eprintln!("Gmail idle completion error: {err:?}");
+                        }
+                    }
+                }
                 Err(err) => {
                     eprintln!("Gmail idle wait error: {err:?}");
                     if let Ok(sess) = idle_handle.done().await {
@@ -952,23 +1000,28 @@ impl GmailInner {
         }
     }
 
-    async fn handle_parsed_response(
+    async fn process_idle_response(
         &self,
-        session: &mut AsyncSession,
         response: &Response<'_>,
+        pending_exists: &mut Vec<u32>,
     ) -> Result<()> {
         match response {
             Response::Expunge(seq) => {
+                log_backend_event("BACKEND", &format!("processing EXPUNGE for seq {seq}"));
                 self.handle_expunge(*seq).await;
             }
             Response::MailboxData(MailboxDatum::Exists(count)) => {
-                self.handle_exists(session, *count).await?;
+                log_backend_event("BACKEND", &format!("queueing EXISTS with count {count}"));
+                pending_exists.push(*count);
             }
             Response::Fetch(seq, attrs) => {
+                log_backend_event("BACKEND", &format!("processing FETCH update for seq {seq}"));
                 self.handle_fetch_update(*seq, attrs).await?;
+                self.enqueue_label_refresh(*seq).await;
             }
             _ => {}
         }
+
         Ok(())
     }
 
@@ -1094,6 +1147,10 @@ impl GmailInner {
         };
 
         if let Some(msg) = removed {
+            log_backend_event(
+                "BACKEND",
+                &format!("emitting MessageDeleted for id {} (seq {seq})", msg.id),
+            );
             self.emit_event(BackendEvent::MessageDeleted(msg.id));
         }
     }
@@ -1231,16 +1288,19 @@ impl SharedState {
         self.messages.len()
     }
 
-    fn insert(&mut self, stored: StoredMessage) {
+    fn insert(&mut self, mut stored: StoredMessage) {
+        stored.message.seq = stored.seq;
         self.seq_to_id.insert(stored.seq, stored.message.id);
         self.uid_to_id.insert(stored.uid, stored.message.id);
         self.messages.insert(stored.message.id, stored);
     }
 
     fn remove_by_seq(&mut self, seq: u32) -> Option<Message> {
-        let id = self.seq_to_id.remove(&seq)?;
-        let stored = self.messages.remove(&id)?;
-        self.uid_to_id.remove(&stored.uid);
+        let removed = self.seq_to_id.remove(&seq).and_then(|id| {
+            let stored = self.messages.remove(&id)?;
+            self.uid_to_id.remove(&stored.uid);
+            Some(stored.message)
+        });
 
         let updates: Vec<(u32, MessageId)> = self
             .seq_to_id
@@ -1251,12 +1311,14 @@ impl SharedState {
         for (old_seq, msg_id) in updates {
             if let Some(entry) = self.messages.get_mut(&msg_id) {
                 self.seq_to_id.remove(&old_seq);
-                self.seq_to_id.insert(old_seq - 1, msg_id);
-                entry.seq -= 1;
+                let new_seq = old_seq.saturating_sub(1);
+                self.seq_to_id.insert(new_seq, msg_id);
+                entry.seq = new_seq;
+                entry.message.seq = new_seq;
             }
         }
 
-        Some(stored.message)
+        removed
     }
 
     fn apply_flag_values(
@@ -1343,6 +1405,7 @@ fn build_message_from_fetch(fetch: &Fetch) -> Result<Option<StoredMessage>> {
         status,
         labels: Vec::new(),
         uid,
+        seq,
     };
 
     Ok(Some(StoredMessage { message, seq, uid }))
@@ -1540,4 +1603,59 @@ where
     };
 
     (status, starred, answered, forwarded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_message(id: u64, seq: u32) -> StoredMessage {
+        let message = Message {
+            id,
+            sent: OffsetDateTime::UNIX_EPOCH,
+            sender: format!("sender{id}"),
+            recipients: Vec::new(),
+            subject: format!("subject{id}"),
+            size: 0,
+            starred: false,
+            answered: false,
+            forwarded: false,
+            status: MessageStatus::New,
+            labels: Vec::new(),
+            uid: id as u32,
+            seq,
+        };
+
+        StoredMessage {
+            message,
+            seq,
+            uid: id as u32,
+        }
+    }
+
+    #[test]
+    fn remove_by_seq_handles_repeated_sequence_numbers() {
+        let mut state = SharedState::default();
+        for seq in 1..=5 {
+            let stored = make_message(seq as u64, seq);
+            state.insert(stored);
+        }
+
+        assert_eq!(state.len(), 5);
+
+        let first = state.remove_by_seq(3).expect("first removal");
+        assert_eq!(first.id, 3);
+        assert_eq!(first.seq, 3);
+        let second = state.remove_by_seq(3).expect("second removal");
+        assert_eq!(second.id, 4);
+        assert_eq!(second.seq, 3);
+        let third = state.remove_by_seq(3).expect("third removal");
+        assert_eq!(third.id, 5);
+        assert_eq!(third.seq, 3);
+        assert!(state.remove_by_seq(3).is_none());
+
+        assert_eq!(state.len(), 2);
+        assert!(state.seq_to_id.contains_key(&1));
+        assert!(state.seq_to_id.contains_key(&2));
+    }
 }

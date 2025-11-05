@@ -1134,9 +1134,19 @@ impl App {
             }
         };
 
+        let removed_id;
+        let removed_seq;
         {
             let mailbox = self.mailbox_mut();
-            mailbox.messages.remove(position);
+            let removed = mailbox.messages.remove(position);
+            removed_id = removed.id;
+            removed_seq = removed.seq;
+
+            for msg in &mut mailbox.messages {
+                if msg.seq > removed_seq {
+                    msg.seq -= 1;
+                }
+            }
 
             if let Some(selected) = mailbox.selected {
                 if mailbox.messages.is_empty() {
@@ -1153,7 +1163,7 @@ impl App {
             .current_account()
             .message_view
             .as_ref()
-            .map(|view| view.message_id == id)
+            .map(|view| view.message_id == removed_id)
             .unwrap_or(false);
         if should_close {
             self.set_message_view(None);
@@ -2295,6 +2305,7 @@ impl App {
         };
 
         MessageRow {
+            sequence: format!("{:>5}", message.seq),
             flags: message.flag_string(),
             date: message.formatted_received(now),
             sender: padded_sender(&display_name),
@@ -2307,6 +2318,7 @@ impl App {
 }
 
 pub(crate) struct MessageRow {
+    pub(crate) sequence: String,
     pub(crate) flags: String,
     pub(crate) date: String,
     pub(crate) sender: String,
