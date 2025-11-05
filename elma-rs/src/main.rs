@@ -15,7 +15,7 @@ use crossterm::{
 use ratatui::{Terminal, prelude::CrosstermBackend};
 use serde::Deserialize;
 use std::io::{self, Stdout};
-use std::{fs, path::PathBuf, time::Duration};
+use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
 const TICK_RATE: Duration = Duration::from_millis(100);
 
@@ -100,7 +100,7 @@ fn load_accounts(demo_mode: bool) -> Result<Vec<AccountDescriptor>> {
     if demo_mode {
         return Ok(vec![AccountDescriptor::new(
             "Demo",
-            Box::new(MockBackend::demo()),
+            Arc::new(MockBackend::demo()),
         )]);
     }
 
@@ -112,7 +112,7 @@ fn load_accounts(demo_mode: bool) -> Result<Vec<AccountDescriptor>> {
             );
             Ok(vec![AccountDescriptor::new(
                 "Demo",
-                Box::new(MockBackend::demo()),
+                Arc::new(MockBackend::demo()),
             )])
         }
         None => {
@@ -121,7 +121,7 @@ fn load_accounts(demo_mode: bool) -> Result<Vec<AccountDescriptor>> {
             );
             Ok(vec![AccountDescriptor::new(
                 "Demo",
-                Box::new(MockBackend::demo()),
+                Arc::new(MockBackend::demo()),
             )])
         }
     }
@@ -166,11 +166,11 @@ fn build_account_from_config(config: AccountConfig, index: usize) -> Result<Acco
             let backend = GmailBackend::new(&username, password)
                 .with_context(|| format!("failed to initialize Gmail backend for {username}"))?;
             let name = config.name.unwrap_or(username);
-            Ok(AccountDescriptor::new(name, Box::new(backend)))
+            Ok(AccountDescriptor::new(name, Arc::new(backend)))
         }
         "demo" => {
             let name = config.name.unwrap_or("Demo".to_string());
-            let backend: Box<dyn MailBackend> = Box::new(MockBackend::demo());
+            let backend: Arc<dyn MailBackend> = Arc::new(MockBackend::demo());
             Ok(AccountDescriptor::new(name, backend))
         }
         other => Err(anyhow!("accounts[{index}]: unsupported backend '{other}'")),

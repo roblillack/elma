@@ -17,7 +17,11 @@ use std::{
     collections::VecDeque,
     io::Cursor,
     ops::{Deref, DerefMut},
-    sync::mpsc::{Receiver, TryRecvError},
+    sync::{
+        Arc,
+        mpsc::{Receiver, TryRecvError},
+    },
+    thread,
 };
 use tdoc::{Document, html};
 use time::OffsetDateTime;
@@ -32,11 +36,11 @@ const ACCOUNT_SHORTCUT_KEYS: [char; 36] = [
 /// Data required to bootstrap an account within the application.
 pub struct AccountDescriptor {
     pub name: String,
-    pub backend: Box<dyn MailBackend>,
+    pub backend: Arc<dyn MailBackend>,
 }
 
 impl AccountDescriptor {
-    pub fn new<S: Into<String>>(name: S, backend: Box<dyn MailBackend>) -> Self {
+    pub fn new<S: Into<String>>(name: S, backend: Arc<dyn MailBackend>) -> Self {
         Self {
             name: name.into(),
             backend,
@@ -78,14 +82,34 @@ struct CommitProgress {
     completed: usize,
 }
 
+const MAILBOX_LOAD_CHUNK: usize = 64;
+
+enum MailboxLoadUpdate {
+    Started {
+        total: usize,
+    },
+    Batch(Vec<Message>),
+    Finished {
+        events: Receiver<BackendEvent>,
+        status: Option<String>,
+    },
+    Failed(String),
+}
+
+struct MailboxLoaderState {
+    receiver: Receiver<MailboxLoadUpdate>,
+}
+
 /// Per-account state tracked by the UI.
 pub struct AccountState {
     name: String,
-    backend: Box<dyn MailBackend>,
+    backend: Arc<dyn MailBackend>,
     mailbox: MailboxState,
     message_view: Option<MessageViewState>,
     commit_batches: VecDeque<CommitBatchState>,
     commit_progress: Option<CommitProgress>,
+    mailbox_loader: Option<MailboxLoaderState>,
+    mailbox_load_progress: Option<CommitProgress>,
     scheduled_actions: Vec<Action>,
     current_mailbox: MailboxKind,
 }
@@ -797,6 +821,8 @@ impl App {
                 message_view: None,
                 commit_batches: VecDeque::new(),
                 commit_progress: None,
+                mailbox_loader: None,
+                mailbox_load_progress: None,
                 scheduled_actions: Vec::new(),
                 current_mailbox: MailboxKind::Inbox,
             });
@@ -1049,30 +1075,56 @@ impl App {
         }
     }
 
-    fn load_mailbox_state(&mut self, target: MailboxKind, status: Option<String>) -> Result<()> {
-        let (mut messages, events) = self
-            .backend
-            .load_mailbox(target)
-            .with_context(|| format!("failed to load {target} mailbox"))?;
-        messages.sort_by_key(|msg| msg.sent);
-        let selected = if messages.is_empty() {
-            None
-        } else {
-            Some(messages.len().saturating_sub(1))
-        };
+    fn begin_mailbox_load(&mut self, target: MailboxKind, status: Option<String>) -> Result<()> {
+        let backend = Arc::clone(&self.current_account().backend);
+        let status_for_finish = status.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
 
-        self.mailbox = MailboxState {
-            messages,
-            selected,
-            events,
-            event_count: 0,
-            status_line: status,
-            scroll_top: 0,
-        };
+        thread::spawn(move || match backend.load_mailbox(target) {
+            Ok((mut messages, events)) => {
+                messages.sort_by_key(|msg| msg.sent);
+                let total = messages.len();
+                if sender.send(MailboxLoadUpdate::Started { total }).is_err() {
+                    return;
+                }
+                if total > 0 {
+                    for chunk in messages.chunks(MAILBOX_LOAD_CHUNK) {
+                        if sender
+                            .send(MailboxLoadUpdate::Batch(chunk.to_vec()))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                let _ = sender.send(MailboxLoadUpdate::Finished {
+                    events,
+                    status: status_for_finish,
+                });
+            }
+            Err(err) => {
+                let _ = sender.send(MailboxLoadUpdate::Failed(err.to_string()));
+            }
+        });
 
-        self.current_mailbox = target;
-        self.message_view = None;
-        self.normalize_scroll();
+        {
+            let account = self.current_account_mut();
+            account.mailbox_loader = Some(MailboxLoaderState { receiver });
+            account.mailbox_load_progress = Some(CommitProgress {
+                total: PROGRESS_SEGMENTS,
+                completed: 0,
+            });
+            account.message_view = None;
+            account.current_mailbox = target;
+            account.mailbox.messages.clear();
+            account.mailbox.selected = None;
+            account.mailbox.scroll_top = 0;
+            account.mailbox.event_count = 0;
+            let (_tx, placeholder_rx) = std::sync::mpsc::channel();
+            account.mailbox.events = placeholder_rx;
+            account.mailbox.status_line = Some(format!("Loading {target}..."));
+        }
+
         Ok(())
     }
 
@@ -1082,12 +1134,12 @@ impl App {
             return Ok(());
         }
 
-        self.load_mailbox_state(target, Some(format!("Opened {target}.")))
+        self.begin_mailbox_load(target, Some(format!("Opened {target}.")))
     }
 
     fn reload_current_mailbox(&mut self) -> Result<()> {
         let target = self.current_mailbox;
-        self.load_mailbox_state(target, None)
+        self.begin_mailbox_load(target, None)
     }
 
     fn switch_account(&mut self, index: usize) -> Result<()> {
@@ -1176,6 +1228,7 @@ impl App {
 
     /// Drain backend event channels and merge them into local state.
     pub fn poll_backend_events(&mut self) {
+        self.poll_mailbox_loader();
         self.poll_commit_updates();
 
         let mut resort = false;
@@ -1228,6 +1281,118 @@ impl App {
 
         if refresh {
             self.update_selection_after_refresh(current_id);
+        }
+    }
+
+    fn poll_mailbox_loader(&mut self) {
+        loop {
+            let update = {
+                let Some(loader) = self.mailbox_loader.as_mut() else {
+                    return;
+                };
+                match loader.receiver.try_recv() {
+                    Ok(update) => Some(update),
+                    Err(TryRecvError::Empty) => return,
+                    Err(TryRecvError::Disconnected) => {
+                        self.mailbox_loader = None;
+                        self.mailbox_load_progress = None;
+                        self.mailbox
+                            .status_line
+                            .get_or_insert_with(|| "Mailbox load interrupted.".to_string());
+                        return;
+                    }
+                }
+            };
+
+            if let Some(update) = update {
+                let should_yield = matches!(update, MailboxLoadUpdate::Batch(_));
+                self.apply_mailbox_loader_update(update);
+                if should_yield {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn apply_mailbox_loader_update(&mut self, update: MailboxLoadUpdate) {
+        match update {
+            MailboxLoadUpdate::Started { total } => {
+                let current = self.current_mailbox;
+                let completed;
+                {
+                    let progress =
+                        self.mailbox_load_progress
+                            .get_or_insert_with(|| CommitProgress {
+                                total,
+                                completed: 0,
+                            });
+                    progress.total = total;
+                    progress.completed = progress.completed.min(total);
+                    completed = progress.completed;
+                }
+                self.mailbox.status_line =
+                    Some(format!("Loading {current}: {completed}/{total} messages"));
+            }
+            MailboxLoadUpdate::Batch(messages) => {
+                let added = messages.len();
+                let current = self.current_mailbox;
+                self.mailbox.messages.extend(messages);
+
+                let mut should_normalize = false;
+                if !self.mailbox.messages.is_empty() {
+                    self.mailbox.selected = Some(self.mailbox.messages.len() - 1);
+                    should_normalize = true;
+                }
+
+                let total_len = self.mailbox.messages.len();
+                if let Some(progress) = self.mailbox_load_progress.as_mut() {
+                    if progress.total == 0 {
+                        progress.total = total_len;
+                    }
+                    progress.completed =
+                        min(progress.completed.saturating_add(added), progress.total);
+                } else {
+                    self.mailbox_load_progress = Some(CommitProgress {
+                        total: added,
+                        completed: added,
+                    });
+                }
+
+                if should_normalize {
+                    self.normalize_scroll();
+                }
+
+                if let Some(progress) = self.mailbox_load_progress.as_ref() {
+                    if progress.total > 0 {
+                        self.mailbox.status_line = Some(format!(
+                            "Loading {current}: {}/{} messages",
+                            progress.completed, progress.total
+                        ));
+                    }
+                }
+            }
+            MailboxLoadUpdate::Finished { events, status } => {
+                self.mailbox.events = events;
+                self.mailbox_loader = None;
+                self.mailbox_load_progress = None;
+                let count = self.mailbox.messages.len();
+                self.mailbox.status_line = status.or_else(|| {
+                    Some(format!(
+                        "Loaded {count} messages in {}.",
+                        self.current_mailbox
+                    ))
+                });
+                if !self.mailbox.messages.is_empty() {
+                    self.mailbox.selected = Some(self.mailbox.messages.len() - 1);
+                    self.normalize_scroll();
+                }
+            }
+            MailboxLoadUpdate::Failed(message) => {
+                let target = self.current_mailbox;
+                self.mailbox_loader = None;
+                self.mailbox_load_progress = None;
+                self.mailbox.status_line = Some(format!("Failed to load {target}: {message}"));
+            }
         }
     }
 
@@ -1418,7 +1583,20 @@ impl App {
 
     /// Renderable text indicator reflecting aggregate commit progress.
     pub(crate) fn commit_indicator(&self) -> Option<String> {
-        let progress = self.commit_progress.as_ref()?;
+        if let Some(progress) = self
+            .mailbox_load_progress
+            .as_ref()
+            .and_then(Self::format_progress)
+        {
+            return Some(progress);
+        }
+
+        self.commit_progress
+            .as_ref()
+            .and_then(Self::format_progress)
+    }
+
+    fn format_progress(progress: &CommitProgress) -> Option<String> {
         if progress.total == 0 {
             return None;
         }
