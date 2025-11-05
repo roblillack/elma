@@ -91,6 +91,8 @@ Message status is indicated by a three symbol character prefix in the message li
 
 ### Todo
 
+- [ ] Rename special use mailboxes to standard names (Junk, Flagged)?
+- [ ] Implement transparent support of accounts which have Archive support vs. All Mail support?
 - [x] Add `!` to report as spam
 - [x] Add `g` `S` (Should be `g` `j` or even `g` `!`) to go to spam mailbox
 - [ ] Implement `r` to reply to message
@@ -110,6 +112,10 @@ Message status is indicated by a three symbol character prefix in the message li
 - [ ] Show FTML-based preview in compose dialog -- for editing open the draft as Markdown in the user's $EDITOR
 - [ ] Add support for attachments when composing messages
 - [ ] Switch from hardcoded folder named in Gmail backend to standard "Special Use" folders via IMAP (See [RFC 6154](https://datatracker.ietf.org/doc/html/rfc6154)) as per [Google Developer Docs](https://developers.google.com/workspace/gmail/imap/imap-extensions#special-use_extension_of_the_list_command)
+- [ ] Add command (`o`?) to open the current message in the web interface
+- [ ] Add support to copy the current message's content to the clipboard as Markdown (context menu?)
+- [ ] Add theming support (light/dark mode, custom colours)
+- [ ] Log network actions and user events for debugging and compatibility with existing ELMA tools
 
 ## Project layout
 

@@ -17,7 +17,7 @@ use async_imap::{
     extensions::idle::IdleResponse,
     types::{Fetch, Flag},
 };
-use async_native_tls::{TlsStream, connect as tls_connect};
+use async_native_tls::connect as tls_connect;
 use futures::TryStreamExt;
 use imap_proto::types::{AttributeValue, MailboxDatum, NameAttribute, Response};
 use lettre::{
@@ -40,7 +40,246 @@ use tokio::{
     task::JoinHandle,
 };
 
-type AsyncSession = Session<TlsStream<TcpStream>>;
+#[cfg(debug_assertions)]
+mod debug_logging {
+    use std::{
+        fs::OpenOptions,
+        io::{self, BufWriter, IoSlice, Write},
+        pin::Pin,
+        sync::{
+            Arc, Mutex, OnceLock,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+    };
+
+    use anyhow::{Context as AnyhowContext, Result};
+    use async_native_tls::TlsStream;
+    use chrono::{Local, Utc};
+    use tokio::io::ReadBuf;
+    use tokio::net::TcpStream;
+
+    #[derive(Debug)]
+    pub struct GmailImapLogger {
+        file: Mutex<BufWriter<std::fs::File>>,
+        next_id: AtomicUsize,
+    }
+
+    impl GmailImapLogger {
+        fn init() -> Result<Self> {
+            let now = Local::now();
+            let stamp = now.format("%Y-%m-%d-%H%M").to_string();
+            let pid = std::process::id();
+            let filename = format!("gmail-log-{stamp}-{pid}.log");
+            let path = std::env::current_dir()
+                .context("determining current directory for Gmail log file")?
+                .join(filename);
+
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("opening Gmail debug log file at {}", path.display()))?;
+
+            let mut writer = BufWriter::new(file);
+            let header_time = now.format("%Y-%m-%d %H:%M:%S");
+            writeln!(
+                writer,
+                "# Gmail IMAP debug log started {header_time} local, pid {pid}"
+            )
+            .ok();
+
+            Ok(Self {
+                file: Mutex::new(writer),
+                next_id: AtomicUsize::new(1),
+            })
+        }
+
+        pub fn global() -> Result<Arc<Self>> {
+            static LOGGER: OnceLock<Arc<GmailImapLogger>> = OnceLock::new();
+            if let Some(logger) = LOGGER.get() {
+                return Ok(Arc::clone(logger));
+            }
+
+            let logger = Arc::new(Self::init()?);
+            match LOGGER.set(Arc::clone(&logger)) {
+                Ok(()) => Ok(logger),
+                Err(_) => Ok(Arc::clone(
+                    LOGGER
+                        .get()
+                        .expect("Gmail IMAP logger should be present after set"),
+                )),
+            }
+        }
+
+        fn allocate_connection_id(&self) -> usize {
+            self.next_id.fetch_add(1, Ordering::AcqRel)
+        }
+
+        fn log_event(&self, connection_id: usize, label: &str, payload: &str) {
+            let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ");
+            if let Ok(mut writer) = self.file.lock() {
+                let _ = writeln!(
+                    writer,
+                    "{timestamp} conn#{connection_id:02} {label}: {payload}"
+                );
+                let _ = writer.flush();
+            }
+        }
+
+        fn log_data(&self, connection_id: usize, direction: &str, data: &[u8]) {
+            // Convert to UTF-8-friendly string, replacing invalid bytes.
+            let text = String::from_utf8_lossy(data);
+            for segment in text.split_inclusive('\n') {
+                let trimmed = segment.trim_end_matches(['\r', '\n']);
+                if segment.ends_with('\n') {
+                    let mut owned = trimmed.to_owned();
+                    owned.push_str(" <CRLF>");
+                    self.log_event(connection_id, direction, &owned);
+                } else {
+                    self.log_event(connection_id, direction, trimmed);
+                }
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct LoggedTlsStream {
+        inner: TlsStream<TcpStream>,
+        logger: Arc<GmailImapLogger>,
+        connection_id: usize,
+    }
+
+    impl LoggedTlsStream {
+        pub fn new(inner: TlsStream<TcpStream>) -> Result<Self> {
+            let logger = GmailImapLogger::global()?;
+            let connection_id = logger.allocate_connection_id();
+            logger.log_event(connection_id, "INFO", "IMAP connection established");
+
+            Ok(Self {
+                inner,
+                logger,
+                connection_id,
+            })
+        }
+
+        fn log_outgoing(&self, data: &[u8]) {
+            self.logger.log_data(self.connection_id, "C->S", data);
+        }
+
+        fn log_incoming(&self, data: &[u8]) {
+            self.logger.log_data(self.connection_id, "S->C", data);
+        }
+    }
+
+    impl Unpin for LoggedTlsStream {}
+
+    impl Drop for LoggedTlsStream {
+        fn drop(&mut self) {
+            self.logger
+                .log_event(self.connection_id, "INFO", "IMAP connection closed");
+        }
+    }
+
+    impl tokio::io::AsyncRead for LoggedTlsStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            let before = buf.filled().len();
+            match Pin::new(&mut this.inner).poll_read(cx, buf) {
+                Poll::Ready(Ok(())) => {
+                    let after = buf.filled().len();
+                    if after > before {
+                        this.log_incoming(&buf.filled()[before..after]);
+                    }
+                    Poll::Ready(Ok(()))
+                }
+                other => other,
+            }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for LoggedTlsStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            match Pin::new(&mut this.inner).poll_write(cx, buf) {
+                Poll::Ready(Ok(written)) => {
+                    if written > 0 {
+                        this.log_outgoing(&buf[..written]);
+                    }
+                    Poll::Ready(Ok(written))
+                }
+                other => other,
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            match Pin::new(&mut this.inner).poll_write_vectored(cx, bufs) {
+                Poll::Ready(Ok(written)) => {
+                    if written > 0 {
+                        let mut remaining = written;
+                        let mut aggregated = Vec::with_capacity(written);
+                        for slice in bufs {
+                            if remaining == 0 {
+                                break;
+                            }
+                            let take = remaining.min(slice.len());
+                            aggregated.extend_from_slice(&slice[..take]);
+                            remaining -= take;
+                        }
+                        this.log_outgoing(&aggregated);
+                    }
+                    Poll::Ready(Ok(written))
+                }
+                other => other,
+            }
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            self.inner.is_write_vectored()
+        }
+    }
+
+    pub fn wrap_stream(stream: TlsStream<TcpStream>) -> Result<LoggedTlsStream> {
+        LoggedTlsStream::new(stream)
+    }
+}
+
+#[cfg(not(debug_assertions))]
+mod debug_logging {
+    use async_native_tls::TlsStream;
+    use tokio::net::TcpStream;
+
+    pub type LoggedTlsStream = TlsStream<TcpStream>;
+
+    pub fn wrap_stream(stream: TlsStream<TcpStream>) -> anyhow::Result<LoggedTlsStream> {
+        Ok(stream)
+    }
+}
+
+use debug_logging::{LoggedTlsStream, wrap_stream};
+
+type AsyncSession = Session<LoggedTlsStream>;
 
 const GMAIL_HOST: &str = "imap.gmail.com";
 const GMAIL_PORT: u16 = 993;
@@ -204,18 +443,15 @@ impl MailBackend for GmailBackend {
 
                 while let Some(fetch) = fetches.try_next().await? {
                     if let Some(body) = fetch.body() {
-                        let parsed =
-                            mailparse::parse_mail(body).context("parsing message MIME structure")?;
+                        let parsed = mailparse::parse_mail(body)
+                            .context("parsing message MIME structure")?;
                         content = Some(build_message_content(&parsed)?);
                     }
                 }
             }
 
             self.inner
-                .fetch_gmail_labels_command(
-                    session,
-                    &format!("UID FETCH {uid} (UID X-GM-LABELS)"),
-                )
+                .fetch_gmail_labels_command(session, &format!("UID FETCH {uid} (UID X-GM-LABELS)"))
                 .await?;
 
             self.inner.start_idle_loop().await?;
@@ -276,6 +512,7 @@ impl GmailInner {
         let tls_stream = tls_connect(GMAIL_HOST, tcp)
             .await
             .context("starting TLS handshake with Gmail")?;
+        let tls_stream = wrap_stream(tls_stream).context("enabling Gmail IMAP debug logging")?;
         let mut client = async_imap::Client::new(tls_stream);
         client
             .read_response()
@@ -735,15 +972,10 @@ impl GmailInner {
         Ok(())
     }
 
-    async fn handle_exists(
-        &self,
-        session: &mut AsyncSession,
-        remote_count: u32,
-    ) -> Result<()> {
+    async fn handle_exists(&self, session: &mut AsyncSession, remote_count: u32) -> Result<()> {
         if let Some(range) = self.collect_new_messages(session, remote_count).await? {
             let command = format!("FETCH {range} (UID X-GM-LABELS)");
-            self.fetch_gmail_labels_command(session, &command)
-                .await?;
+            self.fetch_gmail_labels_command(session, &command).await?;
         }
         Ok(())
     }
@@ -802,7 +1034,10 @@ impl GmailInner {
                 }
                 AttributeValue::Uid(value) => uid = Some(*value),
                 AttributeValue::GmailLabels(values) => {
-                    let snapshot = values.iter().map(|value| value.as_ref().to_string()).collect();
+                    let snapshot = values
+                        .iter()
+                        .map(|value| value.as_ref().to_string())
+                        .collect();
                     labels = Some(snapshot);
                 }
                 _ => {}
