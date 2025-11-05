@@ -710,7 +710,7 @@ impl GmailInner {
             let parsed = response.parsed();
             match parsed {
                 Response::Fetch(seq, attrs) => {
-                    self.handle_fetch_update(*seq, attrs).await?;
+                    let _ = self.handle_fetch_update(*seq, attrs).await?;
                 }
                 Response::Done { tag: done_tag, .. } if done_tag == &tag => break,
                 Response::Expunge(seq) => {
@@ -940,8 +940,10 @@ impl GmailInner {
                     drop(stopper);
 
                     let mut exists = Vec::new();
-                    if let Err(err) =
-                        self.process_idle_response(resp.parsed(), &mut exists).await
+                    let mut label_refresh = Vec::new();
+                    if let Err(err) = self
+                        .process_idle_response(resp.parsed(), &mut exists, &mut label_refresh)
+                        .await
                     {
                         eprintln!("Gmail idle processing error: {err:?}");
                     }
@@ -952,7 +954,11 @@ impl GmailInner {
                         match next_wait.await {
                             Ok(IdleResponse::NewData(resp)) => {
                                 if let Err(err) = self
-                                    .process_idle_response(resp.parsed(), &mut exists)
+                                    .process_idle_response(
+                                        resp.parsed(),
+                                        &mut exists,
+                                        &mut label_refresh,
+                                    )
                                     .await
                                 {
                                     eprintln!("Gmail idle processing error: {err:?}");
@@ -971,7 +977,7 @@ impl GmailInner {
                         }
                     }
 
-                    if exists.is_empty() {
+                    if exists.is_empty() && label_refresh.is_empty() {
                         continue;
                     }
 
@@ -980,6 +986,19 @@ impl GmailInner {
                             for count in exists {
                                 if let Err(err) = self.handle_exists(&mut sess, count).await {
                                     eprintln!("Gmail idle EXISTS handling error: {err:?}");
+                                }
+                            }
+                            if !label_refresh.is_empty() {
+                                label_refresh.sort_unstable();
+                                label_refresh.dedup();
+                                for uid in label_refresh {
+                                    let command = format!("UID FETCH {uid} (UID X-GM-LABELS)");
+                                    if let Err(err) = self
+                                        .fetch_gmail_labels_command(&mut sess, &command)
+                                        .await
+                                    {
+                                        eprintln!("Gmail label refresh error: {err:?}");
+                                    }
                                 }
                             }
                             self.reinsert_session(sess).await;
@@ -1004,6 +1023,7 @@ impl GmailInner {
         &self,
         response: &Response<'_>,
         pending_exists: &mut Vec<u32>,
+        pending_labels: &mut Vec<u32>,
     ) -> Result<()> {
         match response {
             Response::Expunge(seq) => {
@@ -1016,8 +1036,13 @@ impl GmailInner {
             }
             Response::Fetch(seq, attrs) => {
                 log_backend_event("BACKEND", &format!("processing FETCH update for seq {seq}"));
-                self.handle_fetch_update(*seq, attrs).await?;
-                self.enqueue_label_refresh(*seq).await;
+                if let Some(uid) = self.handle_fetch_update(*seq, attrs).await? {
+                    log_backend_event(
+                        "BACKEND",
+                        &format!("queueing label refresh for uid {uid}"),
+                    );
+                    pending_labels.push(uid);
+                }
             }
             _ => {}
         }
@@ -1074,7 +1099,11 @@ impl GmailInner {
         }
     }
 
-    async fn handle_fetch_update(&self, _seq: u32, attrs: &[AttributeValue<'_>]) -> Result<()> {
+    async fn handle_fetch_update(
+        &self,
+        _seq: u32,
+        attrs: &[AttributeValue<'_>],
+    ) -> Result<Option<u32>> {
         let mut flags: Option<Vec<String>> = None;
         let mut labels: Option<Vec<String>> = None;
         let mut uid = None;
@@ -1099,7 +1128,7 @@ impl GmailInner {
 
         let uid = match uid {
             Some(uid) => uid,
-            None => return Ok(()),
+            None => return Ok(None),
         };
 
         let mut updated_message = None;
@@ -1137,7 +1166,7 @@ impl GmailInner {
             self.emit_event(BackendEvent::MessageFlagsChanged(message));
         }
 
-        Ok(())
+        Ok(Some(uid))
     }
 
     async fn handle_expunge(&self, seq: u32) {

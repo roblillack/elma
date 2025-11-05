@@ -50,7 +50,7 @@ few seconds to keep the inbox active.
 
 ### Email flags
 
-Message status is indicated by a three symbol character prefix in the message list:
+Message status is indicated by a four symbol character prefix in the message list:
 
 1. Read/unread/scheduled action status:
    - ` `: This is a read message
@@ -62,13 +62,16 @@ Message status is indicated by a three symbol character prefix in the message li
 2. Starred/unstarred and important status:
    - ` `: Regular message
    - `*`: Starred
-   - `○`: Marked as important (alternatively: `+`)
-   - `⊛`: Marked as important and starred (alternatively: `@`)
+   - `○`: Marked as important (alternatively: `+`) (TODO)
+   - `⊛`: Marked as important and starred (alternatively: `#`) (TODO)
 3. Reply/forward state:
    - ` `: No reply/forward
    - `↩`: This message has been replied to
    - `→`: This message has been forwarded
    - `⇄`: This message has been both replied to and forwarded
+4. Attachment indicator: (TODO)
+   - ` `: No attachment
+   - `@`: Message has one or more attachments
 
 ### Key bindings
 
@@ -98,6 +101,8 @@ Message status is indicated by a three symbol character prefix in the message li
 - [ ] Implement `r` to reply to message
 - [ ] Implement `a` to reply all
 - [ ] Implement `f` to forward message
+- [ ] Add "Important" flag support
+- [ ] Add attachment indicator to message list
 - [ ] `=`/`+` and `-` to mark as important/unimportant
 - [ ] Implement search (`/` and `n`/`N`)
 - [x] Implement composing new message (`c`)
@@ -117,6 +122,8 @@ Message status is indicated by a three symbol character prefix in the message li
 - [ ] Add theming support (light/dark mode, custom colours)
 - [ ] Log network actions and user events for debugging and compatibility with existing ELMA tools
 - [ ] Formatted date does not match web interface -- are we missing locale info somewhere?
+- [ ] Load mailbox while already showing it
+- [ ] Only start connecting to backends when the user first tries to access them
 
 ## Project layout
 
