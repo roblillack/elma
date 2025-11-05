@@ -22,6 +22,10 @@ use time::OffsetDateTime;
 const ACTION_BAR_BG: Color = Color::Rgb(211, 211, 211);
 const ACTION_BAR_FG: Color = Color::Rgb(105, 105, 105);
 const ARCHIVED_FG: Color = Color::Rgb(0, 139, 139);
+const LABEL_SPECIAL_BG: Color = Color::Rgb(64, 64, 64);
+const LABEL_SPECIAL_FG: Color = Color::White;
+const LABEL_DEFAULT_BG: Color = Color::Rgb(224, 224, 224);
+const LABEL_DEFAULT_FG: Color = Color::Black;
 
 /// Render the entire UI based on the currently active view.
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
@@ -463,22 +467,33 @@ fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         Constraint::Length(5),
         Constraint::Min(10),
     ];
+    let column_spacing = 1u16;
+    let subject_column_width = area
+        .width
+        .saturating_sub(6 + 3 + 14 + 21 + 5 + column_spacing * (widths.len() as u16 - 1));
 
+    let selected_index = app.inbox_selected();
     let visible_rows = messages
         .iter()
         .enumerate()
         .skip(top)
         .take(if height == 0 { total } else { height })
-        .map(|(_, message)| app.formatted_message_row(message, now))
-        .map(|row| {
+        .map(|(absolute_idx, message)| {
+            (
+                app.formatted_message_row(message, now),
+                matches!(selected_index, Some(sel) if sel == absolute_idx),
+            )
+        })
+        .map(|(row, highlighted)| {
             let style = style_for_row(&row);
+            let subject_cell = build_subject_cell(&row, subject_column_width, highlighted);
             Row::new(vec![
                 Cell::from(row.sequence),
                 Cell::from(row.flags),
                 Cell::from(row.date),
                 Cell::from(row.sender),
                 Cell::from(row.size),
-                Cell::from(row.subject),
+                subject_cell,
             ])
             .style(style)
         })
@@ -486,6 +501,7 @@ fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     let table = Table::new(visible_rows, widths)
         .block(Block::default().borders(Borders::NONE))
+        .column_spacing(column_spacing)
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("");
 
@@ -500,6 +516,229 @@ fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
 
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+#[derive(Clone)]
+struct DisplayLabel {
+    text: String,
+    kind: DisplayLabelKind,
+}
+
+#[derive(Clone, Copy)]
+enum DisplayLabelKind {
+    Special,
+    Normal,
+}
+
+struct LabelRender {
+    spans: Vec<Span<'static>>,
+    width: usize,
+}
+
+enum SpecialLabelMapping {
+    Display(&'static str),
+    Hidden,
+}
+
+fn build_subject_cell(
+    row: &crate::app::MessageRow,
+    subject_width: u16,
+    highlighted: bool,
+) -> Cell<'static> {
+    if subject_width == 0 {
+        return Cell::from("");
+    }
+
+    let total_width = subject_width as usize;
+    let base_subject = if row.subject.trim().is_empty() {
+        row.uid.clone()
+    } else {
+        format!("{} {}", row.uid, row.subject)
+    };
+
+    let label_render = format_labels(&row.labels, total_width, highlighted);
+    let mut spans = Vec::new();
+    let mut remaining = total_width;
+
+    if label_render.width > 0 {
+        remaining = remaining.saturating_sub(label_render.width);
+        spans.extend(label_render.spans);
+    }
+
+    if !base_subject.is_empty() && remaining > 0 {
+        if label_render.width > 0 {
+            if remaining == 0 {
+                return Cell::from(Line::from(spans));
+            }
+            spans.push(Span::raw(" "));
+            remaining = remaining.saturating_sub(1);
+        }
+
+        if remaining > 0 {
+            let subject_text = fit_text_with_padding(&base_subject, remaining, false);
+            if !subject_text.is_empty() {
+                spans.push(Span::raw(subject_text));
+            }
+        }
+    }
+
+    Cell::from(Line::from(spans))
+}
+
+fn format_labels(labels: &[String], subject_width: usize, highlighted: bool) -> LabelRender {
+    if subject_width == 0 {
+        return LabelRender {
+            spans: Vec::new(),
+            width: 0,
+        };
+    }
+
+    let mut display_labels = prepare_display_labels(labels);
+    if display_labels.is_empty() {
+        return LabelRender {
+            spans: Vec::new(),
+            width: 0,
+        };
+    }
+
+    if display_labels.len() > 2 {
+        let count = display_labels.len();
+        display_labels = vec![DisplayLabel {
+            text: format!("{count} labels"),
+            kind: DisplayLabelKind::Normal,
+        }];
+    }
+
+    let mut spans = Vec::new();
+    let mut width = 0usize;
+
+    for (index, label) in display_labels.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+            width += 1;
+        }
+        let text = format!("[{}]", label.text);
+        width += text_width(&text);
+        spans.push(Span::styled(text, label_style(label.kind, highlighted)));
+    }
+
+    if width > subject_width {
+        return LabelRender {
+            spans: Vec::new(),
+            width: 0,
+        };
+    }
+
+    LabelRender { spans, width }
+}
+
+fn prepare_display_labels(labels: &[String]) -> Vec<DisplayLabel> {
+    let mut prepared = Vec::new();
+
+    for raw_label in labels {
+        let cleaned = raw_label.trim().trim_matches('"');
+        if cleaned.is_empty() {
+            continue;
+        }
+
+        if let Some(mapping) = map_special_use_label(cleaned) {
+            match mapping {
+                SpecialLabelMapping::Hidden => continue,
+                SpecialLabelMapping::Display(name) => prepared.push(DisplayLabel {
+                    text: name.to_string(),
+                    kind: DisplayLabelKind::Special,
+                }),
+            }
+        } else {
+            prepared.push(DisplayLabel {
+                text: cleaned.to_string(),
+                kind: DisplayLabelKind::Normal,
+            });
+        }
+    }
+
+    prepared.sort_by(|a, b| {
+        let a_key = a.text.to_ascii_lowercase();
+        let b_key = b.text.to_ascii_lowercase();
+        a_key.cmp(&b_key).then_with(|| a.text.cmp(&b.text))
+    });
+
+    prepared
+}
+
+fn map_special_use_label(label: &str) -> Option<SpecialLabelMapping> {
+    let normalized = label.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let lower = normalized.to_ascii_lowercase();
+    let stripped = lower.trim_start_matches('\\');
+    match stripped {
+        "starred" | "[gmail]/starred" => Some(SpecialLabelMapping::Hidden),
+        "important" | "[gmail]/important" => Some(SpecialLabelMapping::Hidden),
+        "inbox" | "[gmail]/inbox" => Some(SpecialLabelMapping::Display("Inbox")),
+        "sent" | "sent mail" | "[gmail]/sent mail" | "[gmail]/sent" => {
+            Some(SpecialLabelMapping::Display("Sent"))
+        }
+        "draft" | "drafts" | "[gmail]/drafts" => Some(SpecialLabelMapping::Display("Drafts")),
+        "spam" | "[gmail]/spam" => Some(SpecialLabelMapping::Display("Spam")),
+        "trash" | "[gmail]/trash" => Some(SpecialLabelMapping::Display("Trash")),
+        "all" | "all mail" | "[gmail]/all mail" | "archive" | "[gmail]/archive" => {
+            Some(SpecialLabelMapping::Display("Archive"))
+        }
+        _ => None,
+    }
+}
+
+fn label_style(kind: DisplayLabelKind, highlighted: bool) -> Style {
+    if highlighted {
+        return Style::default();
+    }
+
+    match kind {
+        DisplayLabelKind::Special => Style::default().fg(LABEL_SPECIAL_FG).bg(LABEL_SPECIAL_BG),
+        DisplayLabelKind::Normal => Style::default().fg(LABEL_DEFAULT_FG).bg(LABEL_DEFAULT_BG),
+    }
+}
+
+fn fit_text_with_padding(text: &str, target_width: usize, pad: bool) -> String {
+    if target_width == 0 {
+        return String::new();
+    }
+
+    let current_width = text_width(text);
+    if current_width <= target_width {
+        if !pad {
+            return text.to_string();
+        }
+        let mut result = text.to_string();
+        result.extend(std::iter::repeat(' ').take(target_width.saturating_sub(current_width)));
+        return result;
+    }
+
+    if target_width == 1 {
+        return "…".to_string();
+    }
+
+    let mut result = String::new();
+    for ch in text.chars().take(target_width.saturating_sub(1)) {
+        result.push(ch);
+    }
+    result.push('…');
+
+    if pad {
+        let result_width = text_width(&result);
+        if result_width < target_width {
+            result.extend(std::iter::repeat(' ').take(target_width - result_width));
+        }
+    }
+
+    result
+}
+
+fn text_width(value: &str) -> usize {
+    value.chars().count()
 }
 
 fn render_shortcut_menu(frame: &mut Frame<'_>, menu: &ShortcutMenu) {

@@ -48,6 +48,25 @@ treated as a single Gmail account. If no configuration is found the client falls
 backend so you can continue exploring the UI without network access. New mock messages arrive every
 few seconds to keep the inbox active.
 
+### General use
+
+Elma presents a terminal-based email client interface with a focus on keyboard navigation and
+efficiency. The main screen displays a list of emails in the selected mailbox, along with key
+information such as sender, subject, and date. Users can navigate through emails, open them for
+reading, and perform various actions like archiving, deleting, or starring messages.
+
+### Acting on messages
+
+Elma differentiates between two different types of actions on messages:
+
+- Immediate actions: These simple actions are applied to the message right away. For example, starring or
+  unstarring a message is an immediate action. Actions like these can usually easily be undone by
+  performing the opposite action (e.g., unstarring a starred message) if you notice a mistake.
+
+- Scheduled actions: These actions are marked for later application. For example, when you delete a
+  message, it is marked for deletion but not removed from the list until you commit all the scheduled changes (by
+  pressing `$`). This allows you to quickly go through a large amount of messages and review and modify your scheduled actions before they are finalized.
+
 ### Email flags
 
 Message status is indicated by a four symbol character prefix in the message list:
@@ -124,6 +143,8 @@ Message status is indicated by a four symbol character prefix in the message lis
 - [ ] Formatted date does not match web interface -- are we missing locale info somewhere?
 - [ ] Load mailbox while already showing it
 - [ ] Only start connecting to backends when the user first tries to access them
+- [ ] Backends should be able to express if they have support for "Important" flags & virtual folders
+- [ ] Backends should be able to express if they have support for "Archive" vs "All Mail" folders (Gmail, sadly, does not have a true Archive folder)
 
 ## Project layout
 

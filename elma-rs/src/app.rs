@@ -2310,7 +2310,9 @@ impl App {
             date: message.formatted_received(now),
             sender: padded_sender(&display_name),
             size: format_size(message.size),
-            subject: format_subject(message),
+            uid: message.uid.to_string(),
+            subject: message.subject.clone(),
+            labels: message.labels.clone(),
             status: message.status,
             starred: message.starred,
         }
@@ -2323,18 +2325,11 @@ pub(crate) struct MessageRow {
     pub(crate) date: String,
     pub(crate) sender: String,
     pub(crate) size: String,
+    pub(crate) uid: String,
     pub(crate) subject: String,
+    pub(crate) labels: Vec<String>,
     pub(crate) status: MessageStatus,
     pub(crate) starred: bool,
-}
-
-fn format_subject(message: &Message) -> String {
-    let labels = if message.labels.is_empty() {
-        String::new()
-    } else {
-        format!("{} ", message.labels.join("+"))
-    };
-    format!("{} {}{}", message.uid, labels, message.subject)
 }
 
 impl App {

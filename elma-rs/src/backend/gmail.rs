@@ -285,7 +285,7 @@ mod debug_logging {
     pub fn log_backend_event(_label: &str, _payload: &str) {}
 }
 
-use debug_logging::{log_backend_event, LoggedTlsStream, wrap_stream};
+use debug_logging::{LoggedTlsStream, log_backend_event, wrap_stream};
 
 type AsyncSession = Session<LoggedTlsStream>;
 
@@ -993,9 +993,8 @@ impl GmailInner {
                                 label_refresh.dedup();
                                 for uid in label_refresh {
                                     let command = format!("UID FETCH {uid} (UID X-GM-LABELS)");
-                                    if let Err(err) = self
-                                        .fetch_gmail_labels_command(&mut sess, &command)
-                                        .await
+                                    if let Err(err) =
+                                        self.fetch_gmail_labels_command(&mut sess, &command).await
                                     {
                                         eprintln!("Gmail label refresh error: {err:?}");
                                     }
@@ -1037,10 +1036,7 @@ impl GmailInner {
             Response::Fetch(seq, attrs) => {
                 log_backend_event("BACKEND", &format!("processing FETCH update for seq {seq}"));
                 if let Some(uid) = self.handle_fetch_update(*seq, attrs).await? {
-                    log_backend_event(
-                        "BACKEND",
-                        &format!("queueing label refresh for uid {uid}"),
-                    );
+                    log_backend_event("BACKEND", &format!("queueing label refresh for uid {uid}"));
                     pending_labels.push(uid);
                 }
             }
