@@ -4,7 +4,7 @@ mod model;
 mod ui;
 mod viewer;
 
-use crate::app::App;
+use crate::app::{AccountDescriptor, App};
 use crate::backend::{MailBackend, gmail::GmailBackend, mock::MockBackend};
 use anyhow::{Context, Result, anyhow};
 use crossterm::{
@@ -38,9 +38,9 @@ fn main() -> Result<()> {
         }
     }
 
-    let backend = select_backend(demo_mode)?;
+    let accounts = load_accounts(demo_mode)?;
 
-    let mut app = App::new(backend).context("failed to initialize application state")?;
+    let mut app = App::new(accounts).context("failed to initialize application state")?;
     run(&mut app).context("failed while running application loop")
 }
 
@@ -96,33 +96,41 @@ fn print_usage() {
     println!("    -h, --help    Show this help message");
 }
 
-fn select_backend(demo_mode: bool) -> Result<Box<dyn MailBackend>> {
+fn load_accounts(demo_mode: bool) -> Result<Vec<AccountDescriptor>> {
     if demo_mode {
-        return Ok(Box::new(MockBackend::demo()));
+        return Ok(vec![AccountDescriptor::new(
+            "Demo",
+            Box::new(MockBackend::demo()),
+        )]);
     }
 
-    match load_gmail_config()? {
-        Some(cfg) => {
-            let password = cfg
-                .password
-                .ok_or_else(|| anyhow!("gmail.password missing in configuration file"))?;
-            let backend = GmailBackend::new(cfg.email, password)
-                .context("failed to initialize Gmail backend")?;
-            Ok(Box::new(backend))
+    match load_accounts_from_config()? {
+        Some(accounts) if !accounts.is_empty() => Ok(accounts),
+        Some(_) => {
+            eprintln!(
+                "No accounts configured; falling back to demo backend (use --demo to hide this message)."
+            );
+            Ok(vec![AccountDescriptor::new(
+                "Demo",
+                Box::new(MockBackend::demo()),
+            )])
         }
         None => {
             eprintln!(
-                "No Gmail configuration found; using mock backend (pass --demo to hide this message)."
+                "No configuration file found; using demo backend (use --demo to hide this message)."
             );
-            Ok(Box::new(MockBackend::default()))
+            Ok(vec![AccountDescriptor::new(
+                "Demo",
+                Box::new(MockBackend::demo()),
+            )])
         }
     }
 }
 
-fn load_gmail_config() -> Result<Option<GmailConfig>> {
-    let path = config_path();
-    let Some(path) = path else {
-        return Ok(None);
+fn load_accounts_from_config() -> Result<Option<Vec<AccountDescriptor>>> {
+    let path = match config_path() {
+        Some(path) => path,
+        None => return Ok(None),
     };
 
     if !path.exists() {
@@ -133,7 +141,40 @@ fn load_gmail_config() -> Result<Option<GmailConfig>> {
         .with_context(|| format!("unable to read configuration file {}", path.display()))?;
     let config: Config = toml::from_str(&raw)
         .with_context(|| format!("unable to parse configuration file {}", path.display()))?;
-    Ok(config.gmail)
+
+    if let Some(entries) = config.accounts {
+        let mut accounts = Vec::new();
+        for (idx, entry) in entries.into_iter().enumerate() {
+            accounts.push(build_account_from_config(entry, idx)?);
+        }
+        return Ok(Some(accounts));
+    }
+
+    Ok(Some(Vec::new()))
+}
+
+fn build_account_from_config(config: AccountConfig, index: usize) -> Result<AccountDescriptor> {
+    let backend_name = config.r#type.to_ascii_lowercase();
+    match backend_name.as_str() {
+        "gmail" => {
+            let username = config
+                .email
+                .ok_or_else(|| anyhow!("accounts[{index}].username missing for Gmail backend"))?;
+            let password = config
+                .password
+                .ok_or_else(|| anyhow!("accounts[{index}].password missing for Gmail backend"))?;
+            let backend = GmailBackend::new(&username, password)
+                .with_context(|| format!("failed to initialize Gmail backend for {username}"))?;
+            let name = config.name.unwrap_or(username);
+            Ok(AccountDescriptor::new(name, Box::new(backend)))
+        }
+        "demo" => {
+            let name = config.name.unwrap_or("Demo".to_string());
+            let backend: Box<dyn MailBackend> = Box::new(MockBackend::demo());
+            Ok(AccountDescriptor::new(name, backend))
+        }
+        other => Err(anyhow!("accounts[{index}]: unsupported backend '{other}'")),
+    }
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -142,11 +183,14 @@ fn config_path() -> Option<PathBuf> {
 
 #[derive(Debug, Deserialize)]
 struct Config {
-    gmail: Option<GmailConfig>,
+    #[serde(alias = "accounts")]
+    accounts: Option<Vec<AccountConfig>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct GmailConfig {
-    email: String,
+struct AccountConfig {
+    name: Option<String>,
+    r#type: String,
+    email: Option<String>,
     password: Option<String>,
 }

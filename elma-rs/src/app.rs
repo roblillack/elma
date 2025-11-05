@@ -16,6 +16,7 @@ use std::{
     cmp::{max, min},
     collections::VecDeque,
     io::Cursor,
+    ops::{Deref, DerefMut},
     sync::mpsc::{Receiver, TryRecvError},
 };
 use tdoc::{Document, html};
@@ -23,6 +24,25 @@ use time::OffsetDateTime;
 
 const PAGE_JUMP: isize = 5;
 const PROGRESS_SEGMENTS: usize = 5;
+const ACCOUNT_SHORTCUT_KEYS: [char; 36] = [
+    '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
+    'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+];
+
+/// Data required to bootstrap an account within the application.
+pub struct AccountDescriptor {
+    pub name: String,
+    pub backend: Box<dyn MailBackend>,
+}
+
+impl AccountDescriptor {
+    pub fn new<S: Into<String>>(name: S, backend: Box<dyn MailBackend>) -> Self {
+        Self {
+            name: name.into(),
+            backend,
+        }
+    }
+}
 
 /// Tracks the lifecycle of a batch currently being committed.
 struct CommitBatchState {
@@ -58,11 +78,34 @@ struct CommitProgress {
     completed: usize,
 }
 
+/// Per-account state tracked by the UI.
+pub struct AccountState {
+    name: String,
+    backend: Box<dyn MailBackend>,
+    mailbox: MailboxState,
+    message_view: Option<MessageViewState>,
+    commit_batches: VecDeque<CommitBatchState>,
+    commit_progress: Option<CommitProgress>,
+    scheduled_actions: Vec<Action>,
+    current_mailbox: MailboxKind,
+}
+
 /// Which screen the UI is currently rendering.
 pub enum ActiveView {
     Mailbox,
     Message,
     Compose,
+}
+
+#[derive(Clone, Copy)]
+enum NavigationTarget {
+    Mailbox(MailboxKind),
+    Account(usize),
+}
+
+#[derive(Clone, Copy)]
+struct PendingNavigation {
+    target: NavigationTarget,
 }
 
 /// Central controller that wires backend state into the TUI.
@@ -85,16 +128,12 @@ pub enum ActiveView {
 /// # Ok(()) }
 /// ```
 pub struct App {
-    backend: Box<dyn MailBackend>,
-    mailbox: MailboxState,
-    message_view: Option<MessageViewState>,
+    accounts: Vec<AccountState>,
+    active_account: usize,
     compose: Option<ComposeState>,
     should_quit: bool,
-    commit_batches: VecDeque<CommitBatchState>,
-    commit_progress: Option<CommitProgress>,
-    scheduled_actions: Vec<Action>,
-    current_mailbox: MailboxKind,
     pending_shortcut: Option<ShortcutMenuState>,
+    pending_navigation: Option<PendingNavigation>,
 }
 
 /// Cached inbox view derived from backend events.
@@ -619,39 +658,48 @@ pub(crate) struct ShortcutMenu {
     items: Vec<ShortcutItem>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ShortcutItem {
     key: char,
-    description: &'static str,
+    description: String,
     action: ShortcutAction,
 }
 
 #[derive(Clone, Copy)]
 enum ShortcutAction {
     SwitchMailbox(MailboxKind),
+    SwitchAccount(usize),
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct ShortcutEntry {
+pub(crate) struct ShortcutEntry<'a> {
     pub(crate) key: char,
-    pub(crate) description: &'static str,
+    pub(crate) description: &'a str,
 }
 
 impl ShortcutMenuState {
-    fn go_to_menu() -> Self {
+    fn mailbox_menu() -> Self {
         let items = vec![
-            ShortcutItem::new('i', "Inbox", MailboxKind::Inbox),
-            ShortcutItem::new('s', "Starred", MailboxKind::Starred),
-            ShortcutItem::new('t', "Sent", MailboxKind::Sent),
-            ShortcutItem::new('d', "Drafts", MailboxKind::Drafts),
-            ShortcutItem::new('a', "Archive", MailboxKind::Archive),
-            ShortcutItem::new('S', "Spam", MailboxKind::Spam),
-            ShortcutItem::new('T', "Trash", MailboxKind::Trash),
+            ShortcutItem::mailbox('i', "Inbox", MailboxKind::Inbox),
+            ShortcutItem::mailbox('s', "Starred", MailboxKind::Starred),
+            ShortcutItem::mailbox('t', "Sent", MailboxKind::Sent),
+            ShortcutItem::mailbox('d', "Drafts", MailboxKind::Drafts),
+            ShortcutItem::mailbox('a', "Archive", MailboxKind::Archive),
+            ShortcutItem::mailbox('S', "Spam", MailboxKind::Spam),
+            ShortcutItem::mailbox('T', "Trash", MailboxKind::Trash),
         ];
 
         Self {
             menu: ShortcutMenu {
                 title: "Go to",
+                items,
+            },
+        }
+    }
+
+    fn account_menu(items: Vec<ShortcutItem>) -> Self {
+        Self {
+            menu: ShortcutMenu {
+                title: "Go to account",
                 items,
             },
         }
@@ -675,7 +723,7 @@ impl ShortcutMenu {
         self.title
     }
 
-    pub(crate) fn entries(&self) -> impl Iterator<Item = ShortcutEntry> + '_ {
+    pub(crate) fn entries(&self) -> impl Iterator<Item = ShortcutEntry<'_>> + '_ {
         self.items.iter().map(|item| ShortcutEntry {
             key: item.key(),
             description: item.description(),
@@ -684,10 +732,10 @@ impl ShortcutMenu {
 }
 
 impl ShortcutItem {
-    const fn new(key: char, description: &'static str, mailbox: MailboxKind) -> Self {
+    fn mailbox(key: char, description: &'static str, mailbox: MailboxKind) -> Self {
         Self {
             key,
-            description,
+            description: description.to_string(),
             action: ShortcutAction::SwitchMailbox(mailbox),
         }
     }
@@ -700,46 +748,83 @@ impl ShortcutItem {
         self.key
     }
 
-    fn description(&self) -> &'static str {
-        self.description
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn account(key: char, description: String, index: usize) -> Self {
+        Self {
+            key,
+            description,
+            action: ShortcutAction::SwitchAccount(index),
+        }
     }
 }
 impl App {
-    /// Build the application state around the provided backend.
-    pub fn new(backend: Box<dyn MailBackend>) -> Result<Self> {
-        let (messages, events) = backend
-            .load_inbox()
-            .context("failed to load inbox from backend")?;
+    /// Build the application state around the configured accounts.
+    pub fn new(descriptors: Vec<AccountDescriptor>) -> Result<Self> {
+        if descriptors.is_empty() {
+            return Err(anyhow!("no accounts configured"));
+        }
 
-        let mut sorted = messages;
-        sorted.sort_by_key(|msg| msg.sent);
-        let selected = if sorted.is_empty() {
-            None
-        } else {
-            Some(sorted.len().saturating_sub(1))
-        };
+        let mut accounts = Vec::with_capacity(descriptors.len());
 
-        let mailbox = MailboxState {
-            messages: sorted,
-            selected,
-            events,
-            event_count: 0,
-            status_line: None,
-            scroll_top: 0,
-        };
+        for descriptor in descriptors {
+            let backend = descriptor.backend;
+            let account_name = descriptor.name;
+            let (mut messages, events) = backend
+                .load_inbox()
+                .with_context(|| format!("failed to load inbox for account {}", account_name))?;
+            messages.sort_by_key(|msg| msg.sent);
+            let selected = if messages.is_empty() {
+                None
+            } else {
+                Some(messages.len().saturating_sub(1))
+            };
+
+            accounts.push(AccountState {
+                name: account_name,
+                backend,
+                mailbox: MailboxState {
+                    messages,
+                    selected,
+                    events,
+                    event_count: 0,
+                    status_line: None,
+                    scroll_top: 0,
+                },
+                message_view: None,
+                commit_batches: VecDeque::new(),
+                commit_progress: None,
+                scheduled_actions: Vec::new(),
+                current_mailbox: MailboxKind::Inbox,
+            });
+        }
 
         Ok(Self {
-            backend,
-            mailbox,
-            message_view: None,
+            accounts,
+            active_account: 0,
             compose: None,
             should_quit: false,
-            commit_batches: VecDeque::new(),
-            commit_progress: None,
-            scheduled_actions: Vec::new(),
-            current_mailbox: MailboxKind::Inbox,
             pending_shortcut: None,
+            pending_navigation: None,
         })
+    }
+
+    fn current_account(&self) -> &AccountState {
+        &self.accounts[self.active_account]
+    }
+
+    fn current_account_mut(&mut self) -> &mut AccountState {
+        &mut self.accounts[self.active_account]
+    }
+
+    fn mailbox_mut(&mut self) -> &mut MailboxState {
+        &mut self.current_account_mut().mailbox
+    }
+
+    fn set_message_view(&mut self, view: Option<MessageViewState>) {
+        self.current_account_mut().message_view = view;
     }
 
     /// Whether the main loop should terminate.
@@ -751,7 +836,7 @@ impl App {
     pub fn active_view(&self) -> ActiveView {
         if self.compose.is_some() {
             ActiveView::Compose
-        } else if self.message_view.is_some() {
+        } else if self.current_account().message_view.is_some() {
             ActiveView::Message
         } else {
             ActiveView::Mailbox
@@ -765,6 +850,10 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         self.poll_backend_events();
 
+        if self.process_pending_navigation(key)? {
+            return Ok(());
+        }
+
         let active_view = self.active_view();
         if matches!(active_view, ActiveView::Compose) {
             return self.handle_compose_key(key);
@@ -777,10 +866,18 @@ impl App {
         if self.pending_shortcut.is_none()
             && self.compose.is_none()
             && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
-            && matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G'))
         {
-            self.open_go_to_menu();
-            return Ok(());
+            match key.code {
+                KeyCode::Char('g') => {
+                    self.open_mailbox_menu();
+                    return Ok(());
+                }
+                KeyCode::Char('G') => {
+                    self.open_account_menu();
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
 
         match self.active_view() {
@@ -798,7 +895,8 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.pending_shortcut = None;
-                self.mailbox.status_line = Some("Shortcut cancelled.".to_string());
+                self.current_account_mut().mailbox.status_line =
+                    Some("Shortcut cancelled.".to_string());
                 Ok(true)
             }
             KeyCode::Char(ch) => {
@@ -806,10 +904,14 @@ impl App {
                 self.pending_shortcut = None;
                 match action {
                     Some(ShortcutAction::SwitchMailbox(target)) => {
-                        self.switch_mailbox(target)?;
+                        self.begin_navigation(NavigationTarget::Mailbox(target))?;
+                    }
+                    Some(ShortcutAction::SwitchAccount(index)) => {
+                        self.begin_navigation(NavigationTarget::Account(index))?;
                     }
                     None => {
-                        self.mailbox.status_line = Some(format!("Unknown go to target: {ch}"));
+                        self.current_account_mut().mailbox.status_line =
+                            Some(format!("Unknown go to target: {ch}"));
                     }
                 }
                 Ok(true)
@@ -821,17 +923,132 @@ impl App {
         }
     }
 
-    fn open_go_to_menu(&mut self) {
-        self.pending_shortcut = Some(ShortcutMenuState::go_to_menu());
-        self.mailbox.status_line = Some("Go to: press the highlighted key.".to_string());
+    fn open_mailbox_menu(&mut self) {
+        self.pending_shortcut = Some(ShortcutMenuState::mailbox_menu());
+        self.current_account_mut().mailbox.status_line =
+            Some("Go to: press the highlighted key.".to_string());
     }
 
-    fn switch_mailbox(&mut self, target: MailboxKind) -> Result<()> {
-        if target == self.current_mailbox {
-            self.mailbox.status_line = Some(format!("Already viewing {target}."));
-            return Ok(());
+    fn open_account_menu(&mut self) {
+        let items: Vec<ShortcutItem> = self
+            .accounts
+            .iter()
+            .enumerate()
+            .zip(ACCOUNT_SHORTCUT_KEYS.iter())
+            .map(|((idx, account), key)| {
+                let mut description = account.name.clone();
+                if idx == self.active_account {
+                    description.push_str(" (current)");
+                }
+                ShortcutItem::account(*key, description, idx)
+            })
+            .collect();
+
+        if items.is_empty() {
+            self.current_account_mut().mailbox.status_line =
+                Some("No accounts configured.".to_string());
+            return;
         }
 
+        if self.accounts.len() > ACCOUNT_SHORTCUT_KEYS.len() {
+            self.current_account_mut().mailbox.status_line = Some(format!(
+                "Showing first {} accounts. Press highlighted key.",
+                ACCOUNT_SHORTCUT_KEYS.len()
+            ));
+        } else {
+            self.current_account_mut().mailbox.status_line =
+                Some("Switch account: press the highlighted key.".to_string());
+        }
+
+        self.pending_shortcut = Some(ShortcutMenuState::account_menu(items));
+    }
+
+    fn process_pending_navigation(&mut self, key: KeyEvent) -> Result<bool> {
+        let Some(pending) = self.pending_navigation else {
+            return Ok(false);
+        };
+
+        if self.scheduled_actions.is_empty() {
+            self.pending_navigation = None;
+            self.execute_navigation(pending.target)?;
+            return Ok(true);
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.pending_navigation = None;
+                self.mailbox.status_line = Some("Switch cancelled.".to_string());
+                Ok(true)
+            }
+            KeyCode::Char(ch) if matches!(ch, 'y' | 'Y') => {
+                let queued = self.scheduled_actions.len();
+                self.commit_actions()?;
+                self.pending_navigation = None;
+                self.execute_navigation(pending.target)?;
+                if queued > 0 {
+                    let message = match pending.target {
+                        NavigationTarget::Mailbox(kind) => {
+                            format!("Queued {queued} actions; opened {kind}.")
+                        }
+                        NavigationTarget::Account(_) => {
+                            format!("Queued {queued} actions; switched to {}.", self.name)
+                        }
+                    };
+                    self.mailbox.status_line = Some(message);
+                }
+                Ok(true)
+            }
+            KeyCode::Char(ch) if matches!(ch, 'n' | 'N') => {
+                let target = pending.target;
+                let discarded = self.discard_scheduled_actions()?;
+                self.pending_navigation = None;
+                self.execute_navigation(target)?;
+                if discarded > 0 {
+                    let message = match target {
+                        NavigationTarget::Mailbox(kind) => {
+                            format!("Discarded {discarded} scheduled actions; opened {kind}.")
+                        }
+                        NavigationTarget::Account(_) => {
+                            format!(
+                                "Discarded {discarded} scheduled actions; switched to {}.",
+                                self.name
+                            )
+                        }
+                    };
+                    self.mailbox.status_line = Some(message);
+                }
+                Ok(true)
+            }
+            _ => {
+                self.mailbox
+                    .status_line
+                    .get_or_insert_with(|| "Press y/n or Esc.".to_string());
+                Ok(true)
+            }
+        }
+    }
+
+    fn begin_navigation(&mut self, target: NavigationTarget) -> Result<()> {
+        if self.scheduled_actions.is_empty() {
+            return self.execute_navigation(target);
+        }
+
+        let count = self.scheduled_actions.len();
+        self.pending_navigation = Some(PendingNavigation { target });
+        self.mailbox.status_line = Some(format!(
+            "{count} scheduled actions. Apply now? (y/n, Esc cancels)"
+        ));
+        Ok(())
+    }
+
+    fn execute_navigation(&mut self, target: NavigationTarget) -> Result<()> {
+        match target {
+            NavigationTarget::Mailbox(kind) => self.switch_mailbox(kind),
+            NavigationTarget::Account(index) => self.switch_account(index),
+        }
+    }
+
+    fn load_mailbox_state(&mut self, target: MailboxKind, status: Option<String>) -> Result<()> {
         let (mut messages, events) = self
             .backend
             .load_mailbox(target)
@@ -848,7 +1065,7 @@ impl App {
             selected,
             events,
             event_count: 0,
-            status_line: Some(format!("Opened {target}.")),
+            status_line: status,
             scroll_top: 0,
         };
 
@@ -858,39 +1075,91 @@ impl App {
         Ok(())
     }
 
+    fn switch_mailbox(&mut self, target: MailboxKind) -> Result<()> {
+        if target == self.current_mailbox {
+            self.mailbox.status_line = Some(format!("Already viewing {target}."));
+            return Ok(());
+        }
+
+        self.load_mailbox_state(target, Some(format!("Opened {target}.")))
+    }
+
+    fn reload_current_mailbox(&mut self) -> Result<()> {
+        let target = self.current_mailbox;
+        self.load_mailbox_state(target, None)
+    }
+
+    fn switch_account(&mut self, index: usize) -> Result<()> {
+        if index >= self.accounts.len() {
+            self.mailbox.status_line = Some("Unknown account.".to_string());
+            return Ok(());
+        }
+
+        if index == self.active_account {
+            let name = self.accounts[index].name.clone();
+            self.mailbox.status_line = Some(format!("Already viewing {name}."));
+            return Ok(());
+        }
+
+        self.active_account = index;
+        self.normalize_scroll();
+        self.sync_message_view_state();
+        let name = self.name.clone();
+        let mailbox = self.current_mailbox;
+        self.mailbox.status_line = Some(format!("Switched to {name} ({mailbox})."));
+        Ok(())
+    }
+
+    fn discard_scheduled_actions(&mut self) -> Result<usize> {
+        let count = self.scheduled_actions.len();
+        if count == 0 {
+            return Ok(0);
+        }
+
+        self.scheduled_actions.clear();
+        self.reload_current_mailbox()?;
+        Ok(count)
+    }
+
     pub(crate) fn shortcut_menu(&self) -> Option<&ShortcutMenu> {
         self.pending_shortcut.as_ref().map(|state| state.menu())
     }
 
     fn remove_message_from_mailbox(&mut self, id: MessageId) -> bool {
-        let position = match self.mailbox.messages.iter().position(|msg| msg.id == id) {
-            Some(pos) => pos,
-            None => return false,
+        let position = {
+            let mailbox = self.mailbox_mut();
+            match mailbox.messages.iter().position(|msg| msg.id == id) {
+                Some(pos) => pos,
+                None => return false,
+            }
         };
 
-        self.mailbox.messages.remove(position);
+        {
+            let mailbox = self.mailbox_mut();
+            mailbox.messages.remove(position);
 
-        if let Some(selected) = self.mailbox.selected {
-            if self.mailbox.messages.is_empty() {
-                self.mailbox.selected = None;
-            } else if selected >= self.mailbox.messages.len() {
-                self.mailbox.selected = Some(self.mailbox.messages.len() - 1);
-            } else if position <= selected && selected > 0 {
-                self.mailbox.selected = Some(selected.saturating_sub(1));
+            if let Some(selected) = mailbox.selected {
+                if mailbox.messages.is_empty() {
+                    mailbox.selected = None;
+                } else if selected >= mailbox.messages.len() {
+                    mailbox.selected = Some(mailbox.messages.len() - 1);
+                } else if position <= selected && selected > 0 {
+                    mailbox.selected = Some(selected.saturating_sub(1));
+                }
             }
         }
 
-        self.normalize_scroll();
-
         let should_close = self
+            .current_account()
             .message_view
             .as_ref()
             .map(|view| view.message_id == id)
             .unwrap_or(false);
         if should_close {
-            self.message_view = None;
+            self.set_message_view(None);
         }
 
+        self.normalize_scroll();
         true
     }
 
@@ -900,31 +1169,40 @@ impl App {
 
         let mut resort = false;
         let mut refresh = false;
-        let current_id = self.message_view.as_ref().map(|view| view.message_id);
+        let current_id = self
+            .current_account()
+            .message_view
+            .as_ref()
+            .map(|view| view.message_id);
 
         loop {
-            match self.mailbox.events.try_recv() {
+            let event = {
+                let mailbox = self.mailbox_mut();
+                mailbox.events.try_recv()
+            };
+
+            match event {
                 Ok(BackendEvent::NewMessage(message)) => {
-                    self.mailbox.event_count += 1;
-                    self.mailbox.messages.push(message);
+                    let mailbox = self.mailbox_mut();
+                    mailbox.event_count += 1;
+                    mailbox.messages.push(message);
                     resort = true;
                     refresh = true;
                 }
                 Ok(BackendEvent::MessageFlagsChanged(message)) => {
-                    if let Some(existing) = self
-                        .mailbox
-                        .messages
-                        .iter_mut()
-                        .find(|msg| msg.id == message.id)
+                    let mailbox = self.mailbox_mut();
+                    if let Some(existing) =
+                        mailbox.messages.iter_mut().find(|msg| msg.id == message.id)
                     {
                         *existing = message;
-                        self.mailbox.event_count += 1;
+                        mailbox.event_count += 1;
                         refresh = true;
                     }
                 }
                 Ok(BackendEvent::MessageDeleted(id)) => {
                     if self.remove_message_from_mailbox(id) {
-                        self.mailbox.event_count += 1;
+                        let mailbox = self.mailbox_mut();
+                        mailbox.event_count += 1;
                         refresh = true;
                     }
                 }
@@ -934,7 +1212,7 @@ impl App {
         }
 
         if resort {
-            self.mailbox.messages.sort_by_key(|msg| msg.sent);
+            self.mailbox_mut().messages.sort_by_key(|msg| msg.sent);
         }
 
         if refresh {
@@ -948,25 +1226,39 @@ impl App {
             return;
         }
 
-        for batch in &mut self.commit_batches {
-            loop {
-                match batch.receiver.try_recv() {
-                    Ok(status) => {
-                        if let Some(progress) = self.commit_progress.as_mut() {
-                            progress.completed =
-                                progress.completed.saturating_add(1).min(progress.total);
-                        }
+        let len = self.commit_batches.len();
+        for index in 0..len {
+            let mut delta_completed = 0usize;
+            {
+                let batch = self
+                    .commit_batches
+                    .get_mut(index)
+                    .expect("commit batch index out of bounds");
 
-                        batch.completed = batch.completed.saturating_add(1);
-                        if let Err(error) = status.result {
-                            batch.failed.push((status.action, error));
+                loop {
+                    match batch.receiver.try_recv() {
+                        Ok(status) => {
+                            delta_completed = delta_completed.saturating_add(1);
+                            batch.completed = batch.completed.saturating_add(1);
+                            if let Err(error) = status.result {
+                                batch.failed.push((status.action, error));
+                            }
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            batch.finished = true;
+                            break;
                         }
                     }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        batch.finished = true;
-                        break;
-                    }
+                }
+            }
+
+            if delta_completed > 0 {
+                if let Some(progress) = self.commit_progress.as_mut() {
+                    progress.completed = progress
+                        .completed
+                        .saturating_add(delta_completed)
+                        .min(progress.total);
                 }
             }
         }
@@ -1050,7 +1342,7 @@ impl App {
     }
 
     pub(crate) fn inbox_action_bar(&self) -> String {
-        let mut text = String::from("^Q:Quit g:GoTo c:Compose");
+        let mut text = String::from("^Q:Quit g:GoToMailbox G:Accounts c:Compose");
 
         if let Some(idx) = self.mailbox.selected {
             if let Some(msg) = self.mailbox.messages.get(idx) {
@@ -1061,9 +1353,10 @@ impl App {
                     text.push_str(" s:Star");
                 }
 
-                let in_archive = self.current_mailbox == MailboxKind::Archive;
-                let in_trash = self.current_mailbox == MailboxKind::Trash;
-                let in_spam = self.current_mailbox == MailboxKind::Spam;
+                let current_mailbox = self.current_mailbox;
+                let in_archive = current_mailbox == MailboxKind::Archive;
+                let in_trash = current_mailbox == MailboxKind::Trash;
+                let in_spam = current_mailbox == MailboxKind::Spam;
                 match msg.status {
                     MessageStatus::New | MessageStatus::Read => {
                         text.push_str(" r:Reply y:Archive d:Delete");
@@ -1138,7 +1431,8 @@ impl App {
             .map(|idx| format!("{}", idx + 1))
             .unwrap_or_else(|| "-".to_string());
         format!(
-            "{} — message {selected}/{total}, {} scheduled actions, got {} events",
+            "{} • {} — message {selected}/{total}, {} scheduled actions, got {} events",
+            self.name,
             self.current_mailbox,
             self.scheduled_actions.len(),
             self.mailbox.event_count
@@ -1233,15 +1527,17 @@ impl App {
             let current_id = self.message_view.as_ref().map(|view| view.message_id);
             self.toggle_star();
             if let Some(id) = current_id {
-                if let Some(view) = self.message_view.as_mut() {
-                    if view.message_id == id {
-                        if let Some(msg) = self
-                            .mailbox
-                            .messages
-                            .iter()
-                            .find(|message| message.id == id)
-                        {
-                            view.message.starred = msg.starred;
+                let starred = self
+                    .mailbox
+                    .messages
+                    .iter()
+                    .find(|message| message.id == id)
+                    .map(|msg| msg.starred);
+
+                if let Some(starred) = starred {
+                    if let Some(view) = self.message_view.as_mut() {
+                        if view.message_id == id {
+                            view.message.starred = starred;
                         }
                     }
                 }
@@ -1645,19 +1941,27 @@ impl App {
     }
 
     fn toggle_star(&mut self) {
-        if let Some(idx) = self.mailbox.selected {
-            if let Some(msg) = self.mailbox.messages.get_mut(idx) {
+        let Some(idx) = self.mailbox.selected else {
+            return;
+        };
+
+        let (action_type, message_id) = match self.mailbox.messages.get_mut(idx) {
+            Some(msg) => {
                 msg.starred = !msg.starred;
                 let ty = if msg.starred {
                     ActionType::MarkAsStarred
                 } else {
                     ActionType::MarkAsUnstarred
                 };
-                self.scheduled_actions.push(Action::new(ty, msg.id));
-                self.mailbox.status_line = None;
-                self.sync_message_view_state();
+                (ty, msg.id)
             }
-        }
+            None => return,
+        };
+
+        self.scheduled_actions
+            .push(Action::new(action_type, message_id));
+        self.mailbox.status_line = None;
+        self.sync_message_view_state();
     }
 
     fn schedule_archive(&mut self) {
@@ -1666,15 +1970,22 @@ impl App {
             return;
         }
 
-        if let Some(idx) = self.mailbox.selected {
-            if let Some(msg) = self.mailbox.messages.get_mut(idx) {
+        let Some(idx) = self.mailbox.selected else {
+            return;
+        };
+
+        let message_id = match self.mailbox.messages.get_mut(idx) {
+            Some(msg) => {
                 msg.status = MessageStatus::Archived;
-                self.scheduled_actions
-                    .push(Action::new(ActionType::Archive, msg.id));
-                self.advance_selection_after_action(idx);
-                self.sync_message_view_state();
+                msg.id
             }
-        }
+            None => return,
+        };
+
+        self.scheduled_actions
+            .push(Action::new(ActionType::Archive, message_id));
+        self.advance_selection_after_action(idx);
+        self.sync_message_view_state();
     }
 
     fn schedule_delete(&mut self) {
@@ -1683,33 +1994,51 @@ impl App {
             return;
         }
 
-        if let Some(idx) = self.mailbox.selected {
-            if let Some(msg) = self.mailbox.messages.get_mut(idx) {
+        let Some(idx) = self.mailbox.selected else {
+            return;
+        };
+
+        let message_id = match self.mailbox.messages.get_mut(idx) {
+            Some(msg) => {
                 msg.status = MessageStatus::Deleted;
-                self.scheduled_actions
-                    .push(Action::new(ActionType::Delete, msg.id));
-                self.advance_selection_after_action(idx);
-                self.sync_message_view_state();
+                msg.id
             }
-        }
+            None => return,
+        };
+
+        self.scheduled_actions
+            .push(Action::new(ActionType::Delete, message_id));
+        self.advance_selection_after_action(idx);
+        self.sync_message_view_state();
     }
 
     fn schedule_move_to_spam(&mut self) {
-        if let Some(idx) = self.mailbox.selected {
-            if let Some(msg) = self.mailbox.messages.get_mut(idx) {
+        let Some(idx) = self.mailbox.selected else {
+            return;
+        };
+
+        let message_id = match self.mailbox.messages.get_mut(idx) {
+            Some(msg) => {
                 msg.status = MessageStatus::Spam;
-                self.scheduled_actions
-                    .push(Action::new(ActionType::MoveToSpam, msg.id));
-                self.advance_selection_after_action(idx);
-                self.mailbox.status_line = None;
-                self.sync_message_view_state();
+                msg.id
             }
-        }
+            None => return,
+        };
+
+        self.scheduled_actions
+            .push(Action::new(ActionType::MoveToSpam, message_id));
+        self.advance_selection_after_action(idx);
+        self.mailbox.status_line = None;
+        self.sync_message_view_state();
     }
 
     fn schedule_move_to_inbox(&mut self) {
-        if let Some(idx) = self.mailbox.selected {
-            if let Some(msg) = self.mailbox.messages.get_mut(idx) {
+        let Some(idx) = self.mailbox.selected else {
+            return;
+        };
+
+        let (action_type, message_id) = match self.mailbox.messages.get_mut(idx) {
+            Some(msg) => {
                 let restore_unread = matches!(msg.status, MessageStatus::New);
                 msg.status = MessageStatus::PendingInbox;
                 let action_type = if restore_unread {
@@ -1717,18 +2046,25 @@ impl App {
                 } else {
                     ActionType::MoveToInboxRead
                 };
-                self.scheduled_actions
-                    .push(Action::new(action_type, msg.id));
-                self.advance_selection_after_action(idx);
-                self.mailbox.status_line = None;
-                self.sync_message_view_state();
+                (action_type, msg.id)
             }
-        }
+            None => return,
+        };
+
+        self.scheduled_actions
+            .push(Action::new(action_type, message_id));
+        self.advance_selection_after_action(idx);
+        self.mailbox.status_line = None;
+        self.sync_message_view_state();
     }
 
     fn toggle_unread(&mut self) {
-        if let Some(idx) = self.mailbox.selected {
-            if let Some(msg) = self.mailbox.messages.get_mut(idx) {
+        let Some(idx) = self.mailbox.selected else {
+            return;
+        };
+
+        let (action_type, message_id) = match self.mailbox.messages.get_mut(idx) {
+            Some(msg) => {
                 let action_type = match msg.status {
                     MessageStatus::New | MessageStatus::Read => {
                         msg.status = MessageStatus::New;
@@ -1744,12 +2080,15 @@ impl App {
                         return;
                     }
                 };
-                self.scheduled_actions
-                    .push(Action::new(action_type, msg.id));
-                self.mailbox.status_line = None;
-                self.sync_message_view_state();
+                (action_type, msg.id)
             }
-        }
+            None => return,
+        };
+
+        self.scheduled_actions
+            .push(Action::new(action_type, message_id));
+        self.mailbox.status_line = None;
+        self.sync_message_view_state();
     }
 
     fn advance_selection_after_action(&mut self, current_idx: usize) {
@@ -1876,17 +2215,27 @@ impl App {
     }
 
     fn sync_message_view_state(&mut self) {
-        if let Some(view) = self.message_view.as_mut() {
-            if let Some((idx, message)) = self
-                .mailbox
-                .messages
-                .iter()
-                .enumerate()
-                .find(|(_, msg)| msg.id == view.message_id)
-            {
-                view.message_index = idx;
-                view.message = message.clone();
-            } else {
+        let message_id = match self.message_view.as_ref().map(|view| view.message_id) {
+            Some(id) => id,
+            None => return,
+        };
+
+        let update = self
+            .mailbox
+            .messages
+            .iter()
+            .enumerate()
+            .find(|(_, msg)| msg.id == message_id)
+            .map(|(idx, msg)| (idx, msg.clone()));
+
+        match update {
+            Some((idx, message)) => {
+                if let Some(view) = self.message_view.as_mut() {
+                    view.message_index = idx;
+                    view.message = message;
+                }
+            }
+            None => {
                 self.message_view = None;
             }
         }
@@ -1971,5 +2320,19 @@ impl App {
                 self.mailbox.scroll_top = max_top;
             }
         }
+    }
+}
+
+impl Deref for App {
+    type Target = AccountState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.accounts[self.active_account]
+    }
+}
+
+impl DerefMut for App {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.accounts[self.active_account]
     }
 }

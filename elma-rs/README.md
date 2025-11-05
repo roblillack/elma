@@ -27,18 +27,48 @@ rendering.
 cargo run -- --demo
 ```
 
-The mock backend remains available via `--demo`. Without that flag the application looks for a
-Gmail configuration in `~/.elmarc` and connects through Gmail's IMAP endpoint:
+The mock backend remains available via `--demo`. Without that flag the application loads accounts
+from `~/.elmarc`. Multiple accounts are supported via the `[[accounts]]` table:
 
 ```toml
-[gmail]
-email = "user@gmail.com"
+[[accounts]]
+name = "Private"
+backend = "gmail"
+username = "user@gmail.com"
 password = "app-specific-password"
+
+[[accounts]]
+name = "Demo"
+backend = "demo"
 ```
 
-If the configuration file (or the `gmail` section) is missing, the client falls back to the mock
+`backend = "gmail"` expects an app password; `backend = "demo"` (or `"mock"`) uses the bundled
+mock backend. For backwards compatibility, the legacy `[gmail]` section remains supported and is
+treated as a single Gmail account. If no configuration is found the client falls back to the mock
 backend so you can continue exploring the UI without network access. New mock messages arrive every
 few seconds to keep the inbox active.
+
+### Email flags
+
+Message status is indicated by a three symbol character prefix in the message list:
+
+1. Read/unread/scheduled action status:
+   - ` `: This is a read message
+   - `N`: New/unread message
+   - `D`: Scheduled for deletion
+   - `A`: Scheduled for archival
+   - `!`: Scheduled to move to spam
+   - `I`: Scheduled to move to inbox
+2. Starred/unstarred and important status:
+   - ` `: Regular message
+   - `*`: Starred
+   - `○`: Marked as important (alternatively: `+`)
+   - `⊛`: Marked as important and starred (alternatively: `@`)
+3. Reply/forward state:
+   - ` `: No reply/forward
+   - `↩`: This message has been replied to
+   - `→`: This message has been forwarded
+   - `⇄`: This message has been both replied to and forwarded
 
 ### Key bindings
 
@@ -72,9 +102,9 @@ few seconds to keep the inbox active.
 - [ ] Implement help overlay (`?`)
 - [ ] Implement `j` and `k` to move to next/previous message in mailbox view
 - [ ] Implement `.` to open context menu for selected message
-- [ ] Add support for multiple accounts/backends (`G` to Go to different account?)
+- [x] Add support for multiple accounts/backends (`G` to Go to different account?)
 - [ ] In "Drafts" mailbox, show recipients in the message list
-- [ ] Allow continued editing of drafts (Enter to open draft in compose view again)
+- [x] Allow continued editing of drafts (Enter to open draft in compose view again)
 
 ## Project layout
 
