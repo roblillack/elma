@@ -8,7 +8,7 @@ use crate::app::{
     ActiveView, App, ComposeButton, ComposeField, ComposeFocus, ComposeState, MessageViewState,
     ShortcutMenu,
 };
-use crate::model::MessageStatus;
+use crate::model::{MessageStatus, format_size};
 use crate::viewer;
 use ratatui::{
     Frame,
@@ -809,6 +809,25 @@ fn render_message_body(frame: &mut Frame<'_>, view: &MessageViewState, area: Rec
 
     let meta_lines = message_metadata_lines(view, content_width);
     lines.extend(meta_lines);
+
+    if !view.content.attachments.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::raw("Attachments:"));
+        for attachment in &view.content.attachments {
+            let display_name = attachment
+                .filename
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .unwrap_or("(unnamed attachment)");
+            let size_display = format_size(attachment.size);
+            let size_display = size_display.trim().to_string();
+            lines.push(Line::raw(format!(
+                "- {} ({}, {})",
+                display_name, attachment.mime_type, size_display
+            )));
+        }
+    }
+
     lines.push(Line::raw(""));
 
     if view.unformatted {

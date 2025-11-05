@@ -68,6 +68,7 @@ pub struct Message {
     pub labels: Vec<String>,
     pub uid: u32,
     pub seq: u32,
+    pub has_attachments: bool,
 }
 
 impl Message {
@@ -96,6 +97,8 @@ impl Message {
             (false, true) => '↩',
             (false, false) => ' ',
         };
+
+        flags[3] = if self.has_attachments { '@' } else { ' ' };
 
         flags.into_iter().collect()
     }
@@ -126,6 +129,7 @@ impl Message {
 pub struct MessageContent {
     pub mailer: String,
     pub parts: Vec<MessageContentPart>,
+    pub attachments: Vec<MessageAttachment>,
 }
 
 impl MessageContent {
@@ -134,6 +138,13 @@ impl MessageContent {
             .iter()
             .find(|part| part.content_type.eq_ignore_ascii_case(content_type))
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct MessageAttachment {
+    pub filename: Option<String>,
+    pub mime_type: String,
+    pub size: usize,
 }
 
 #[derive(Clone, Debug)]

@@ -7,8 +7,8 @@
 use crate::{
     backend::{ActionStatus, BackendEvent, MailBackend, OutgoingMessage},
     model::{
-        Action, ActionType, MailboxKind, Message, MessageContent, MessageContentPart, MessageId,
-        MessageStatus,
+        Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
+        MessageContentPart, MessageId, MessageStatus,
     },
 };
 use anyhow::{Result, anyhow};
@@ -28,6 +28,20 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 const INITIAL_MESSAGE_COUNT: usize = 250;
 const MAILER_NAME: &str = "MockMailer/tdoc-demo";
 const DEFAULT_SENDER: &str = "user@mock.example";
+const ATTACHMENT_TEMPLATES: &[(&str, &str)] = &[
+    ("proposal.pdf", "application/pdf"),
+    ("diagram.png", "image/png"),
+    (
+        "report.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ),
+    ("notes.txt", "text/plain"),
+    (
+        "presentation.pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ),
+    ("archive.zip", "application/zip"),
+];
 
 /// Simple in-memory backend for demos and integration tests.
 ///
@@ -424,6 +438,7 @@ impl MockBackend {
             labels: Vec::new(),
             uid: id as u32,
             seq: 0,
+            has_attachments: false,
         };
 
         if !label.is_empty() {
@@ -542,6 +557,42 @@ impl MailBackend for MockBackend {
     }
 }
 
+fn generate_mock_attachments(rng: &mut SimpleRng) -> Vec<MessageAttachment> {
+    if rng.one_in(3) {
+        let count = rng.gen_range_usize_inclusive(1, 3);
+        let mut attachments = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (filename, mime_type) =
+                ATTACHMENT_TEMPLATES[rng.gen_range_usize(0..ATTACHMENT_TEMPLATES.len())];
+            let size = mock_attachment_size(rng, mime_type);
+            attachments.push(MessageAttachment {
+                filename: Some(filename.to_string()),
+                mime_type: mime_type.to_string(),
+                size,
+            });
+        }
+        attachments
+    } else {
+        Vec::new()
+    }
+}
+
+fn mock_attachment_size(rng: &mut SimpleRng, mime_type: &str) -> usize {
+    match mime_type {
+        "application/pdf" => rng.gen_range_usize(150_000..3_000_000),
+        "image/png" => rng.gen_range_usize(90_000..1_500_000),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => {
+            rng.gen_range_usize(120_000..2_400_000)
+        }
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => {
+            rng.gen_range_usize(400_000..4_800_000)
+        }
+        "application/zip" => rng.gen_range_usize(240_000..4_500_000),
+        "text/plain" => rng.gen_range_usize(4_000..40_000),
+        _ => rng.gen_range_usize(60_000..750_000),
+    }
+}
+
 fn new_random_message(
     id: MessageId,
     sent: OffsetDateTime,
@@ -564,7 +615,11 @@ fn new_random_message(
         content: plain.into_bytes(),
     });
 
-    let size = rng.gen_range_usize(0..7_203_680) + 200;
+    let attachments = generate_mock_attachments(rng);
+    let attachments_bytes = attachments.iter().map(|att| att.size).sum::<usize>();
+    content.attachments = attachments.clone();
+
+    let size = rng.gen_range_usize(0..7_203_680) + 200 + attachments_bytes;
 
     let important = rng.one_in(6);
     let mut labels = Vec::new();
@@ -587,6 +642,7 @@ fn new_random_message(
         labels,
         uid: id as u32,
         seq: 0,
+        has_attachments: !attachments.is_empty(),
     };
 
     update_mailer(&mut content, message.status);

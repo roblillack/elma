@@ -2444,7 +2444,7 @@ impl App {
             None => return Ok(()),
         };
 
-        let message = self
+        let mut message = self
             .mailbox
             .messages
             .get(idx)
@@ -2455,6 +2455,14 @@ impl App {
             .backend
             .load_message(message.id)
             .with_context(|| format!("failed to load message {}", message.id))?;
+
+        let has_attachments = !content.attachments.is_empty();
+        if message.has_attachments != has_attachments {
+            message.has_attachments = has_attachments;
+            if let Some(slot) = self.mailbox.messages.get_mut(idx) {
+                slot.has_attachments = has_attachments;
+            }
+        }
 
         let raw_html = content
             .part("text/html")

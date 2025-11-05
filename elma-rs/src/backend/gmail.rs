@@ -7,8 +7,8 @@
 use crate::{
     backend::{ActionStatus, BackendEvent, MailBackend, OutgoingMessage},
     model::{
-        Action, ActionType, MailboxKind, Message, MessageContent, MessageContentPart, MessageId,
-        MessageStatus,
+        Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
+        MessageContentPart, MessageId, MessageStatus,
     },
 };
 use anyhow::{Context, Result, anyhow};
@@ -19,12 +19,15 @@ use async_imap::{
 };
 use async_native_tls::connect as tls_connect;
 use futures::TryStreamExt;
-use imap_proto::types::{AttributeValue, MailboxDatum, NameAttribute, Response};
+use imap_proto::types::{
+    AttributeValue, BodyContentCommon, BodyParams, BodyStructure, MailboxDatum, NameAttribute,
+    Response,
+};
 use lettre::{
     Message as LettreEmail, SmtpTransport, Transport, message::Mailbox as LettreMailbox,
     transport::smtp::authentication::Credentials,
 };
-use mailparse::{self, MailHeaderMap, ParsedMail};
+use mailparse::{self, DispositionType, MailHeaderMap, ParsedMail};
 use std::{
     collections::{BTreeMap, HashMap},
     str,
@@ -576,7 +579,7 @@ impl GmailInner {
 
     /// Refresh the cached state for the currently selected mailbox.
     async fn refresh_selected_mailbox(&self) -> Result<Vec<Message>> {
-        let query = "(FLAGS INTERNALDATE RFC822.SIZE ENVELOPE UID)";
+        let query = "(FLAGS INTERNALDATE RFC822.SIZE ENVELOPE UID BODYSTRUCTURE)";
         let mut messages = Vec::new();
         let mut new_state = SharedState::default();
 
@@ -1085,7 +1088,7 @@ impl GmailInner {
 
         let start = current + 1;
         let range = format!("{start}:{remote_count}");
-        let query = "(FLAGS INTERNALDATE RFC822.SIZE ENVELOPE UID)";
+        let query = "(FLAGS INTERNALDATE RFC822.SIZE ENVELOPE UID BODYSTRUCTURE)";
         let mut has_new_messages = false;
         {
             let mut fetches = session.fetch(&range, query).await?;
@@ -1450,6 +1453,10 @@ fn build_message_from_fetch(fetch: &Fetch) -> Result<Option<StoredMessage>> {
     let important = flags
         .iter()
         .any(|flag| matches!(flag, Flag::Custom(name) if name.eq_ignore_ascii_case("\\Important")));
+    let has_attachments = fetch
+        .bodystructure()
+        .map(body_contains_attachment)
+        .unwrap_or(false);
 
     let message = Message {
         id: uid as u64,
@@ -1466,24 +1473,82 @@ fn build_message_from_fetch(fetch: &Fetch) -> Result<Option<StoredMessage>> {
         labels: Vec::new(),
         uid,
         seq,
+        has_attachments,
     };
 
     Ok(Some(StoredMessage { message, seq, uid }))
+}
+
+fn body_contains_attachment(structure: &BodyStructure<'_>) -> bool {
+    match structure {
+        BodyStructure::Multipart { bodies, .. } => bodies.iter().any(body_contains_attachment),
+        BodyStructure::Message { common, body, .. } => {
+            body_part_is_attachment(common) || body_contains_attachment(body)
+        }
+        BodyStructure::Text { common, .. } | BodyStructure::Basic { common, .. } => {
+            body_part_is_attachment(common)
+        }
+    }
+}
+
+fn body_part_is_attachment(common: &BodyContentCommon<'_>) -> bool {
+    if let Some(disposition) = &common.disposition {
+        if disposition.ty.as_ref().eq_ignore_ascii_case("attachment") {
+            return true;
+        }
+        if body_params_contains(&disposition.params, "filename") {
+            return true;
+        }
+    }
+
+    if body_params_contains(&common.ty.params, "name")
+        && !common.ty.ty.as_ref().eq_ignore_ascii_case("text")
+    {
+        return true;
+    }
+
+    let ty = common.ty.ty.as_ref();
+    if ty.eq_ignore_ascii_case("multipart") {
+        return false;
+    }
+    if ty.eq_ignore_ascii_case("text") {
+        return false;
+    }
+
+    true
+}
+
+fn body_params_contains(params: &BodyParams<'_>, name: &str) -> bool {
+    params
+        .as_ref()
+        .and_then(|pairs| {
+            pairs
+                .iter()
+                .find(|(key, _)| key.as_ref().eq_ignore_ascii_case(name))
+        })
+        .map(|(_, value)| !value.as_ref().is_empty())
+        .unwrap_or(false)
 }
 
 fn build_message_content(mail: &ParsedMail<'_>) -> Result<MessageContent> {
     let mailer = mail.headers.get_first_value("X-Mailer").unwrap_or_default();
 
     let mut parts = Vec::new();
-    collect_parts(mail, 0, &mut parts)?;
+    let mut attachments = Vec::new();
+    collect_parts(mail, 0, &mut parts, &mut attachments)?;
 
-    Ok(MessageContent { mailer, parts })
+    Ok(MessageContent {
+        mailer,
+        parts,
+        attachments,
+    })
 }
 
 fn collect_parts(
     mail: &ParsedMail<'_>,
     depth: usize,
     parts: &mut Vec<MessageContentPart>,
+    attachments: &mut Vec<MessageAttachment>,
 ) -> Result<()> {
     if depth >= MAX_PART_DEPTH {
         return Ok(());
@@ -1502,13 +1567,38 @@ fn collect_parts(
             mail.get_body_raw()
                 .context("reading message body segment")?
         };
+        let disposition = mail.get_content_disposition();
+        let filename = disposition
+            .params
+            .get("filename")
+            .cloned()
+            .or_else(|| disposition.params.get("name").cloned())
+            .or_else(|| mail.ctype.params.get("name").cloned())
+            .filter(|name| !name.trim().is_empty());
+        let is_text = mail
+            .ctype
+            .mimetype
+            .split('/')
+            .next()
+            .map(|major| major.eq_ignore_ascii_case("text"))
+            .unwrap_or(false);
+        let is_attachment = matches!(disposition.disposition, DispositionType::Attachment)
+            || filename.is_some()
+            || !is_text;
+        if is_attachment {
+            attachments.push(MessageAttachment {
+                filename,
+                mime_type: content_type.clone(),
+                size: data.len(),
+            });
+        }
         parts.push(MessageContentPart {
             content_type,
             content: data,
         });
     } else {
         for sub in &mail.subparts {
-            collect_parts(sub, depth + 1, parts)?;
+            collect_parts(sub, depth + 1, parts, attachments)?;
         }
     }
 
@@ -1697,6 +1787,7 @@ mod tests {
             labels: Vec::new(),
             uid: id as u32,
             seq,
+            has_attachments: false,
         };
 
         StoredMessage {
