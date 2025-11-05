@@ -667,6 +667,13 @@ fn message_metadata_lines(view: &MessageViewState, width: u16) -> Vec<Line<'stat
         meta.push(format!("Mailer:  {}", view.content.mailer));
     }
 
+    let labels_line = if message.labels.is_empty() {
+        "Labels:  (none)".to_string()
+    } else {
+        format!("Labels:  {}", message.labels.join(", "))
+    };
+    meta.push(labels_line);
+
     meta.into_iter()
         .map(|line| {
             let padded = pad_to_width(&line, width);

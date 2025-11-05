@@ -195,19 +195,28 @@ impl MailBackend for GmailBackend {
                 .as_mut()
                 .ok_or_else(|| anyhow!("IMAP session is not available"))?;
 
-            let mut fetches = session
-                .uid_fetch(uid.to_string(), "(RFC822)")
-                .await
-                .context("fetching full message")?;
-
             let mut content = None;
-            while let Some(fetch) = fetches.try_next().await? {
-                if let Some(body) = fetch.body() {
-                    let parsed =
-                        mailparse::parse_mail(body).context("parsing message MIME structure")?;
-                    content = Some(build_message_content(&parsed)?);
+            {
+                let mut fetches = session
+                    .uid_fetch(uid.to_string(), "(RFC822)")
+                    .await
+                    .context("fetching full message")?;
+
+                while let Some(fetch) = fetches.try_next().await? {
+                    if let Some(body) = fetch.body() {
+                        let parsed =
+                            mailparse::parse_mail(body).context("parsing message MIME structure")?;
+                        content = Some(build_message_content(&parsed)?);
+                    }
                 }
             }
+
+            self.inner
+                .fetch_gmail_labels_command(
+                    session,
+                    &format!("UID FETCH {uid} (UID X-GM-LABELS)"),
+                )
+                .await?;
 
             self.inner.start_idle_loop().await?;
 
@@ -344,6 +353,15 @@ impl GmailInner {
             *state_guard = new_state;
         }
 
+        if !messages.is_empty() {
+            let mut session_guard = self.session.lock().await;
+            let session = session_guard
+                .as_mut()
+                .ok_or_else(|| anyhow!("IMAP session is not available"))?;
+            self.fetch_gmail_labels_command(session, "FETCH 1:* (UID X-GM-LABELS)")
+                .await?;
+        }
+
         Ok(messages)
     }
 
@@ -416,6 +434,47 @@ impl GmailInner {
             }
             if let Some(value) = drafts {
                 labels.drafts = value;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn fetch_gmail_labels_command(
+        &self,
+        session: &mut AsyncSession,
+        command: &str,
+    ) -> Result<()> {
+        let command_text = command.to_string();
+        let tag = session
+            .run_command(&command_text)
+            .await
+            .with_context(|| format!("issuing command `{command_text}`"))?;
+
+        loop {
+            let Some(response) = session
+                .read_response()
+                .await
+                .context("reading Gmail label response")?
+            else {
+                return Err(anyhow!(
+                    "IMAP connection closed while fetching Gmail labels"
+                ));
+            };
+
+            let parsed = response.parsed();
+            match parsed {
+                Response::Fetch(seq, attrs) => {
+                    self.handle_fetch_update(*seq, attrs).await?;
+                }
+                Response::Done { tag: done_tag, .. } if done_tag == &tag => break,
+                Response::Expunge(seq) => {
+                    self.handle_expunge(*seq).await;
+                }
+                Response::MailboxData(MailboxDatum::Exists(count)) => {
+                    let _ = self.collect_new_messages(session, *count).await?;
+                }
+                _ => {}
             }
         }
 
@@ -676,37 +735,63 @@ impl GmailInner {
         Ok(())
     }
 
-    async fn handle_exists(&self, session: &mut AsyncSession, remote_count: u32) -> Result<()> {
+    async fn handle_exists(
+        &self,
+        session: &mut AsyncSession,
+        remote_count: u32,
+    ) -> Result<()> {
+        if let Some(range) = self.collect_new_messages(session, remote_count).await? {
+            let command = format!("FETCH {range} (UID X-GM-LABELS)");
+            self.fetch_gmail_labels_command(session, &command)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn collect_new_messages(
+        &self,
+        session: &mut AsyncSession,
+        remote_count: u32,
+    ) -> Result<Option<String>> {
         let current = {
             let state = self.state.lock().await;
             state.len() as u32
         };
 
         if remote_count <= current {
-            return Ok(());
+            return Ok(None);
         }
 
         let start = current + 1;
         let range = format!("{start}:{remote_count}");
         let query = "(FLAGS INTERNALDATE RFC822.SIZE ENVELOPE UID)";
-        let mut fetches = session.fetch(&range, query).await?;
+        let mut has_new_messages = false;
+        {
+            let mut fetches = session.fetch(&range, query).await?;
 
-        while let Some(fetch) = fetches.try_next().await? {
-            if let Some(stored) = build_message_from_fetch(&fetch)? {
-                let message = stored.message.clone();
-                {
-                    let mut state = self.state.lock().await;
-                    state.insert(stored);
+            while let Some(fetch) = fetches.try_next().await? {
+                if let Some(stored) = build_message_from_fetch(&fetch)? {
+                    let message = stored.message.clone();
+                    {
+                        let mut state = self.state.lock().await;
+                        state.insert(stored);
+                    }
+                    self.emit_event(BackendEvent::NewMessage(message));
+                    has_new_messages = true;
                 }
-                self.emit_event(BackendEvent::NewMessage(message));
             }
         }
 
-        Ok(())
+        if has_new_messages {
+            Ok(Some(range))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn handle_fetch_update(&self, _seq: u32, attrs: &[AttributeValue<'_>]) -> Result<()> {
         let mut flags: Option<Vec<String>> = None;
+        let mut labels: Option<Vec<String>> = None;
         let mut uid = None;
 
         for attr in attrs {
@@ -716,6 +801,10 @@ impl GmailInner {
                     flags = Some(snapshot);
                 }
                 AttributeValue::Uid(value) => uid = Some(*value),
+                AttributeValue::GmailLabels(values) => {
+                    let snapshot = values.iter().map(|value| value.as_ref().to_string()).collect();
+                    labels = Some(snapshot);
+                }
                 _ => {}
             }
         }
@@ -725,15 +814,39 @@ impl GmailInner {
             None => return Ok(()),
         };
 
-        if let Some(flag_list) = flags {
-            let (status, starred, answered, forwarded) =
-                summarize_flags_from_names(flag_list.iter().map(|s| s.as_str()));
+        let mut updated_message = None;
+        if flags.is_some() || labels.is_some() {
             let mut state = self.state.lock().await;
-            if let Some(message) =
-                state.apply_flag_values(uid, status, starred, answered, forwarded)
-            {
-                self.emit_event(BackendEvent::MessageFlagsChanged(message));
+            let mut changed = false;
+
+            if let Some(flag_list) = flags {
+                let (status, starred, answered, forwarded) =
+                    summarize_flags_from_names(flag_list.iter().map(|s| s.as_str()));
+                if state
+                    .apply_flag_values(uid, status, starred, answered, forwarded)
+                    .is_some()
+                {
+                    changed = true;
+                }
             }
+
+            if let Some(label_list) = labels {
+                if state.update_labels(uid, label_list).is_some() {
+                    changed = true;
+                }
+            }
+
+            if changed {
+                if let Some(id) = state.uid_to_id.get(&uid).copied() {
+                    if let Some(stored) = state.messages.get(&id) {
+                        updated_message = Some(stored.message.clone());
+                    }
+                }
+            }
+        }
+
+        if let Some(message) = updated_message {
+            self.emit_event(BackendEvent::MessageFlagsChanged(message));
         }
 
         Ok(())
@@ -939,6 +1052,16 @@ impl SharedState {
         } else {
             None
         }
+    }
+
+    fn update_labels(&mut self, uid: u32, labels: Vec<String>) -> Option<Message> {
+        let id = *self.uid_to_id.get(&uid)?;
+        let stored = self.messages.get_mut(&id)?;
+        if stored.message.labels == labels {
+            return None;
+        }
+        stored.message.labels = labels;
+        Some(stored.message.clone())
     }
 }
 

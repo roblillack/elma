@@ -107,6 +107,9 @@ Message status is indicated by a three symbol character prefix in the message li
 - [x] Allow continued editing of drafts (Enter to open draft in compose view again)
 - [ ] Add auto-complete for email addresses when composing messages based on the user's contacts or previously sent emails and last 1000 messages
 - [ ] Add showing labels in the message view
+- [ ] Show FTML-based preview in compose dialog -- for editing open the draft as Markdown in the user's $EDITOR
+- [ ] Add support for attachments when composing messages
+- [ ] Switch from hardcoded folder named in Gmail backend to standard "Special Use" folders via IMAP (See [RFC 6154](https://datatracker.ietf.org/doc/html/rfc6154)) as per [Google Developer Docs](https://developers.google.com/workspace/gmail/imap/imap-extensions#special-use_extension_of_the_list_command)
 
 ## Project layout
 
