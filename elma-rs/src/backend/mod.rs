@@ -35,6 +35,16 @@ pub struct ActionStatus {
     pub result: std::result::Result<(), String>,
 }
 
+/// Snapshot of a mailbox returned by [`MailBackend::load_mailbox`].
+#[derive(Clone, Debug)]
+pub struct MailboxSnapshot {
+    /// Total number of messages currently present in the mailbox.
+    pub total: usize,
+    /// Messages that have been populated so far. Implementations may return a
+    /// partial slice so the UI can start rendering immediately.
+    pub messages: Vec<Message>,
+}
+
 /// Data associated with an outgoing message created from the compose view.
 #[derive(Clone, Debug, Default)]
 pub struct OutgoingMessage {
@@ -66,11 +76,11 @@ pub struct OutgoingMessage {
 /// # Examples
 ///
 /// ```
-/// use elma_rs::backend::{ActionStatus, MailBackend};
+/// use elma_rs::backend::{ActionStatus, MailBackend, MailboxSnapshot};
 /// use elma_rs::model::{Action, ActionType, MessageId};
 /// # struct DemoBackend;
 /// # impl MailBackend for DemoBackend {
-/// #     fn load_inbox(&self) -> anyhow::Result<(Vec<_>, std::sync::mpsc::Receiver<_>)> {
+/// #     fn load_inbox(&self) -> anyhow::Result<(MailboxSnapshot, std::sync::mpsc::Receiver<_>)> {
 /// #         unimplemented!()
 /// #     }
 /// #     fn load_message(&self, _id: MessageId) -> anyhow::Result<_> { unimplemented!() }
@@ -86,10 +96,13 @@ pub struct OutgoingMessage {
 /// ```
 pub trait MailBackend: Send + Sync {
     /// Load `mailbox` and return a channel that streams [`BackendEvent`] updates.
-    fn load_mailbox(&self, mailbox: MailboxKind) -> Result<(Vec<Message>, Receiver<BackendEvent>)>;
+    fn load_mailbox(
+        &self,
+        mailbox: MailboxKind,
+    ) -> Result<(MailboxSnapshot, Receiver<BackendEvent>)>;
 
     /// Load the default inbox and return a channel that streams [`BackendEvent`] updates.
-    fn load_inbox(&self) -> Result<(Vec<Message>, Receiver<BackendEvent>)> {
+    fn load_inbox(&self) -> Result<(MailboxSnapshot, Receiver<BackendEvent>)> {
         self.load_mailbox(MailboxKind::Inbox)
     }
     /// Load the full content for a single message.

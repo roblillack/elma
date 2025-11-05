@@ -5,7 +5,7 @@
 //! the UI logic without relying on an external mail provider.
 
 use crate::{
-    backend::{ActionStatus, BackendEvent, MailBackend, OutgoingMessage},
+    backend::{ActionStatus, BackendEvent, MailBackend, MailboxSnapshot, OutgoingMessage},
     model::{
         Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
         MessageContentPart, MessageId, MessageStatus,
@@ -466,7 +466,10 @@ impl MockBackend {
 
 impl MailBackend for MockBackend {
     /// Return the current mailbox snapshot and subscribe to future events.
-    fn load_mailbox(&self, mailbox: MailboxKind) -> Result<(Vec<Message>, Receiver<BackendEvent>)> {
+    fn load_mailbox(
+        &self,
+        mailbox: MailboxKind,
+    ) -> Result<(MailboxSnapshot, Receiver<BackendEvent>)> {
         let mut messages = {
             let mailboxes = self.mailboxes.lock().expect("mailboxes mutex poisoned");
             if mailbox == MailboxKind::Important {
@@ -494,6 +497,9 @@ impl MailBackend for MockBackend {
         };
 
         messages.sort_by_key(|msg| msg.sent);
+        for (index, message) in messages.iter_mut().enumerate() {
+            message.seq = index as u32 + 1;
+        }
 
         let receiver = if mailbox == MailboxKind::Inbox {
             let (sender, receiver) = mpsc::channel();
@@ -510,7 +516,8 @@ impl MailBackend for MockBackend {
             receiver
         };
 
-        Ok((messages, receiver))
+        let total = messages.len();
+        Ok((MailboxSnapshot { total, messages }, receiver))
     }
 
     /// Fetch the MIME content for an individual message.

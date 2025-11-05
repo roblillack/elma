@@ -73,6 +73,10 @@ pub struct Message {
 
 impl Message {
     pub fn flag_string(&self) -> String {
+        if self.is_placeholder() {
+            return "    ".to_string();
+        }
+
         let mut flags = [' ', ' ', ' ', ' '];
 
         flags[0] = match self.status {
@@ -122,6 +126,10 @@ impl Message {
         } else {
             self.recipients.join(", ")
         }
+    }
+
+    pub fn is_placeholder(&self) -> bool {
+        self.uid == 0
     }
 }
 

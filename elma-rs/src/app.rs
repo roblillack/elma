@@ -33,6 +33,81 @@ const ACCOUNT_SHORTCUT_KEYS: [char; 36] = [
     'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
+fn placeholder_id(seq: u32) -> MessageId {
+    u64::MAX - seq as u64
+}
+
+fn placeholder_message(seq: u32) -> Message {
+    Message {
+        id: placeholder_id(seq),
+        sent: OffsetDateTime::UNIX_EPOCH,
+        sender: String::new(),
+        recipients: Vec::new(),
+        subject: String::new(),
+        size: 0,
+        starred: false,
+        important: false,
+        answered: false,
+        forwarded: false,
+        status: MessageStatus::Read,
+        labels: Vec::new(),
+        uid: 0,
+        seq,
+        has_attachments: false,
+    }
+}
+
+fn loaded_message_count(messages: &[Message]) -> usize {
+    messages.iter().filter(|msg| !msg.is_placeholder()).count()
+}
+
+fn ensure_placeholder_capacity(messages: &mut Vec<Message>, len: usize) {
+    let mut current_len = messages.len();
+    if current_len >= len {
+        return;
+    }
+    while current_len < len {
+        let seq = current_len as u32 + 1;
+        messages.push(placeholder_message(seq));
+        current_len += 1;
+    }
+}
+
+fn last_loaded_index(messages: &[Message]) -> Option<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, msg)| (!msg.is_placeholder()).then_some(idx))
+}
+
+fn resequence_messages(messages: &mut [Message]) {
+    for (index, message) in messages.iter_mut().enumerate() {
+        let new_seq = index as u32 + 1;
+        message.seq = new_seq;
+        if message.is_placeholder() {
+            message.id = placeholder_id(new_seq);
+        }
+    }
+}
+
+fn next_loaded_index(messages: &[Message], start: usize) -> Option<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .skip(start)
+        .find_map(|(idx, msg)| (!msg.is_placeholder()).then_some(idx))
+}
+
+fn previous_loaded_index(messages: &[Message], start: usize) -> Option<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .take(start)
+        .rev()
+        .find_map(|(idx, msg)| (!msg.is_placeholder()).then_some(idx))
+}
+
 /// Data required to bootstrap an account within the application.
 pub struct AccountDescriptor {
     pub name: String,
@@ -797,15 +872,32 @@ impl App {
         for descriptor in descriptors {
             let backend = descriptor.backend;
             let account_name = descriptor.name;
-            let (mut messages, events) = backend
+            let (mut snapshot, events) = backend
                 .load_inbox()
                 .with_context(|| format!("failed to load inbox for account {}", account_name))?;
-            messages.sort_by_key(|msg| msg.sent);
-            let selected = if messages.is_empty() {
-                None
-            } else {
-                Some(messages.len().saturating_sub(1))
-            };
+            snapshot.messages.sort_by_key(|msg| msg.seq);
+
+            let mut messages = Vec::new();
+            if snapshot.total > 0 {
+                ensure_placeholder_capacity(&mut messages, snapshot.total);
+            }
+            for message in snapshot.messages {
+                if message.seq == 0 {
+                    messages.push(message);
+                    continue;
+                }
+                let index = message.seq.saturating_sub(1) as usize;
+                ensure_placeholder_capacity(&mut messages, index + 1);
+                messages[index] = message;
+            }
+
+            let selected = last_loaded_index(&messages).or_else(|| {
+                if messages.is_empty() {
+                    None
+                } else {
+                    Some(messages.len() - 1)
+                }
+            });
 
             accounts.push(AccountState {
                 name: account_name,
@@ -1081,14 +1173,14 @@ impl App {
         let (sender, receiver) = std::sync::mpsc::channel();
 
         thread::spawn(move || match backend.load_mailbox(target) {
-            Ok((mut messages, events)) => {
-                messages.sort_by_key(|msg| msg.sent);
-                let total = messages.len();
+            Ok((mut snapshot, events)) => {
+                snapshot.messages.sort_by_key(|msg| msg.seq);
+                let total = snapshot.total;
                 if sender.send(MailboxLoadUpdate::Started { total }).is_err() {
                     return;
                 }
-                if total > 0 {
-                    for chunk in messages.chunks(MAILBOX_LOAD_CHUNK) {
+                if !snapshot.messages.is_empty() {
+                    for chunk in snapshot.messages.chunks(MAILBOX_LOAD_CHUNK) {
                         if sender
                             .send(MailboxLoadUpdate::Batch(chunk.to_vec()))
                             .is_err()
@@ -1188,18 +1280,11 @@ impl App {
         };
 
         let removed_id;
-        let removed_seq;
         {
             let mailbox = self.mailbox_mut();
             let removed = mailbox.messages.remove(position);
             removed_id = removed.id;
-            removed_seq = removed.seq;
-
-            for msg in &mut mailbox.messages {
-                if msg.seq > removed_seq {
-                    msg.seq -= 1;
-                }
-            }
+            resequence_messages(&mut mailbox.messages);
 
             if let Some(selected) = mailbox.selected {
                 if mailbox.messages.is_empty() {
@@ -1231,7 +1316,6 @@ impl App {
         self.poll_mailbox_loader();
         self.poll_commit_updates();
 
-        let mut resort = false;
         let mut refresh = false;
         let current_id = self
             .current_account()
@@ -1249,8 +1333,16 @@ impl App {
                 Ok(BackendEvent::NewMessage(message)) => {
                     let mailbox = self.mailbox_mut();
                     mailbox.event_count += 1;
-                    mailbox.messages.push(message);
-                    resort = true;
+                    let index = if message.seq == 0 {
+                        mailbox.messages.len()
+                    } else {
+                        message.seq.saturating_sub(1) as usize
+                    };
+                    ensure_placeholder_capacity(&mut mailbox.messages, index + 1);
+                    mailbox.messages[index] = message;
+                    if mailbox.selected.is_none() {
+                        mailbox.selected = last_loaded_index(&mailbox.messages);
+                    }
                     refresh = true;
                 }
                 Ok(BackendEvent::MessageFlagsChanged(message)) => {
@@ -1273,10 +1365,6 @@ impl App {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
-        }
-
-        if resort {
-            self.mailbox_mut().messages.sort_by_key(|msg| msg.sent);
         }
 
         if refresh {
@@ -1318,47 +1406,47 @@ impl App {
         match update {
             MailboxLoadUpdate::Started { total } => {
                 let current = self.current_mailbox;
-                let completed;
-                {
-                    let progress =
-                        self.mailbox_load_progress
-                            .get_or_insert_with(|| CommitProgress {
-                                total,
-                                completed: 0,
-                            });
-                    progress.total = total;
-                    progress.completed = progress.completed.min(total);
-                    completed = progress.completed;
+                self.mailbox.messages.clear();
+                if total > 0 {
+                    ensure_placeholder_capacity(&mut self.mailbox.messages, total);
+                    self.mailbox.selected = Some(total.saturating_sub(1));
+                } else {
+                    self.mailbox.selected = None;
                 }
+                self.normalize_scroll();
+
+                let completed = loaded_message_count(&self.mailbox.messages);
+                let progress = self
+                    .mailbox_load_progress
+                    .get_or_insert_with(|| CommitProgress { total, completed });
+                progress.total = total;
+                progress.completed = completed;
                 self.mailbox.status_line =
                     Some(format!("Loading {current}: {completed}/{total} messages"));
             }
             MailboxLoadUpdate::Batch(messages) => {
-                let added = messages.len();
                 let current = self.current_mailbox;
-                self.mailbox.messages.extend(messages);
-
-                let mut should_normalize = false;
-                if !self.mailbox.messages.is_empty() {
-                    self.mailbox.selected = Some(self.mailbox.messages.len() - 1);
-                    should_normalize = true;
+                for message in messages {
+                    if message.seq == 0 {
+                        continue;
+                    }
+                    let index = message.seq.saturating_sub(1) as usize;
+                    ensure_placeholder_capacity(&mut self.mailbox.messages, index + 1);
+                    self.mailbox.messages[index] = message;
                 }
 
                 let total_len = self.mailbox.messages.len();
+                let completed = loaded_message_count(&self.mailbox.messages);
+
                 if let Some(progress) = self.mailbox_load_progress.as_mut() {
-                    if progress.total == 0 {
+                    if progress.total < total_len {
                         progress.total = total_len;
                     }
-                    progress.completed =
-                        min(progress.completed.saturating_add(added), progress.total);
-                } else {
-                    self.mailbox_load_progress = Some(CommitProgress {
-                        total: added,
-                        completed: added,
-                    });
+                    progress.completed = completed;
                 }
 
-                if should_normalize {
+                if let Some(last_loaded) = last_loaded_index(&self.mailbox.messages) {
+                    self.mailbox.selected = Some(last_loaded);
                     self.normalize_scroll();
                 }
 
@@ -1366,7 +1454,7 @@ impl App {
                     if progress.total > 0 {
                         self.mailbox.status_line = Some(format!(
                             "Loading {current}: {}/{} messages",
-                            progress.completed, progress.total
+                            completed, progress.total
                         ));
                     }
                 }
@@ -1375,16 +1463,19 @@ impl App {
                 self.mailbox.events = events;
                 self.mailbox_loader = None;
                 self.mailbox_load_progress = None;
-                let count = self.mailbox.messages.len();
+                let loaded = loaded_message_count(&self.mailbox.messages);
+                let total = self.mailbox.messages.len();
                 self.mailbox.status_line = status.or_else(|| {
                     Some(format!(
-                        "Loaded {count} messages in {}.",
+                        "Loaded {loaded}/{total} messages in {}.",
                         self.current_mailbox
                     ))
                 });
-                if !self.mailbox.messages.is_empty() {
-                    self.mailbox.selected = Some(self.mailbox.messages.len() - 1);
+                if let Some(last_loaded) = last_loaded_index(&self.mailbox.messages) {
+                    self.mailbox.selected = Some(last_loaded);
                     self.normalize_scroll();
+                } else if total > 0 {
+                    self.mailbox.selected = Some(total - 1);
                 }
             }
             MailboxLoadUpdate::Failed(message) => {
@@ -1517,11 +1608,30 @@ impl App {
         self.mailbox.selected
     }
 
+    fn selected_loaded_message(&self) -> Option<&Message> {
+        self.mailbox
+            .selected
+            .and_then(|idx| self.mailbox.messages.get(idx))
+            .filter(|msg| !msg.is_placeholder())
+    }
+
+    fn selected_loaded_message_mut(&mut self) -> Option<&mut Message> {
+        let idx = self.mailbox.selected?;
+        self.mailbox
+            .messages
+            .get_mut(idx)
+            .filter(|msg| !msg.is_placeholder())
+    }
+
     pub(crate) fn inbox_action_bar(&self) -> String {
         let mut text = String::from("^Q:Quit g:GoToMailbox G:Accounts c:Compose");
 
         if let Some(idx) = self.mailbox.selected {
             if let Some(msg) = self.mailbox.messages.get(idx) {
+                if msg.is_placeholder() {
+                    text.push_str(" Loading message...");
+                    return text;
+                }
                 text.push_str(" Enter:Open");
                 if msg.starred {
                     text.push_str(" s:Unstar");
@@ -2194,22 +2304,24 @@ impl App {
     }
 
     fn toggle_star(&mut self) {
-        let Some(idx) = self.mailbox.selected else {
+        if self.mailbox.selected.is_none() {
+            return;
+        }
+
+        let Some(msg) = self.selected_loaded_message_mut() else {
+            self.mailbox
+                .status_line
+                .get_or_insert_with(|| "Message is still loading.".to_string());
             return;
         };
 
-        let (action_type, message_id) = match self.mailbox.messages.get_mut(idx) {
-            Some(msg) => {
-                msg.starred = !msg.starred;
-                let ty = if msg.starred {
-                    ActionType::MarkAsStarred
-                } else {
-                    ActionType::MarkAsUnstarred
-                };
-                (ty, msg.id)
-            }
-            None => return,
+        msg.starred = !msg.starred;
+        let action_type = if msg.starred {
+            ActionType::MarkAsStarred
+        } else {
+            ActionType::MarkAsUnstarred
         };
+        let message_id = msg.id;
 
         self.scheduled_actions
             .push(Action::new(action_type, message_id));
@@ -2218,25 +2330,28 @@ impl App {
     }
 
     fn mark_selected_important(&mut self, important: bool) {
-        let Some(idx) = self.mailbox.selected else {
+        if self.mailbox.selected.is_none() {
+            return;
+        }
+
+        let Some(msg) = self.selected_loaded_message_mut() else {
+            self.mailbox
+                .status_line
+                .get_or_insert_with(|| "Message is still loading.".to_string());
             return;
         };
 
-        let (action_type, message_id) = match self.mailbox.messages.get_mut(idx) {
-            Some(msg) => {
-                if msg.important == important {
-                    return;
-                }
-                msg.important = important;
-                let ty = if important {
-                    ActionType::MarkAsImportant
-                } else {
-                    ActionType::MarkAsUnimportant
-                };
-                (ty, msg.id)
-            }
-            None => return,
+        if msg.important == important {
+            return;
+        }
+
+        msg.important = important;
+        let action_type = if important {
+            ActionType::MarkAsImportant
+        } else {
+            ActionType::MarkAsUnimportant
         };
+        let message_id = msg.id;
 
         self.scheduled_actions
             .push(Action::new(action_type, message_id));
@@ -2254,13 +2369,15 @@ impl App {
             return;
         };
 
-        let message_id = match self.mailbox.messages.get_mut(idx) {
-            Some(msg) => {
-                msg.status = MessageStatus::Archived;
-                msg.id
-            }
-            None => return,
+        let Some(msg) = self.selected_loaded_message_mut() else {
+            self.mailbox
+                .status_line
+                .get_or_insert_with(|| "Message is still loading.".to_string());
+            return;
         };
+
+        msg.status = MessageStatus::Archived;
+        let message_id = msg.id;
 
         self.scheduled_actions
             .push(Action::new(ActionType::Archive, message_id));
@@ -2278,13 +2395,15 @@ impl App {
             return;
         };
 
-        let message_id = match self.mailbox.messages.get_mut(idx) {
-            Some(msg) => {
-                msg.status = MessageStatus::Deleted;
-                msg.id
-            }
-            None => return,
+        let Some(msg) = self.selected_loaded_message_mut() else {
+            self.mailbox
+                .status_line
+                .get_or_insert_with(|| "Message is still loading.".to_string());
+            return;
         };
+
+        msg.status = MessageStatus::Deleted;
+        let message_id = msg.id;
 
         self.scheduled_actions
             .push(Action::new(ActionType::Delete, message_id));
@@ -2297,13 +2416,15 @@ impl App {
             return;
         };
 
-        let message_id = match self.mailbox.messages.get_mut(idx) {
-            Some(msg) => {
-                msg.status = MessageStatus::Spam;
-                msg.id
-            }
-            None => return,
+        let Some(msg) = self.selected_loaded_message_mut() else {
+            self.mailbox
+                .status_line
+                .get_or_insert_with(|| "Message is still loading.".to_string());
+            return;
         };
+
+        msg.status = MessageStatus::Spam;
+        let message_id = msg.id;
 
         self.scheduled_actions
             .push(Action::new(ActionType::MoveToSpam, message_id));
@@ -2317,19 +2438,21 @@ impl App {
             return;
         };
 
-        let (action_type, message_id) = match self.mailbox.messages.get_mut(idx) {
-            Some(msg) => {
-                let restore_unread = matches!(msg.status, MessageStatus::New);
-                msg.status = MessageStatus::PendingInbox;
-                let action_type = if restore_unread {
-                    ActionType::MoveToInboxUnread
-                } else {
-                    ActionType::MoveToInboxRead
-                };
-                (action_type, msg.id)
-            }
-            None => return,
+        let Some(msg) = self.selected_loaded_message_mut() else {
+            self.mailbox
+                .status_line
+                .get_or_insert_with(|| "Message is still loading.".to_string());
+            return;
         };
+
+        let restore_unread = matches!(msg.status, MessageStatus::New);
+        msg.status = MessageStatus::PendingInbox;
+        let action_type = if restore_unread {
+            ActionType::MoveToInboxUnread
+        } else {
+            ActionType::MoveToInboxRead
+        };
+        let message_id = msg.id;
 
         self.scheduled_actions
             .push(Action::new(action_type, message_id));
@@ -2339,31 +2462,33 @@ impl App {
     }
 
     fn toggle_unread(&mut self) {
-        let Some(idx) = self.mailbox.selected else {
+        if self.mailbox.selected.is_none() {
+            return;
+        }
+
+        let Some(msg) = self.selected_loaded_message_mut() else {
+            self.mailbox
+                .status_line
+                .get_or_insert_with(|| "Message is still loading.".to_string());
             return;
         };
 
-        let (action_type, message_id) = match self.mailbox.messages.get_mut(idx) {
-            Some(msg) => {
-                let action_type = match msg.status {
-                    MessageStatus::New | MessageStatus::Read => {
-                        msg.status = MessageStatus::New;
-                        ActionType::MoveToInboxUnread
-                    }
-                    MessageStatus::Deleted | MessageStatus::Archived | MessageStatus::Spam => {
-                        msg.status = MessageStatus::Read;
-                        ActionType::MoveToInboxRead
-                    }
-                    MessageStatus::PendingInbox => {
-                        self.mailbox.status_line =
-                            Some("Message already scheduled to move to inbox.".to_string());
-                        return;
-                    }
-                };
-                (action_type, msg.id)
+        let action_type = match msg.status {
+            MessageStatus::New | MessageStatus::Read => {
+                msg.status = MessageStatus::New;
+                ActionType::MoveToInboxUnread
             }
-            None => return,
+            MessageStatus::Deleted | MessageStatus::Archived | MessageStatus::Spam => {
+                msg.status = MessageStatus::Read;
+                ActionType::MoveToInboxRead
+            }
+            MessageStatus::PendingInbox => {
+                self.mailbox.status_line =
+                    Some("Message already scheduled to move to inbox.".to_string());
+                return;
+            }
         };
+        let message_id = msg.id;
 
         self.scheduled_actions
             .push(Action::new(action_type, message_id));
@@ -2376,11 +2501,15 @@ impl App {
             self.mailbox.selected = None;
             return;
         }
-        let next = min(
-            current_idx + 1,
-            self.mailbox.messages.len().saturating_sub(1),
-        );
-        self.mailbox.selected = Some(next);
+        let mut next_idx = current_idx + 1;
+        if next_idx >= self.mailbox.messages.len() {
+            next_idx = self.mailbox.messages.len().saturating_sub(1);
+        }
+
+        let candidate = next_loaded_index(&self.mailbox.messages, next_idx)
+            .or_else(|| previous_loaded_index(&self.mailbox.messages, current_idx));
+
+        self.mailbox.selected = candidate.or_else(|| last_loaded_index(&self.mailbox.messages));
     }
 
     /// Hand the current batch of scheduled actions to the backend.
@@ -2444,12 +2573,15 @@ impl App {
             None => return Ok(()),
         };
 
-        let mut message = self
-            .mailbox
-            .messages
-            .get(idx)
-            .cloned()
-            .ok_or_else(|| anyhow!("no message selected"))?;
+        let mut message = match self.selected_loaded_message() {
+            Some(msg) => msg.clone(),
+            None => {
+                self.mailbox
+                    .status_line
+                    .get_or_insert_with(|| "Message is still loading.".to_string());
+                return Ok(());
+            }
+        };
 
         let content = self
             .backend
@@ -2459,7 +2591,7 @@ impl App {
         let has_attachments = !content.attachments.is_empty();
         if message.has_attachments != has_attachments {
             message.has_attachments = has_attachments;
-            if let Some(slot) = self.mailbox.messages.get_mut(idx) {
+            if let Some(slot) = self.selected_loaded_message_mut() {
                 slot.has_attachments = has_attachments;
             }
         }
@@ -2548,7 +2680,8 @@ impl App {
                 self.mailbox.selected = Some(idx);
             }
         } else if self.mailbox.selected.is_none() {
-            self.mailbox.selected = Some(self.mailbox.messages.len() - 1);
+            self.mailbox.selected = last_loaded_index(&self.mailbox.messages)
+                .or_else(|| Some(self.mailbox.messages.len() - 1));
         }
 
         self.sync_message_view_state();
@@ -2560,6 +2693,23 @@ impl App {
         message: &Message,
         now: OffsetDateTime,
     ) -> MessageRow {
+        if message.is_placeholder() {
+            let seq = message.seq;
+            return MessageRow {
+                sequence: format!("{:>5}", seq),
+                flags: "    ".to_string(),
+                date: "Loading".to_string(),
+                sender: padded_sender("Loading"),
+                size: String::new(),
+                uid: String::from("..."),
+                subject: format!("Loading message #{seq}..."),
+                labels: Vec::new(),
+                status: MessageStatus::Read,
+                starred: false,
+                important: false,
+            };
+        }
+
         let display_name = if matches!(
             self.current_mailbox,
             MailboxKind::Sent | MailboxKind::Drafts

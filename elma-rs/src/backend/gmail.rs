@@ -5,7 +5,7 @@
 //! so the terminal UI never blocks while Gmail applies flag and mailbox updates.
 
 use crate::{
-    backend::{ActionStatus, BackendEvent, MailBackend, OutgoingMessage},
+    backend::{ActionStatus, BackendEvent, MailBackend, MailboxSnapshot, OutgoingMessage},
     model::{
         Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
         MessageContentPart, MessageId, MessageStatus,
@@ -31,7 +31,11 @@ use mailparse::{self, DispositionType, MailHeaderMap, ParsedMail};
 use std::{
     collections::{BTreeMap, HashMap},
     str,
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::Duration,
 };
 use time::OffsetDateTime;
@@ -302,6 +306,9 @@ const DEFAULT_SENT_LABEL: &str = "[Gmail]/Sent Mail";
 const DEFAULT_DRAFTS_LABEL: &str = "[Gmail]/Drafts";
 const DEFAULT_TRASH_LABEL: &str = "[Gmail]/Trash";
 const MAX_PART_DEPTH: usize = 5;
+const INITIAL_FETCH_LIMIT: u32 = 100;
+const BACKFILL_BATCH_SIZE: u32 = 100;
+const FETCH_MESSAGE_QUERY: &str = "(FLAGS INTERNALDATE RFC822.SIZE ENVELOPE UID BODYSTRUCTURE)";
 
 /// Production backend that communicates with Gmail over IMAP.
 ///
@@ -327,6 +334,8 @@ struct GmailInner {
     events: Mutex<Option<mpsc::Sender<BackendEvent>>>,
     idle_stop: AsyncMutex<Option<oneshot::Sender<()>>>,
     idle_handle: AsyncMutex<Option<JoinHandle<()>>>,
+    backfill_handle: AsyncMutex<Option<JoinHandle<()>>>,
+    backfill_cancel: AsyncMutex<Option<Arc<AtomicBool>>>,
 }
 
 /// Cached view of the Gmail mailbox.
@@ -335,6 +344,7 @@ struct SharedState {
     messages: HashMap<MessageId, StoredMessage>,
     seq_to_id: BTreeMap<u32, MessageId>,
     uid_to_id: HashMap<u32, MessageId>,
+    expected_exists: u32,
 }
 
 /// Metadata we retain for every message Gmail reports.
@@ -395,6 +405,8 @@ impl GmailBackend {
                 events: Mutex::new(None),
                 idle_stop: AsyncMutex::new(None),
                 idle_handle: AsyncMutex::new(None),
+                backfill_handle: AsyncMutex::new(None),
+                backfill_cancel: AsyncMutex::new(None),
             }),
         })
     }
@@ -405,7 +417,7 @@ impl MailBackend for GmailBackend {
     fn load_mailbox(
         &self,
         mailbox: MailboxKind,
-    ) -> Result<(Vec<Message>, mpsc::Receiver<BackendEvent>)> {
+    ) -> Result<(MailboxSnapshot, mpsc::Receiver<BackendEvent>)> {
         let (sender, receiver) = mpsc::channel();
 
         {
@@ -413,21 +425,26 @@ impl MailBackend for GmailBackend {
             *guard = Some(sender.clone());
         }
 
-        let messages = self.inner.runtime.block_on(async {
+        let snapshot = self.inner.runtime.block_on(async {
             self.inner.ensure_connected().await?;
+            self.inner.stop_backfill_task().await;
             self.inner.pause_idle().await?;
-            self.inner.select_mailbox(mailbox).await?;
-            let messages = self.inner.refresh_selected_mailbox().await?;
+            let exists = self.inner.select_mailbox(mailbox).await?;
+            let messages = self.inner.refresh_selected_mailbox(exists).await?;
             {
                 let mut current = self.inner.current_mailbox.lock().await;
                 *current = mailbox;
             }
             self.inner.start_idle_loop().await?;
+            self.inner.start_backfill_if_needed().await?;
 
-            Ok::<_, anyhow::Error>(messages)
+            Ok::<_, anyhow::Error>(MailboxSnapshot {
+                total: exists as usize,
+                messages,
+            })
         })?;
 
-        Ok((messages, receiver))
+        Ok((snapshot, receiver))
     }
 
     /// Download the full MIME body for `message_id`.
@@ -547,6 +564,135 @@ impl GmailInner {
         Ok(())
     }
 
+    async fn stop_backfill_task(&self) {
+        if let Some(cancel) = self.backfill_cancel.lock().await.take() {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        let handle = {
+            let mut guard = self.backfill_handle.lock().await;
+            guard.take()
+        };
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
+    }
+
+    async fn start_backfill_if_needed(self: &Arc<Self>) -> Result<()> {
+        let has_work = {
+            let state = self.state.lock().await;
+            state
+                .next_backfill_range(BACKFILL_BATCH_SIZE as usize)
+                .is_some()
+        };
+
+        if !has_work {
+            self.stop_backfill_task().await;
+            return Ok(());
+        }
+
+        self.stop_backfill_task().await;
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        {
+            let mut cancel_guard = self.backfill_cancel.lock().await;
+            *cancel_guard = Some(Arc::clone(&cancel_flag));
+        }
+
+        let this = Arc::clone(self);
+        let handle = self.runtime.spawn(async move {
+            this.backfill_loop(cancel_flag).await;
+        });
+
+        let mut handle_guard = self.backfill_handle.lock().await;
+        *handle_guard = Some(handle);
+
+        Ok(())
+    }
+
+    async fn backfill_loop(self: Arc<Self>, cancel: Arc<AtomicBool>) {
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let range = {
+                let state = self.state.lock().await;
+                state.next_backfill_range(BACKFILL_BATCH_SIZE as usize)
+            };
+
+            let Some((start, end)) = range else {
+                break;
+            };
+
+            if let Err(err) = self.load_backfill_batch(start, end, &cancel).await {
+                eprintln!("Gmail backfill error: {err:?}");
+                break;
+            }
+        }
+    }
+
+    async fn load_backfill_batch(
+        self: &Arc<Self>,
+        start: u32,
+        end: u32,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        if cancel.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        self.pause_idle().await?;
+        let mut session_guard = self.session.lock().await;
+        let session = session_guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("IMAP session is not available"))?;
+
+        let stored_messages = match self
+            .fetch_message_range(session, start, end)
+            .await
+            .with_context(|| format!("fetching backfill range {start}:{end}"))
+        {
+            Ok(messages) => messages,
+            Err(err) => {
+                drop(session_guard);
+                let _ = self.start_idle_loop().await;
+                return Err(err);
+            }
+        };
+
+        let mut to_emit = Vec::new();
+        {
+            let mut state = self.state.lock().await;
+            for stored in stored_messages {
+                let message = stored.message.clone();
+                state.insert(stored);
+                to_emit.push(message);
+            }
+        }
+
+        if to_emit.is_empty() {
+            cancel.store(true, Ordering::SeqCst);
+        } else {
+            let command = if start == end {
+                format!("FETCH {start} (UID X-GM-LABELS)")
+            } else {
+                format!("FETCH {start}:{end} (UID X-GM-LABELS)")
+            };
+            if let Err(err) = self.fetch_gmail_labels_command(session, &command).await {
+                eprintln!("Gmail backfill label fetch error: {err:?}");
+            }
+        }
+
+        drop(session_guard);
+        let restart_result = self.start_idle_loop().await;
+
+        for message in to_emit {
+            self.emit_event(BackendEvent::NewMessage(message));
+        }
+
+        restart_result
+    }
+
     /// Resolve the IMAP mailbox name for `mailbox`.
     async fn mailbox_name(&self, mailbox: MailboxKind) -> Result<String> {
         let labels = self.labels.lock().await;
@@ -564,24 +710,34 @@ impl GmailInner {
     }
 
     /// Select the given mailbox so subsequent fetches operate on the right context.
-    async fn select_mailbox(&self, mailbox: MailboxKind) -> Result<()> {
+    async fn select_mailbox(&self, mailbox: MailboxKind) -> Result<u32> {
         let name = self.mailbox_name(mailbox).await?;
         let mut guard = self.session.lock().await;
         let session = guard
             .as_mut()
             .ok_or_else(|| anyhow!("IMAP session is not available"))?;
-        session
+        let mailbox_info = session
             .select(&name)
             .await
             .with_context(|| format!("selecting mailbox {name}"))?;
-        Ok(())
+        Ok(mailbox_info.exists)
     }
 
     /// Refresh the cached state for the currently selected mailbox.
-    async fn refresh_selected_mailbox(&self) -> Result<Vec<Message>> {
-        let query = "(FLAGS INTERNALDATE RFC822.SIZE ENVELOPE UID BODYSTRUCTURE)";
+    async fn refresh_selected_mailbox(&self, exists: u32) -> Result<Vec<Message>> {
         let mut messages = Vec::new();
         let mut new_state = SharedState::default();
+        new_state.set_expected_exists(exists);
+
+        if exists == 0 {
+            let mut state_guard = self.state.lock().await;
+            *state_guard = new_state;
+            return Ok(messages);
+        }
+
+        let end = exists;
+        let fetch_count = INITIAL_FETCH_LIMIT.min(exists);
+        let start = end - fetch_count + 1;
 
         {
             let mut session_guard = self.session.lock().await;
@@ -589,32 +745,62 @@ impl GmailInner {
                 .as_mut()
                 .ok_or_else(|| anyhow!("IMAP session is not available"))?;
 
-            let mut fetch_stream = session.fetch("1:*", query).await?;
-            while let Some(fetch) = fetch_stream.try_next().await? {
-                if let Some(stored) = build_message_from_fetch(&fetch)? {
-                    messages.push(stored.message.clone());
-                    new_state.insert(stored);
-                }
+            let stored_messages = self
+                .fetch_message_range(session, start, end)
+                .await
+                .context("fetching initial mailbox slice")?;
+
+            for stored in stored_messages {
+                messages.push(stored.message.clone());
+                new_state.insert(stored);
+            }
+
+            if !messages.is_empty() {
+                let command = if start == end {
+                    format!("FETCH {start} (UID X-GM-LABELS)")
+                } else {
+                    format!("FETCH {start}:{end} (UID X-GM-LABELS)")
+                };
+                self.fetch_gmail_labels_command(session, &command).await?;
             }
         }
 
-        messages.sort_by_key(|msg| msg.sent);
+        messages.sort_by_key(|msg| msg.seq);
 
         {
             let mut state_guard = self.state.lock().await;
             *state_guard = new_state;
         }
 
-        if !messages.is_empty() {
-            let mut session_guard = self.session.lock().await;
-            let session = session_guard
-                .as_mut()
-                .ok_or_else(|| anyhow!("IMAP session is not available"))?;
-            self.fetch_gmail_labels_command(session, "FETCH 1:* (UID X-GM-LABELS)")
-                .await?;
+        Ok(messages)
+    }
+
+    async fn fetch_message_range(
+        &self,
+        session: &mut AsyncSession,
+        start: u32,
+        end: u32,
+    ) -> Result<Vec<StoredMessage>> {
+        if start == 0 || end == 0 || start > end {
+            return Ok(Vec::new());
         }
 
-        Ok(messages)
+        let range = if start == end {
+            start.to_string()
+        } else {
+            format!("{start}:{end}")
+        };
+
+        let mut fetch_stream = session.fetch(&range, FETCH_MESSAGE_QUERY).await?;
+        let mut collected = Vec::new();
+
+        while let Some(fetch) = fetch_stream.try_next().await? {
+            if let Some(stored) = build_message_from_fetch(&fetch)? {
+                collected.push(stored);
+            }
+        }
+
+        Ok(collected)
     }
 
     /// Discover the Gmail archive and trash mailboxes so we can move messages later.
@@ -1077,40 +1263,52 @@ impl GmailInner {
         session: &mut AsyncSession,
         remote_count: u32,
     ) -> Result<Option<String>> {
-        let current = {
-            let state = self.state.lock().await;
-            state.len() as u32
+        let start = {
+            let mut state = self.state.lock().await;
+            let expected = state.expected_exists();
+            if remote_count <= expected {
+                state.set_expected_exists(remote_count);
+                return Ok(None);
+            }
+            let start = expected + 1;
+            state.set_expected_exists(remote_count);
+            start
         };
 
-        if remote_count <= current {
+        if start > remote_count {
             return Ok(None);
         }
 
-        let start = current + 1;
-        let range = format!("{start}:{remote_count}");
-        let query = "(FLAGS INTERNALDATE RFC822.SIZE ENVELOPE UID BODYSTRUCTURE)";
-        let mut has_new_messages = false;
-        {
-            let mut fetches = session.fetch(&range, query).await?;
+        let range = if start == remote_count {
+            start.to_string()
+        } else {
+            format!("{start}:{remote_count}")
+        };
 
-            while let Some(fetch) = fetches.try_next().await? {
-                if let Some(stored) = build_message_from_fetch(&fetch)? {
-                    let message = stored.message.clone();
-                    {
-                        let mut state = self.state.lock().await;
-                        state.insert(stored);
-                    }
-                    self.emit_event(BackendEvent::NewMessage(message));
-                    has_new_messages = true;
-                }
+        let stored_messages = self
+            .fetch_message_range(session, start, remote_count)
+            .await
+            .with_context(|| format!("fetching new message range {range}"))?;
+
+        if stored_messages.is_empty() {
+            return Ok(None);
+        }
+
+        let mut to_emit = Vec::with_capacity(stored_messages.len());
+        {
+            let mut state = self.state.lock().await;
+            for stored in stored_messages {
+                let message = stored.message.clone();
+                state.insert(stored);
+                to_emit.push(message);
             }
         }
 
-        if has_new_messages {
-            Ok(Some(range))
-        } else {
-            Ok(None)
+        for message in to_emit {
+            self.emit_event(BackendEvent::NewMessage(message));
         }
+
+        Ok(Some(range))
     }
 
     async fn handle_fetch_update(
@@ -1186,7 +1384,7 @@ impl GmailInner {
     async fn handle_expunge(&self, seq: u32) {
         let removed = {
             let mut state = self.state.lock().await;
-            state.remove_by_seq(seq)
+            state.expunge(seq)
         };
 
         if let Some(msg) = removed {
@@ -1336,8 +1534,34 @@ impl GmailInner {
 }
 
 impl SharedState {
-    fn len(&self) -> usize {
-        self.messages.len()
+    fn set_expected_exists(&mut self, count: u32) {
+        self.expected_exists = count;
+    }
+
+    fn expected_exists(&self) -> u32 {
+        self.expected_exists
+    }
+
+    fn lowest_loaded_seq(&self) -> Option<u32> {
+        self.seq_to_id.keys().next().copied()
+    }
+
+    fn next_backfill_range(&self, batch_size: usize) -> Option<(u32, u32)> {
+        let lowest = self.lowest_loaded_seq()?;
+        if lowest <= 1 {
+            return None;
+        }
+        let end = lowest - 1;
+        let chunk = batch_size as u32;
+        let start = if end + 1 > chunk { end + 1 - chunk } else { 1 };
+        Some((start, end))
+    }
+
+    fn expunge(&mut self, seq: u32) -> Option<Message> {
+        if self.expected_exists > 0 {
+            self.expected_exists -= 1;
+        }
+        self.remove_by_seq(seq)
     }
 
     fn insert(&mut self, mut stored: StoredMessage) {

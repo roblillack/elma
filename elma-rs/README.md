@@ -127,7 +127,8 @@ Message status is indicated by a four symbol character prefix in the message lis
 - [ ] Implement search (`/` and `n`/`N`)
 - [x] Implement composing new message (`c`)
 - [ ] Implement help overlay (`?`)
-- [x] Implement `j` and `k` to move to next/previous message in mailbox view
+- [ ] Implement `j` and `k` to move to next/previous message in mailbox view
+- [x] Implement `j` and `k` to move to next/previous message in message view
 - [ ] Implement `.` to open context menu for selected message
 - [x] Add support for multiple accounts/backends (`G` to Go to different account?)
 - [x] In "Drafts" mailbox, show recipients in the message list
@@ -142,7 +143,7 @@ Message status is indicated by a four symbol character prefix in the message lis
 - [ ] Add theming support (light/dark mode, custom colours)
 - [x] Log network actions and user events for debugging
 - [ ] Formatted date does not match web interface -- are we missing locale info somewhere?
-- [ ] Load mailbox while already showing it
+- [x] Load mailbox while already showing it
 - [ ] Only start connecting to backends when the user first tries to access them
 - [ ] Backends should be able to express if they have support for "Important" flags & virtual folders
 - [ ] Backends should be able to express if they have support for "Archive" vs "All Mail" folders (Gmail, sadly, does not have a true Archive folder)
