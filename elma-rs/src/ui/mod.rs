@@ -619,6 +619,7 @@ fn render_message_body(frame: &mut Frame<'_>, view: &MessageViewState, area: Rec
 
 fn message_action_bar(app: &App, view: &MessageViewState) -> String {
     let mut text = String::from("q:Close s:Star r:Reply f:Forward y:Archive d:Delete");
+    text.push_str(" Up/Down/Space:Scroll");
 
     let total = app.inbox_messages().len();
     let mut entries = Vec::new();

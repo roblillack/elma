@@ -1553,11 +1553,24 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {
                 self.message_view = None;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Char('j') | KeyCode::Char('J') => {
                 self.open_adjacent_message(1)?;
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            KeyCode::Char('k') | KeyCode::Char('K') => {
                 self.open_adjacent_message(-1)?;
+            }
+            KeyCode::Down => {
+                view.scroll = view.scroll.saturating_add(1);
+            }
+            KeyCode::Up => {
+                view.scroll = view.scroll.saturating_sub(1);
+            }
+            KeyCode::Char(' ') => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    view.scroll = view.scroll.saturating_sub(5);
+                } else {
+                    view.scroll = view.scroll.saturating_add(5);
+                }
             }
             KeyCode::PageDown => {
                 view.scroll = view.scroll.saturating_add(5);
