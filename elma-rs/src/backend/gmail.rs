@@ -292,6 +292,7 @@ type AsyncSession = Session<LoggedTlsStream>;
 const GMAIL_HOST: &str = "imap.gmail.com";
 const GMAIL_PORT: u16 = 993;
 const DEFAULT_STARRED_LABEL: &str = "[Gmail]/Starred";
+const DEFAULT_IMPORTANT_LABEL: &str = "[Gmail]/Important";
 const DEFAULT_ARCHIVE_LABEL: &str = "[Gmail]/All Mail";
 const DEFAULT_SPAM_LABEL: &str = "[Gmail]/Spam";
 const DEFAULT_SENT_LABEL: &str = "[Gmail]/Sent Mail";
@@ -344,6 +345,7 @@ struct StoredMessage {
 #[derive(Clone)]
 struct SpecialMailboxes {
     starred: String,
+    important: String,
     archive: String,
     spam: String,
     sent: String,
@@ -355,6 +357,7 @@ impl Default for SpecialMailboxes {
     fn default() -> Self {
         Self {
             starred: DEFAULT_STARRED_LABEL.to_string(),
+            important: DEFAULT_IMPORTANT_LABEL.to_string(),
             archive: DEFAULT_ARCHIVE_LABEL.to_string(),
             spam: DEFAULT_SPAM_LABEL.to_string(),
             sent: DEFAULT_SENT_LABEL.to_string(),
@@ -547,6 +550,7 @@ impl GmailInner {
         let name = match mailbox {
             MailboxKind::Inbox => "INBOX".to_string(),
             MailboxKind::Starred => labels.starred.clone(),
+            MailboxKind::Important => labels.important.clone(),
             MailboxKind::Sent => labels.sent.clone(),
             MailboxKind::Drafts => labels.drafts.clone(),
             MailboxKind::Archive => labels.archive.clone(),
@@ -626,37 +630,45 @@ impl GmailInner {
         let mut trash = None;
         let mut spam = None;
         let mut starred = None;
+        let mut important = None;
         let mut sent = None;
         let mut drafts = None;
 
         while let Some(name) = list_stream.try_next().await? {
             let attrs = name.attributes();
+            let entry_name = name.name().to_string();
             if attrs.iter().any(|attr| matches!(attr, NameAttribute::All)) {
-                archive = Some(name.name().to_string());
+                archive = Some(entry_name.clone());
             }
             if attrs
                 .iter()
                 .any(|attr| matches!(attr, NameAttribute::Trash))
             {
-                trash = Some(name.name().to_string());
+                trash = Some(entry_name.clone());
             }
             if attrs.iter().any(|attr| matches!(attr, NameAttribute::Junk)) {
-                spam = Some(name.name().to_string());
+                spam = Some(entry_name.clone());
             }
             if attrs
                 .iter()
                 .any(|attr| matches!(attr, NameAttribute::Flagged))
             {
-                starred = Some(name.name().to_string());
+                starred = Some(entry_name.clone());
+            }
+            if important.is_none() {
+                let lower = entry_name.to_ascii_lowercase();
+                if lower == "\\important" || lower == "important" || lower.ends_with("/important") {
+                    important = Some(entry_name.clone());
+                }
             }
             if attrs.iter().any(|attr| matches!(attr, NameAttribute::Sent)) {
-                sent = Some(name.name().to_string());
+                sent = Some(entry_name.clone());
             }
             if attrs
                 .iter()
                 .any(|attr| matches!(attr, NameAttribute::Drafts))
             {
-                drafts = Some(name.name().to_string());
+                drafts = Some(entry_name);
             }
         }
 
@@ -673,6 +685,9 @@ impl GmailInner {
             }
             if let Some(value) = starred {
                 labels.starred = value;
+            }
+            if let Some(value) = important {
+                labels.important = value;
             }
             if let Some(value) = sent {
                 labels.sent = value;
@@ -1133,10 +1148,10 @@ impl GmailInner {
             let mut changed = false;
 
             if let Some(flag_list) = flags {
-                let (status, starred, answered, forwarded) =
+                let (status, starred, answered, forwarded, important) =
                     summarize_flags_from_names(flag_list.iter().map(|s| s.as_str()));
                 if state
-                    .apply_flag_values(uid, status, starred, answered, forwarded)
+                    .apply_flag_values(uid, status, starred, answered, forwarded, important)
                     .is_some()
                 {
                     changed = true;
@@ -1219,6 +1234,14 @@ impl GmailInner {
                 self.update_flags(action.message_id, "-FLAGS.SILENT (\\Flagged)")
                     .await
             }
+            ActionType::MarkAsImportant => {
+                self.update_flags(action.message_id, "+FLAGS.SILENT (\\Important)")
+                    .await
+            }
+            ActionType::MarkAsUnimportant => {
+                self.update_flags(action.message_id, "-FLAGS.SILENT (\\Important)")
+                    .await
+            }
         }
     }
 
@@ -1274,7 +1297,7 @@ impl GmailInner {
             let mut stream = session.uid_store(&uid_arg, query).await?;
 
             while let Some(fetch) = stream.try_next().await? {
-                let (status, starred, answered, forwarded) =
+                let (status, starred, answered, forwarded, important) =
                     summarize_flags_from_flag_iter(fetch.flags());
                 let mut state = self.state.lock().await;
                 if let Some(message) = state.apply_flag_values(
@@ -1283,6 +1306,7 @@ impl GmailInner {
                     starred,
                     answered,
                     forwarded,
+                    important,
                 ) {
                     updated = Some(message);
                 }
@@ -1353,6 +1377,7 @@ impl SharedState {
         starred: bool,
         answered: bool,
         forwarded: bool,
+        important: bool,
     ) -> Option<Message> {
         let id = *self.uid_to_id.get(&uid)?;
         let stored = self.messages.get_mut(&id)?;
@@ -1361,12 +1386,14 @@ impl SharedState {
         let changed = status != updated.status
             || starred != updated.starred
             || answered != updated.answered
-            || forwarded != updated.forwarded;
+            || forwarded != updated.forwarded
+            || important != updated.important;
 
         updated.status = status;
         updated.starred = starred;
         updated.answered = answered;
         updated.forwarded = forwarded;
+        updated.important = important;
 
         if changed {
             stored.message = updated.clone();
@@ -1379,10 +1406,14 @@ impl SharedState {
     fn update_labels(&mut self, uid: u32, labels: Vec<String>) -> Option<Message> {
         let id = *self.uid_to_id.get(&uid)?;
         let stored = self.messages.get_mut(&id)?;
-        if stored.message.labels == labels {
+        let important = labels.iter().any(|label| label_is_important(label));
+        let labels_changed = stored.message.labels != labels;
+        let important_changed = stored.message.important != important;
+        if !labels_changed && !important_changed {
             return None;
         }
         stored.message.labels = labels;
+        stored.message.important = important;
         Some(stored.message.clone())
     }
 }
@@ -1416,6 +1447,9 @@ fn build_message_from_fetch(fetch: &Fetch) -> Result<Option<StoredMessage>> {
     let starred = flags.iter().any(|flag| matches!(flag, Flag::Flagged));
     let answered = flags.iter().any(|flag| matches!(flag, Flag::Answered));
     let forwarded = flags.iter().any(|flag| matches!(flag, Flag::Custom(name) if name.eq_ignore_ascii_case("\\Forwarded") || name.eq_ignore_ascii_case("$Forwarded")));
+    let important = flags
+        .iter()
+        .any(|flag| matches!(flag, Flag::Custom(name) if name.eq_ignore_ascii_case("\\Important")));
 
     let message = Message {
         id: uid as u64,
@@ -1425,6 +1459,7 @@ fn build_message_from_fetch(fetch: &Fetch) -> Result<Option<StoredMessage>> {
         subject,
         size,
         starred,
+        important,
         answered,
         forwarded,
         status,
@@ -1564,7 +1599,15 @@ fn decode_envelope_address(
     }
 }
 
-fn summarize_flags_from_names<'a, I>(flags: I) -> (MessageStatus, bool, bool, bool)
+fn label_is_important(label: &str) -> bool {
+    let normalized = label.trim().trim_matches('"').to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "\\\\important" | "important" | "[gmail]/important"
+    )
+}
+
+fn summarize_flags_from_names<'a, I>(flags: I) -> (MessageStatus, bool, bool, bool, bool)
 where
     I: IntoIterator<Item = &'a str>,
 {
@@ -1572,12 +1615,14 @@ where
     let mut starred = false;
     let mut answered = false;
     let mut forwarded = false;
+    let mut important = false;
 
     for flag in flags {
         match flag {
             "\\Seen" => seen = true,
             "\\Flagged" => starred = true,
             "\\Answered" => answered = true,
+            "\\Important" => important = true,
             value
                 if value.eq_ignore_ascii_case("\\Forwarded")
                     || value.eq_ignore_ascii_case("$Forwarded") =>
@@ -1594,10 +1639,10 @@ where
         MessageStatus::New
     };
 
-    (status, starred, answered, forwarded)
+    (status, starred, answered, forwarded, important)
 }
 
-fn summarize_flags_from_flag_iter<'a, I>(flags: I) -> (MessageStatus, bool, bool, bool)
+fn summarize_flags_from_flag_iter<'a, I>(flags: I) -> (MessageStatus, bool, bool, bool, bool)
 where
     I: IntoIterator<Item = Flag<'a>>,
 {
@@ -1605,12 +1650,14 @@ where
     let mut starred = false;
     let mut answered = false;
     let mut forwarded = false;
+    let mut important = false;
 
     for flag in flags {
         match flag {
             Flag::Seen => seen = true,
             Flag::Flagged => starred = true,
             Flag::Answered => answered = true,
+            Flag::Custom(name) if name.eq_ignore_ascii_case("\\Important") => important = true,
             Flag::Custom(name)
                 if name.eq_ignore_ascii_case("\\Forwarded")
                     || name.eq_ignore_ascii_case("$Forwarded") =>
@@ -1627,7 +1674,7 @@ where
         MessageStatus::New
     };
 
-    (status, starred, answered, forwarded)
+    (status, starred, answered, forwarded, important)
 }
 
 #[cfg(test)]
@@ -1643,6 +1690,7 @@ mod tests {
             subject: format!("subject{id}"),
             size: 0,
             starred: false,
+            important: false,
             answered: false,
             forwarded: false,
             status: MessageStatus::New,

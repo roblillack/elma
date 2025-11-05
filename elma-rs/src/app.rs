@@ -681,6 +681,7 @@ impl ShortcutMenuState {
         let items = vec![
             ShortcutItem::mailbox('i', "Inbox", MailboxKind::Inbox),
             ShortcutItem::mailbox('s', "Starred", MailboxKind::Starred),
+            ShortcutItem::mailbox('I', "Important", MailboxKind::Important),
             ShortcutItem::mailbox('t', "Sent", MailboxKind::Sent),
             ShortcutItem::mailbox('d', "Drafts", MailboxKind::Drafts),
             ShortcutItem::mailbox('a', "Archive", MailboxKind::Archive),
@@ -1362,6 +1363,11 @@ impl App {
                 } else {
                     text.push_str(" s:Star");
                 }
+                if msg.important {
+                    text.push_str(" -:NotImportant");
+                } else {
+                    text.push_str(" +/=:Important");
+                }
 
                 let current_mailbox = self.current_mailbox;
                 let in_archive = current_mailbox == MailboxKind::Archive;
@@ -1495,6 +1501,8 @@ impl App {
             KeyCode::Home => self.select_first(),
             KeyCode::End => self.select_last(),
             KeyCode::Char('s') | KeyCode::Char('S') => self.toggle_star(),
+            KeyCode::Char('+') | KeyCode::Char('=') => self.mark_selected_important(true),
+            KeyCode::Char('-') => self.mark_selected_important(false),
             KeyCode::Char('y') | KeyCode::Char('Y') => self.schedule_archive(),
             KeyCode::Char('u') | KeyCode::Char('U') => self.toggle_unread(),
             KeyCode::Char('c') | KeyCode::Char('C') => self.open_compose(),
@@ -1548,6 +1556,50 @@ impl App {
                     if let Some(view) = self.message_view.as_mut() {
                         if view.message_id == id {
                             view.message.starred = starred;
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        if matches!(key.code, KeyCode::Char('+') | KeyCode::Char('=')) {
+            let current_id = self.message_view.as_ref().map(|view| view.message_id);
+            self.mark_selected_important(true);
+            if let Some(id) = current_id {
+                let important = self
+                    .mailbox
+                    .messages
+                    .iter()
+                    .find(|message| message.id == id)
+                    .map(|msg| msg.important);
+
+                if let Some(important) = important {
+                    if let Some(view) = self.message_view.as_mut() {
+                        if view.message_id == id {
+                            view.message.important = important;
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        if matches!(key.code, KeyCode::Char('-')) {
+            let current_id = self.message_view.as_ref().map(|view| view.message_id);
+            self.mark_selected_important(false);
+            if let Some(id) = current_id {
+                let important = self
+                    .mailbox
+                    .messages
+                    .iter()
+                    .find(|message| message.id == id)
+                    .map(|msg| msg.important);
+
+                if let Some(important) = important {
+                    if let Some(view) = self.message_view.as_mut() {
+                        if view.message_id == id {
+                            view.message.important = important;
                         }
                     }
                 }
@@ -1987,6 +2039,33 @@ impl App {
         self.sync_message_view_state();
     }
 
+    fn mark_selected_important(&mut self, important: bool) {
+        let Some(idx) = self.mailbox.selected else {
+            return;
+        };
+
+        let (action_type, message_id) = match self.mailbox.messages.get_mut(idx) {
+            Some(msg) => {
+                if msg.important == important {
+                    return;
+                }
+                msg.important = important;
+                let ty = if important {
+                    ActionType::MarkAsImportant
+                } else {
+                    ActionType::MarkAsUnimportant
+                };
+                (ty, msg.id)
+            }
+            None => return,
+        };
+
+        self.scheduled_actions
+            .push(Action::new(action_type, message_id));
+        self.mailbox.status_line = None;
+        self.sync_message_view_state();
+    }
+
     fn schedule_archive(&mut self) {
         if self.current_mailbox == MailboxKind::Archive {
             self.schedule_move_to_inbox();
@@ -2315,6 +2394,7 @@ impl App {
             labels: message.labels.clone(),
             status: message.status,
             starred: message.starred,
+            important: message.important,
         }
     }
 }
@@ -2330,6 +2410,7 @@ pub(crate) struct MessageRow {
     pub(crate) labels: Vec<String>,
     pub(crate) status: MessageStatus,
     pub(crate) starred: bool,
+    pub(crate) important: bool,
 }
 
 impl App {

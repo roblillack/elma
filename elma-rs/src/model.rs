@@ -17,6 +17,7 @@ pub enum MessageStatus {
 pub enum MailboxKind {
     Inbox,
     Starred,
+    Important,
     Sent,
     Drafts,
     Archive,
@@ -25,9 +26,10 @@ pub enum MailboxKind {
 }
 
 impl MailboxKind {
-    pub const ALL: [MailboxKind; 7] = [
+    pub const ALL: [MailboxKind; 8] = [
         MailboxKind::Inbox,
         MailboxKind::Starred,
+        MailboxKind::Important,
         MailboxKind::Sent,
         MailboxKind::Drafts,
         MailboxKind::Archive,
@@ -40,6 +42,7 @@ impl MailboxKind {
         match self {
             MailboxKind::Inbox => "Inbox",
             MailboxKind::Starred => "Starred",
+            MailboxKind::Important => "Important",
             MailboxKind::Sent => "Sent",
             MailboxKind::Drafts => "Drafts",
             MailboxKind::Archive => "Archive",
@@ -58,6 +61,7 @@ pub struct Message {
     pub subject: String,
     pub size: usize,
     pub starred: bool,
+    pub important: bool,
     pub answered: bool,
     pub forwarded: bool,
     pub status: MessageStatus,
@@ -68,7 +72,7 @@ pub struct Message {
 
 impl Message {
     pub fn flag_string(&self) -> String {
-        let mut flags = [' ', ' ', ' '];
+        let mut flags = [' ', ' ', ' ', ' '];
 
         flags[0] = match self.status {
             MessageStatus::Archived => 'A',
@@ -79,9 +83,12 @@ impl Message {
             MessageStatus::Spam => '!',
         };
 
-        if self.starred {
-            flags[1] = '*';
-        }
+        flags[1] = match (self.important, self.starred) {
+            (false, false) => ' ',
+            (false, true) => '*',
+            (true, false) => '○',
+            (true, true) => '⊛',
+        };
 
         flags[2] = match (self.forwarded, self.answered) {
             (true, true) => '⇄',
@@ -143,6 +150,8 @@ pub enum ActionType {
     MoveToInboxRead,
     MarkAsStarred,
     MarkAsUnstarred,
+    MarkAsImportant,
+    MarkAsUnimportant,
     MoveToSpam,
 }
 

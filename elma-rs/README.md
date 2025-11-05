@@ -81,8 +81,8 @@ Message status is indicated by a four symbol character prefix in the message lis
 2. Starred/unstarred and important status:
    - ` `: Regular message
    - `*`: Starred
-   - `○`: Marked as important (alternatively: `+`) (TODO)
-   - `⊛`: Marked as important and starred (alternatively: `#`) (TODO)
+   - `+`: Marked as important
+   - `#`: Marked as important and starred
 3. Reply/forward state:
    - ` `: No reply/forward
    - `↩`: This message has been replied to
@@ -106,6 +106,7 @@ Message status is indicated by a four symbol character prefix in the message lis
   - `i` Inbox
   - `a` Archive
   - `s` Starred
+  - `I` Important
   - `d` Drafts
   - `t` Sent
   - `S` Spam (Should be `j` or even `!`?)
@@ -120,9 +121,9 @@ Message status is indicated by a four symbol character prefix in the message lis
 - [ ] Implement `r` to reply to message
 - [ ] Implement `a` to reply all
 - [ ] Implement `f` to forward message
-- [ ] Add "Important" flag support
+- [x] Add "Important" flag support
 - [ ] Add attachment indicator to message list
-- [ ] `=`/`+` and `-` to mark as important/unimportant
+- [x] `=`/`+` and `-` to mark as important/unimportant
 - [ ] Implement search (`/` and `n`/`N`)
 - [x] Implement composing new message (`c`)
 - [ ] Implement help overlay (`?`)

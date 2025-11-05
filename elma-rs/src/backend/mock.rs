@@ -13,7 +13,7 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::Range,
     sync::{
         Arc, Mutex,
@@ -97,6 +97,7 @@ impl MockBackend {
         }
 
         let templates = [
+            (MailboxKind::Important, 30usize, MessageStatus::Read),
             (MailboxKind::Starred, 40usize, MessageStatus::Read),
             (MailboxKind::Sent, 25usize, MessageStatus::Read),
             (MailboxKind::Drafts, 12usize, MessageStatus::New),
@@ -118,6 +119,10 @@ impl MockBackend {
                     MailboxKind::Starred => {
                         message.starred = true;
                         message.labels = vec!["Starred".to_string()];
+                    }
+                    MailboxKind::Important => {
+                        message.important = true;
+                        message.labels = vec!["Important".to_string()];
                     }
                     MailboxKind::Sent => {
                         message.labels = vec!["Sent".to_string()];
@@ -149,6 +154,14 @@ impl MockBackend {
                         }
                     }
                     MailboxKind::Inbox => {}
+                }
+                if message.important
+                    && !message
+                        .labels
+                        .iter()
+                        .any(|label| label.eq_ignore_ascii_case("Important"))
+                {
+                    message.labels.push("Important".to_string());
                 }
                 update_mailer(&mut content, message.status);
                 contents.insert(id, content);
@@ -332,6 +345,23 @@ impl MockBackend {
                     .labels
                     .retain(|label| !label.eq_ignore_ascii_case("Starred"));
             }
+            ActionType::MarkAsImportant => {
+                mock.message.important = true;
+                if !mock
+                    .message
+                    .labels
+                    .iter()
+                    .any(|label| label.eq_ignore_ascii_case("Important"))
+                {
+                    mock.message.labels.push("Important".to_string());
+                }
+            }
+            ActionType::MarkAsUnimportant => {
+                mock.message.important = false;
+                mock.message
+                    .labels
+                    .retain(|label| !label.eq_ignore_ascii_case("Important"));
+            }
         }
 
         if let Some(content) = contents.get_mut(&action.message_id) {
@@ -387,6 +417,7 @@ impl MockBackend {
             subject,
             size,
             starred: false,
+            important: false,
             answered: false,
             forwarded: false,
             status,
@@ -423,13 +454,28 @@ impl MailBackend for MockBackend {
     fn load_mailbox(&self, mailbox: MailboxKind) -> Result<(Vec<Message>, Receiver<BackendEvent>)> {
         let mut messages = {
             let mailboxes = self.mailboxes.lock().expect("mailboxes mutex poisoned");
-            let list = mailboxes
-                .get(&mailbox)
-                .ok_or_else(|| anyhow!("mailbox {mailbox:?} not found"))?
-                .iter()
-                .map(|mock| mock.message.clone())
-                .collect::<Vec<_>>();
-            list
+            if mailbox == MailboxKind::Important {
+                let mut seen = HashSet::new();
+                let mut collected = Vec::new();
+                for list in mailboxes.values() {
+                    for mock in list {
+                        if !mock.message.important {
+                            continue;
+                        }
+                        if seen.insert(mock.message.id) {
+                            collected.push(mock.message.clone());
+                        }
+                    }
+                }
+                collected
+            } else {
+                mailboxes
+                    .get(&mailbox)
+                    .ok_or_else(|| anyhow!("mailbox {mailbox:?} not found"))?
+                    .iter()
+                    .map(|mock| mock.message.clone())
+                    .collect::<Vec<_>>()
+            }
         };
 
         messages.sort_by_key(|msg| msg.sent);
@@ -520,6 +566,12 @@ fn new_random_message(
 
     let size = rng.gen_range_usize(0..7_203_680) + 200;
 
+    let important = rng.one_in(6);
+    let mut labels = Vec::new();
+    if important {
+        labels.push("Important".to_string());
+    }
+
     let message = Message {
         id,
         sent,
@@ -528,10 +580,11 @@ fn new_random_message(
         subject,
         size,
         starred: false,
+        important,
         answered: false,
         forwarded: false,
         status: MessageStatus::New,
-        labels: Vec::new(),
+        labels,
         uid: id as u32,
         seq: 0,
     };

@@ -461,7 +461,7 @@ fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let now = OffsetDateTime::now_utc();
     let widths = [
         Constraint::Length(6),
-        Constraint::Length(3),
+        Constraint::Length(4),
         Constraint::Length(14),
         Constraint::Length(21),
         Constraint::Length(5),
@@ -470,7 +470,7 @@ fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let column_spacing = 1u16;
     let subject_column_width = area
         .width
-        .saturating_sub(6 + 3 + 14 + 21 + 5 + column_spacing * (widths.len() as u16 - 1));
+        .saturating_sub(6 + 4 + 14 + 21 + 5 + column_spacing * (widths.len() as u16 - 1));
 
     let selected_index = app.inbox_selected();
     let visible_rows = messages
@@ -859,7 +859,9 @@ fn render_message_body(frame: &mut Frame<'_>, view: &MessageViewState, area: Rec
 }
 
 fn message_action_bar(app: &App, view: &MessageViewState) -> String {
-    let mut text = String::from("q:Close s:Star r:Reply f:Forward y:Archive d:Delete");
+    let mut text = String::from(
+        "q:Close s:Star +/=:Important -:NotImportant r:Reply f:Forward y:Archive d:Delete",
+    );
     text.push_str(" Up/Down/Space:Scroll");
 
     let total = app.inbox_messages().len();
