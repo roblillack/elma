@@ -122,10 +122,10 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
-    let Some(state) = app.compose_state() else {
+    if app.compose_state().is_none() {
         render_inbox(frame, app);
         return;
-    };
+    }
 
     let frame_area = frame.size();
     let dialog_width = if frame_area.width >= 90 {
@@ -197,25 +197,28 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
 
     let mut cursor_pos = None;
 
-    for (area, label, field) in [
-        (field_rows[0], "To", ComposeField::To),
-        (field_rows[1], "Cc", ComposeField::Cc),
-        (field_rows[2], "Bcc", ComposeField::Bcc),
-        (field_rows[3], "Subject", ComposeField::Subject),
-    ] {
-        if cursor_pos.is_none() {
-            cursor_pos = render_compose_field(frame, area, state, label, field);
-        } else {
-            render_compose_field(frame, area, state, label, field);
+    {
+        let state = app.compose_state().expect("compose state should exist");
+        for (area, label, field) in [
+            (field_rows[0], "To", ComposeField::To),
+            (field_rows[1], "Cc", ComposeField::Cc),
+            (field_rows[2], "Bcc", ComposeField::Bcc),
+            (field_rows[3], "Subject", ComposeField::Subject),
+        ] {
+            if cursor_pos.is_none() {
+                cursor_pos = render_compose_field(frame, area, state, label, field);
+            } else {
+                render_compose_field(frame, area, state, label, field);
+            }
         }
     }
 
-    if cursor_pos.is_none() {
-        cursor_pos = render_compose_content(frame, layout[2], state);
-    } else {
-        render_compose_content(frame, layout[2], state);
+    render_compose_body(frame, layout[2], app);
+
+    {
+        let state = app.compose_state().expect("compose state should exist");
+        render_compose_buttons(frame, layout[3], state);
     }
-    render_compose_buttons(frame, layout[3], state);
 
     let status_text = app
         .compose_status_line()
@@ -228,8 +231,6 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
 
     if let Some((x, y)) = cursor_pos {
         frame.set_cursor(x, y);
-    } else {
-        frame.set_cursor(modal_area.x + 1, modal_area.y + 1);
     }
 }
 
@@ -294,33 +295,77 @@ fn render_compose_field(
     Some((cursor_x, area.y))
 }
 
-fn render_compose_content(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    state: &ComposeState,
-) -> Option<(u16, u16)> {
+fn render_compose_body(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if area.height == 0 || area.width == 0 {
-        return None;
+        if let Some(state) = app.compose_state_mut() {
+            state.set_body_view_height(0);
+            state.set_body_scroll(0);
+        }
+        return;
     }
 
-    let focused = state.is_field_focused(ComposeField::Content);
-    let (value, _) = state.field_data(ComposeField::Content);
-    let (before, _) = state.field_parts(ComposeField::Content);
-    let placeholder_style = Style::default().fg(Color::DarkGray);
+    let (focused, all_lines) = {
+        let Some(state) = app.compose_state() else {
+            return;
+        };
 
-    let mut lines: Vec<Line> = Vec::new();
-    if value.is_empty() {
-        lines.push(Line::styled("<type your message>", placeholder_style));
-    } else {
-        for line in value.lines() {
-            lines.push(Line::raw(line.to_string()));
+        let focused = state.is_body_focused();
+        if state.body().is_empty() {
+            let placeholder = Line::styled(
+                "Press [Edit message] to compose.",
+                Style::default().fg(Color::DarkGray),
+            );
+            (focused, vec![placeholder])
+        } else {
+            match viewer::render_document(state.body(), area.width) {
+                Ok(lines) if lines.is_empty() => (focused, vec![Line::raw(String::new())]),
+                Ok(lines) => (
+                    focused,
+                    lines.into_iter().map(Line::raw).collect::<Vec<_>>(),
+                ),
+                Err(err) => (
+                    focused,
+                    vec![Line::styled(
+                        format!("Failed to render message body: {err}"),
+                        Style::default().fg(Color::Red),
+                    )],
+                ),
+            }
         }
-        if value.ends_with('\n') {
-            lines.push(Line::raw(String::new()));
+    };
+
+    let viewport = area.height as usize;
+    if viewport == 0 {
+        if let Some(state) = app.compose_state_mut() {
+            state.set_body_view_height(0);
+            state.set_body_scroll(0);
         }
+        return;
     }
 
-    if lines.is_empty() {
+    let visible_count = viewport.max(1);
+
+    let scroll = {
+        let Some(state) = app.compose_state_mut() else {
+            return;
+        };
+        state.set_body_view_height(visible_count);
+        let max_scroll = all_lines.len().saturating_sub(visible_count);
+        let clamped = state.body_scroll().min(max_scroll);
+        if clamped != state.body_scroll() {
+            state.set_body_scroll(clamped);
+        }
+        clamped
+    };
+
+    let mut lines: Vec<Line> = all_lines
+        .iter()
+        .skip(scroll)
+        .take(visible_count)
+        .cloned()
+        .collect();
+
+    while lines.len() < visible_count {
         lines.push(Line::raw(String::new()));
     }
 
@@ -337,28 +382,6 @@ fn render_compose_content(
         .style(base_style)
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
-
-    if !focused {
-        return None;
-    }
-
-    let mut row: u16 = 0;
-    let mut col: u16 = 0;
-    for ch in before.chars() {
-        if ch == '\n' {
-            row = row.saturating_add(1);
-            col = 0;
-        } else {
-            col = col.saturating_add(1);
-        }
-    }
-
-    let max_y = area.y + area.height.saturating_sub(1);
-    let max_x = area.x + area.width.saturating_sub(1);
-    let cursor_y = (area.y + row).min(max_y);
-    let cursor_x = (area.x + col).min(max_x);
-
-    Some((cursor_x, cursor_y))
 }
 
 fn render_compose_buttons(frame: &mut Frame<'_>, area: Rect, state: &ComposeState) {
@@ -368,6 +391,7 @@ fn render_compose_buttons(frame: &mut Frame<'_>, area: Rect, state: &ComposeStat
 
     let buttons = [
         (ComposeButton::Cancel, "Cancel"),
+        (ComposeButton::Edit, "Edit message"),
         (ComposeButton::Draft, "Draft"),
         (ComposeButton::Send, "Send"),
     ];

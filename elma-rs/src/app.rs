@@ -12,19 +12,29 @@ use crate::model::{
 };
 use anyhow::{Context, Result, anyhow};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use shell_words::split as shell_split;
 use std::{
     cmp::{max, min},
     collections::VecDeque,
-    io::Cursor,
+    env, fs,
+    io::{Cursor, Write},
     ops::{Deref, DerefMut},
+    path::PathBuf,
+    process::Command,
     sync::{
         Arc,
         mpsc::{Receiver, TryRecvError},
     },
     thread,
 };
-use tdoc::{Document, html};
-use time::OffsetDateTime;
+use tdoc::{
+    Document, Paragraph, Span,
+    formatter::{Formatter, FormattingStyle},
+    html, markdown,
+    writer::Writer,
+};
+use tempfile::NamedTempFile;
+use time::{OffsetDateTime, format_description::well_known::Rfc2822};
 
 const PAGE_JUMP: isize = 5;
 const PROGRESS_SEGMENTS: usize = 5;
@@ -264,12 +274,12 @@ pub(crate) enum ComposeField {
     Cc,
     Bcc,
     Subject,
-    Content,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ComposeButton {
     Cancel,
+    Edit,
     Draft,
     Send,
 }
@@ -277,6 +287,7 @@ pub(crate) enum ComposeButton {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ComposeFocus {
     Field(ComposeField),
+    Body,
     Button(ComposeButton),
 }
 
@@ -286,21 +297,17 @@ struct TextFieldState {
     cursor: usize,
 }
 
-#[derive(Default)]
-struct TextAreaState {
-    value: String,
-    cursor: usize,
-}
-
 pub(crate) struct ComposeState {
     to: TextFieldState,
     cc: TextFieldState,
     bcc: TextFieldState,
     subject: TextFieldState,
-    content: TextAreaState,
+    body: Document,
     draft_id: Option<MessageId>,
     focus: ComposeFocus,
     status: Option<String>,
+    body_scroll: usize,
+    body_view_height: usize,
 }
 
 impl Default for ComposeState {
@@ -310,26 +317,33 @@ impl Default for ComposeState {
             cc: TextFieldState::default(),
             bcc: TextFieldState::default(),
             subject: TextFieldState::default(),
-            content: TextAreaState::default(),
+            body: Document::new(),
             draft_id: None,
             focus: ComposeFocus::Field(ComposeField::To),
             status: None,
+            body_scroll: 0,
+            body_view_height: 0,
         }
     }
 }
 
-const COMPOSE_FIELD_SEQUENCE: [ComposeField; 5] = [
-    ComposeField::To,
-    ComposeField::Cc,
-    ComposeField::Bcc,
-    ComposeField::Subject,
-    ComposeField::Content,
-];
-
-const COMPOSE_BUTTON_SEQUENCE: [ComposeButton; 3] = [
+const COMPOSE_BUTTON_SEQUENCE: [ComposeButton; 4] = [
     ComposeButton::Cancel,
+    ComposeButton::Edit,
     ComposeButton::Draft,
     ComposeButton::Send,
+];
+
+const COMPOSE_FOCUS_SEQUENCE: [ComposeFocus; 9] = [
+    ComposeFocus::Field(ComposeField::To),
+    ComposeFocus::Field(ComposeField::Cc),
+    ComposeFocus::Field(ComposeField::Bcc),
+    ComposeFocus::Field(ComposeField::Subject),
+    ComposeFocus::Body,
+    ComposeFocus::Button(ComposeButton::Cancel),
+    ComposeFocus::Button(ComposeButton::Edit),
+    ComposeFocus::Button(ComposeButton::Draft),
+    ComposeFocus::Button(ComposeButton::Send),
 ];
 
 impl ComposeState {
@@ -343,7 +357,7 @@ impl ComposeState {
         cc: String,
         bcc: String,
         subject: String,
-        body: String,
+        body: Document,
     ) -> Self {
         let mut state = Self::default();
         state.draft_id = Some(draft_id);
@@ -355,9 +369,10 @@ impl ComposeState {
         state.bcc.cursor = text_len(&state.bcc.value);
         state.subject.value = subject;
         state.subject.cursor = text_len(&state.subject.value);
-        state.content.value = body;
-        state.content.cursor = text_len(&state.content.value);
-        state.focus = ComposeFocus::Field(ComposeField::Content);
+        state.body = body;
+        state.body_scroll = 0;
+        state.body_view_height = 0;
+        state.focus = ComposeFocus::Body;
         state
     }
 
@@ -370,79 +385,35 @@ impl ComposeState {
     }
 
     fn focus_next(&mut self) {
-        self.focus = match self.focus {
-            ComposeFocus::Field(current) => {
-                let mut iter = COMPOSE_FIELD_SEQUENCE.iter();
-                while let Some(field) = iter.next() {
-                    if *field == current {
-                        break;
-                    }
-                }
-                if let Some(next) = iter.next() {
-                    ComposeFocus::Field(*next)
-                } else {
-                    ComposeFocus::Button(COMPOSE_BUTTON_SEQUENCE[0])
-                }
-            }
-            ComposeFocus::Button(current) => {
-                let mut iter = COMPOSE_BUTTON_SEQUENCE.iter();
-                while let Some(button) = iter.next() {
-                    if *button == current {
-                        break;
-                    }
-                }
-                if let Some(next) = iter.next() {
-                    ComposeFocus::Button(*next)
-                } else {
-                    ComposeFocus::Field(COMPOSE_FIELD_SEQUENCE[0])
-                }
-            }
-        };
+        let current_idx = COMPOSE_FOCUS_SEQUENCE
+            .iter()
+            .position(|focus| *focus == self.focus)
+            .unwrap_or(0);
+        let next = (current_idx + 1) % COMPOSE_FOCUS_SEQUENCE.len();
+        self.focus = COMPOSE_FOCUS_SEQUENCE[next];
     }
 
     fn focus_prev(&mut self) {
-        self.focus = match self.focus {
-            ComposeFocus::Field(current) => {
-                if let Some(pos) = COMPOSE_FIELD_SEQUENCE
-                    .iter()
-                    .position(|field| *field == current)
-                {
-                    if pos == 0 {
-                        ComposeFocus::Button(*COMPOSE_BUTTON_SEQUENCE.last().unwrap())
-                    } else {
-                        ComposeFocus::Field(COMPOSE_FIELD_SEQUENCE[pos - 1])
-                    }
-                } else {
-                    ComposeFocus::Field(COMPOSE_FIELD_SEQUENCE[0])
-                }
-            }
-            ComposeFocus::Button(current) => {
-                if let Some(pos) = COMPOSE_BUTTON_SEQUENCE
-                    .iter()
-                    .position(|button| *button == current)
-                {
-                    if pos == 0 {
-                        ComposeFocus::Field(*COMPOSE_FIELD_SEQUENCE.last().unwrap())
-                    } else {
-                        ComposeFocus::Button(COMPOSE_BUTTON_SEQUENCE[pos - 1])
-                    }
-                } else {
-                    ComposeFocus::Button(COMPOSE_BUTTON_SEQUENCE[0])
-                }
-            }
+        let current_idx = COMPOSE_FOCUS_SEQUENCE
+            .iter()
+            .position(|focus| *focus == self.focus)
+            .unwrap_or(0);
+        let prev = if current_idx == 0 {
+            COMPOSE_FOCUS_SEQUENCE.len() - 1
+        } else {
+            current_idx - 1
         };
+        self.focus = COMPOSE_FOCUS_SEQUENCE[prev];
     }
 
     fn focus_button_next(&mut self) {
         let next = match self.focus {
             ComposeFocus::Button(current) => {
-                let mut iter = COMPOSE_BUTTON_SEQUENCE.iter();
-                while let Some(button) = iter.next() {
-                    if *button == current {
-                        break;
-                    }
-                }
-                iter.next().copied().unwrap_or(COMPOSE_BUTTON_SEQUENCE[0])
+                let index = COMPOSE_BUTTON_SEQUENCE
+                    .iter()
+                    .position(|button| *button == current)
+                    .unwrap_or(0);
+                COMPOSE_BUTTON_SEQUENCE[(index + 1) % COMPOSE_BUTTON_SEQUENCE.len()]
             }
             _ => COMPOSE_BUTTON_SEQUENCE[0],
         };
@@ -452,14 +423,15 @@ impl ComposeState {
     fn focus_button_prev(&mut self) {
         let prev = match self.focus {
             ComposeFocus::Button(current) => {
-                let mut last_seen = *COMPOSE_BUTTON_SEQUENCE.last().unwrap();
-                for button in COMPOSE_BUTTON_SEQUENCE {
-                    if button == current {
-                        break;
-                    }
-                    last_seen = button;
+                let index = COMPOSE_BUTTON_SEQUENCE
+                    .iter()
+                    .position(|button| *button == current)
+                    .unwrap_or(0);
+                if index == 0 {
+                    *COMPOSE_BUTTON_SEQUENCE.last().unwrap()
+                } else {
+                    COMPOSE_BUTTON_SEQUENCE[index - 1]
                 }
-                last_seen
             }
             _ => *COMPOSE_BUTTON_SEQUENCE.last().unwrap(),
         };
@@ -492,7 +464,6 @@ impl ComposeState {
             ComposeField::Cc => (&self.cc.value[..], self.cc.cursor),
             ComposeField::Bcc => (&self.bcc.value[..], self.bcc.cursor),
             ComposeField::Subject => (&self.subject.value[..], self.subject.cursor),
-            ComposeField::Content => (&self.content.value[..], self.content.cursor),
         }
     }
 
@@ -506,24 +477,104 @@ impl ComposeState {
         value.split_at(idx)
     }
 
-    fn field_state_mut(&mut self, field: ComposeField) -> FieldStateMut<'_> {
+    fn field_state_mut(&mut self, field: ComposeField) -> &mut TextFieldState {
         match field {
-            ComposeField::To => FieldStateMut::Text(&mut self.to),
-            ComposeField::Cc => FieldStateMut::Text(&mut self.cc),
-            ComposeField::Bcc => FieldStateMut::Text(&mut self.bcc),
-            ComposeField::Subject => FieldStateMut::Text(&mut self.subject),
-            ComposeField::Content => FieldStateMut::Area(&mut self.content),
+            ComposeField::To => &mut self.to,
+            ComposeField::Cc => &mut self.cc,
+            ComposeField::Bcc => &mut self.bcc,
+            ComposeField::Subject => &mut self.subject,
         }
     }
 
-    pub(crate) fn to_outgoing(&self) -> OutgoingMessage {
-        OutgoingMessage {
+    fn serialize_body_markdown(&self) -> Result<String> {
+        let mut buffer = Vec::new();
+        markdown::write(&mut buffer, &self.body)
+            .context("failed to convert FTML body to Markdown")?;
+        String::from_utf8(buffer).context("Markdown serialization produced invalid UTF-8")
+    }
+
+    fn serialize_body_plain(&self) -> Result<String> {
+        document_to_plain_text(&self.body)
+    }
+
+    fn serialize_body_html(&self) -> Result<String> {
+        let writer = Writer::new();
+        writer
+            .write_to_string(&self.body)
+            .context("failed to convert FTML body to HTML")
+    }
+
+    pub(crate) fn to_outgoing(&self) -> Result<OutgoingMessage> {
+        let text_body = self.serialize_body_plain()?;
+        let html_body = self.serialize_body_html()?;
+        Ok(OutgoingMessage {
             to: split_addresses(&self.to.value),
             cc: split_addresses(&self.cc.value),
             bcc: split_addresses(&self.bcc.value),
             subject: self.subject.value.clone(),
-            content: self.content.value.clone(),
+            text_body,
+            html_body,
+        })
+    }
+
+    pub(crate) fn body(&self) -> &Document {
+        &self.body
+    }
+
+    pub(crate) fn set_body(&mut self, document: Document) {
+        self.body = document;
+        self.body_scroll = 0;
+        self.body_view_height = 0;
+    }
+
+    pub(crate) fn set_field_text<S: Into<String>>(&mut self, field: ComposeField, value: S) {
+        let text = value.into();
+        let state = self.field_state_mut(field);
+        state.value = text;
+        state.cursor = text_len(&state.value);
+    }
+
+    pub(crate) fn is_body_focused(&self) -> bool {
+        matches!(self.focus, ComposeFocus::Body)
+    }
+
+    pub(crate) fn body_markdown(&self) -> Result<String> {
+        self.serialize_body_markdown()
+    }
+
+    pub(crate) fn update_body_from_markdown(&mut self, source: &str) -> Result<()> {
+        let document = markdown::parse(Cursor::new(source))
+            .map_err(|err| anyhow!("Failed to parse Markdown: {err}"))?;
+        self.body = document;
+        self.body_scroll = 0;
+        Ok(())
+    }
+
+    pub(crate) fn body_scroll(&self) -> usize {
+        self.body_scroll
+    }
+
+    pub(crate) fn set_body_scroll(&mut self, value: usize) {
+        self.body_scroll = value;
+    }
+
+    pub(crate) fn set_body_view_height(&mut self, height: usize) {
+        self.body_view_height = height;
+        if height == 0 {
+            self.body_scroll = 0;
         }
+    }
+
+    pub(crate) fn scroll_body_lines(&mut self, delta: isize) {
+        let current = self.body_scroll as isize;
+        let next = (current + delta).max(0);
+        self.body_scroll = next as usize;
+    }
+
+    pub(crate) fn scroll_body_pages(&mut self, pages: isize) {
+        let page = self.body_view_height.max(1) as isize;
+        let delta = page.saturating_mul(pages);
+        self.scroll_body_lines(delta);
     }
 }
 
@@ -571,70 +622,53 @@ impl TextFieldState {
     }
 }
 
-impl TextAreaState {
-    fn insert(&mut self, ch: char) -> bool {
-        insert_char_at(&mut self.value, &mut self.cursor, ch);
-        true
-    }
-
-    fn backspace(&mut self) -> bool {
-        remove_char_before(&mut self.value, &mut self.cursor)
-    }
-
-    fn delete(&mut self) -> bool {
-        remove_char_at(&mut self.value, &mut self.cursor)
-    }
-
-    fn move_left(&mut self) -> bool {
-        move_cursor_left(&mut self.cursor)
-    }
-
-    fn move_right(&mut self) -> bool {
-        let mut cursor = self.cursor;
-        let moved = move_cursor_right(&self.value, &mut cursor);
-        if moved {
-            self.cursor = cursor;
-        }
-        moved
-    }
-
-    fn move_home(&mut self) -> bool {
-        move_cursor_home(&mut self.cursor)
-    }
-
-    fn move_end(&mut self) -> bool {
-        let mut cursor = self.cursor;
-        let moved = move_cursor_end(&self.value, &mut cursor);
-        if moved {
-            self.cursor = cursor;
-        }
-        moved
-    }
-}
-
-enum FieldStateMut<'a> {
-    Text(&'a mut TextFieldState),
-    Area(&'a mut TextAreaState),
-}
-
-fn compose_body_from_content(content: &MessageContent) -> String {
-    if let Some(plain) = content
-        .parts
-        .iter()
-        .find(|part| mime_type_matches(part, "text/plain"))
-    {
-        return String::from_utf8_lossy(&plain.content).into_owned();
-    }
-
-    if let Some(html) = content
+fn document_from_message_content(content: &MessageContent) -> Document {
+    if let Some(html_part) = content
         .parts
         .iter()
         .find(|part| mime_type_matches(part, "text/html"))
     {
-        return String::from_utf8_lossy(&html.content).into_owned();
+        let html = String::from_utf8_lossy(&html_part.content);
+        if let Ok(document) = html::parse(Cursor::new(html.as_ref())) {
+            return document;
+        }
     }
 
-    String::new()
+    if let Some(plain_part) = content
+        .parts
+        .iter()
+        .find(|part| mime_type_matches(part, "text/plain"))
+    {
+        let text = String::from_utf8_lossy(&plain_part.content);
+        if let Ok(document) = markdown::parse(Cursor::new(text.as_ref())) {
+            return document;
+        }
+
+        let mut paragraph = Paragraph::new_text();
+        paragraph.content.push(Span::new_text(text.into_owned()));
+        return Document::new().with_paragraphs(vec![paragraph]);
+    }
+
+    Document::new()
+}
+
+fn document_to_plain_text(document: &Document) -> Result<String> {
+    let mut buffer = Vec::new();
+    {
+        let mut formatter = Formatter::new_ascii(&mut buffer);
+        formatter.style = plain_text_style();
+        formatter
+            .write_document(document)
+            .context("failed to render FTML document as plain text")?;
+    }
+    String::from_utf8(buffer).context("plain text serialization produced invalid UTF-8")
+}
+
+fn plain_text_style() -> FormattingStyle {
+    let mut style = FormattingStyle::ascii();
+    style.wrap_width = 80;
+    style.enable_osc8_hyperlinks = false;
+    style
 }
 
 fn mime_type_matches(part: &MessageContentPart, expected: &str) -> bool {
@@ -643,6 +677,81 @@ fn mime_type_matches(part: &MessageContentPart, expected: &str) -> bool {
         .next()
         .map(|value| value.trim())
         .map_or(false, |value| value.eq_ignore_ascii_case(expected))
+}
+
+fn prefix_subject(subject: &str, prefix: &str) -> String {
+    let trimmed = subject.trim();
+    if trimmed.is_empty() {
+        return prefix.trim_end().to_string();
+    }
+
+    let prefix_lower = prefix.to_ascii_lowercase();
+    let subject_lower = trimmed.to_ascii_lowercase();
+    if subject_lower.starts_with(&prefix_lower) {
+        trimmed.to_string()
+    } else {
+        format!("{} {}", prefix.trim_end(), trimmed)
+    }
+}
+
+fn text_paragraph(content: impl Into<String>) -> Paragraph {
+    Paragraph::new_text().with_content(vec![Span::new_text(content.into())])
+}
+
+fn build_reply_document(original: &Document, sender: &str, sent: OffsetDateTime) -> Document {
+    let mut document = Document::new();
+    document.add_paragraph(Paragraph::new_text());
+
+    let date_str = sent.format(&Rfc2822).unwrap_or_else(|_| sent.to_string());
+    let header = if sender.trim().is_empty() {
+        format!("On {date_str}, the sender wrote:")
+    } else {
+        format!("On {date_str}, {sender} wrote:")
+    };
+
+    document.add_paragraph(text_paragraph(header));
+    document.add_paragraph(Paragraph::new_text());
+
+    let quote = Paragraph::new_quote().with_children(original.paragraphs.clone());
+    document.add_paragraph(quote);
+
+    document
+}
+
+fn build_forward_document(original: &Document, message: &Message) -> Document {
+    let mut document = Document::new();
+    document.add_paragraph(Paragraph::new_text());
+    document.add_paragraph(text_paragraph("---------- Forwarded message ---------"));
+
+    if !message.sender.trim().is_empty() {
+        document.add_paragraph(text_paragraph(format!("From: {}", message.sender.trim())));
+    }
+
+    let date_str = message
+        .sent
+        .format(&Rfc2822)
+        .unwrap_or_else(|_| message.sent.to_string());
+    document.add_paragraph(text_paragraph(format!("Date: {date_str}")));
+
+    if !message.recipients.is_empty() {
+        document.add_paragraph(text_paragraph(format!(
+            "To: {}",
+            message.recipients.join(", ")
+        )));
+    }
+
+    if !message.subject.trim().is_empty() {
+        document.add_paragraph(text_paragraph(format!(
+            "Subject: {}",
+            message.subject.trim()
+        )));
+    }
+
+    document.add_paragraph(Paragraph::new_text());
+    let quote = Paragraph::new_quote().with_children(original.paragraphs.clone());
+    document.add_paragraph(quote);
+
+    document
 }
 
 fn split_addresses(input: &str) -> Vec<String> {
@@ -1763,6 +1872,10 @@ impl App {
         self.compose.as_ref()
     }
 
+    pub(crate) fn compose_state_mut(&mut self) -> Option<&mut ComposeState> {
+        self.compose.as_mut()
+    }
+
     pub(crate) fn compose_action_bar(&self) -> String {
         let label = match self.compose.as_ref().and_then(|state| state.draft_id()) {
             Some(_) => "Edit Draft",
@@ -1794,6 +1907,9 @@ impl App {
             KeyCode::Char('y') | KeyCode::Char('Y') => self.schedule_archive(),
             KeyCode::Char('u') | KeyCode::Char('U') => self.toggle_unread(),
             KeyCode::Char('c') | KeyCode::Char('C') => self.open_compose(),
+            KeyCode::Char('r') | KeyCode::Char('R') => self.open_reply(false)?,
+            KeyCode::Char('a') | KeyCode::Char('A') => self.open_reply(true)?,
+            KeyCode::Char('f') | KeyCode::Char('F') => self.open_forward()?,
             KeyCode::Char('!') => {
                 if let Some(idx) = self.mailbox.selected {
                     if let Some(msg) = self.mailbox.messages.get(idx) {
@@ -1826,6 +1942,30 @@ impl App {
     fn handle_message_key(&mut self, key: KeyEvent) -> Result<()> {
         if matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
             self.open_compose();
+            return Ok(());
+        }
+
+        if matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'))
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            self.open_reply(false)?;
+            return Ok(());
+        }
+
+        if matches!(key.code, KeyCode::Char('a') | KeyCode::Char('A'))
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            self.open_reply(true)?;
+            return Ok(());
+        }
+
+        if matches!(key.code, KeyCode::Char('f') | KeyCode::Char('F'))
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            self.open_forward()?;
             return Ok(());
         }
 
@@ -1948,6 +2088,117 @@ impl App {
         self.mailbox.status_line = Some("Compose mode active.".to_string());
     }
 
+    fn document_for_message(&mut self, message: &Message) -> Result<Document> {
+        if let Some(view) = self.message_view.as_ref() {
+            if view.message_id == message.id {
+                if let Some(document) = &view.document {
+                    return Ok(document.clone());
+                }
+                return Ok(document_from_message_content(&view.content));
+            }
+        }
+
+        let content = self
+            .backend
+            .load_message(message.id)
+            .with_context(|| format!("failed to load message {}", message.id))?;
+        Ok(document_from_message_content(&content))
+    }
+
+    fn open_reply(&mut self, reply_all: bool) -> Result<()> {
+        let message = match self.selected_loaded_message() {
+            Some(message) => message.clone(),
+            None => {
+                self.mailbox
+                    .status_line
+                    .get_or_insert_with(|| "Message is still loading.".to_string());
+                return Ok(());
+            }
+        };
+
+        let document = match self.document_for_message(&message) {
+            Ok(doc) => doc,
+            Err(err) => {
+                self.mailbox.status_line = Some(format!("Failed to load message body: {err}"));
+                return Ok(());
+            }
+        };
+
+        let mut compose = ComposeState::new();
+        let subject = prefix_subject(&message.subject, "Re:");
+        compose.set_field_text(ComposeField::Subject, subject);
+
+        let reply_body = build_reply_document(&document, &message.sender, message.sent);
+        compose.set_body(reply_body);
+        compose.set_focus(ComposeFocus::Body);
+
+        let mut primary_recipient = message.sender.trim().to_string();
+        if primary_recipient.is_empty() {
+            if let Some(first) = message.recipients.first() {
+                primary_recipient = first.trim().to_string();
+            }
+        }
+
+        if !primary_recipient.is_empty() {
+            compose.set_field_text(ComposeField::To, primary_recipient.clone());
+        }
+
+        if reply_all {
+            let primary_lower = primary_recipient.to_ascii_lowercase();
+            let cc_list: Vec<String> = message
+                .recipients
+                .iter()
+                .map(|recipient| recipient.trim().to_string())
+                .filter(|recipient| !recipient.is_empty())
+                .filter(|recipient| recipient.to_ascii_lowercase() != primary_lower)
+                .collect();
+            if !cc_list.is_empty() {
+                compose.set_field_text(ComposeField::Cc, cc_list.join(", "));
+            }
+        }
+
+        self.compose = Some(compose);
+        self.message_view = None;
+        let status = if reply_all {
+            format!("Reply all to '{}'.", message.subject)
+        } else {
+            format!("Replying to '{}'.", message.subject)
+        };
+        self.mailbox.status_line = Some(status);
+        Ok(())
+    }
+
+    fn open_forward(&mut self) -> Result<()> {
+        let message = match self.selected_loaded_message() {
+            Some(message) => message.clone(),
+            None => {
+                self.mailbox
+                    .status_line
+                    .get_or_insert_with(|| "Message is still loading.".to_string());
+                return Ok(());
+            }
+        };
+
+        let document = match self.document_for_message(&message) {
+            Ok(doc) => doc,
+            Err(err) => {
+                self.mailbox.status_line = Some(format!("Failed to load message body: {err}"));
+                return Ok(());
+            }
+        };
+
+        let mut compose = ComposeState::new();
+        let subject = prefix_subject(&message.subject, "Fwd:");
+        compose.set_field_text(ComposeField::Subject, subject);
+        compose.set_body(build_forward_document(&document, &message));
+        compose.set_focus(ComposeFocus::Body);
+
+        self.compose = Some(compose);
+        self.message_view = None;
+        self.mailbox.status_line = Some(format!("Forwarding '{}'.", message.subject));
+        Ok(())
+    }
+
     fn handle_compose_key(&mut self, key: KeyEvent) -> Result<()> {
         if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
@@ -1989,92 +2240,33 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Enter => {
-                    if field == ComposeField::Content {
-                        let inserted = {
-                            let state = compose.field_state_mut(field);
-                            match state {
-                                FieldStateMut::Text(_) => false,
-                                FieldStateMut::Area(area) => area.insert('\n'),
-                            }
-                        };
-                        if inserted {
-                            compose.clear_status();
-                        }
-                    } else {
-                        compose.focus_next();
-                    }
+                    compose.focus_next();
                     return Ok(());
                 }
                 KeyCode::Left => {
-                    let state = compose.field_state_mut(field);
-                    match state {
-                        FieldStateMut::Text(state) => {
-                            let _ = state.move_left();
-                        }
-                        FieldStateMut::Area(state) => {
-                            let _ = state.move_left();
-                        }
-                    }
+                    let _ = compose.field_state_mut(field).move_left();
                     return Ok(());
                 }
                 KeyCode::Right => {
-                    let state = compose.field_state_mut(field);
-                    match state {
-                        FieldStateMut::Text(state) => {
-                            let _ = state.move_right();
-                        }
-                        FieldStateMut::Area(state) => {
-                            let _ = state.move_right();
-                        }
-                    }
+                    let _ = compose.field_state_mut(field).move_right();
                     return Ok(());
                 }
                 KeyCode::Home => {
-                    let state = compose.field_state_mut(field);
-                    match state {
-                        FieldStateMut::Text(state) => {
-                            let _ = state.move_home();
-                        }
-                        FieldStateMut::Area(state) => {
-                            let _ = state.move_home();
-                        }
-                    }
+                    let _ = compose.field_state_mut(field).move_home();
                     return Ok(());
                 }
                 KeyCode::End => {
-                    let state = compose.field_state_mut(field);
-                    match state {
-                        FieldStateMut::Text(state) => {
-                            let _ = state.move_end();
-                        }
-                        FieldStateMut::Area(state) => {
-                            let _ = state.move_end();
-                        }
-                    }
+                    let _ = compose.field_state_mut(field).move_end();
                     return Ok(());
                 }
                 KeyCode::Backspace => {
-                    let modified = {
-                        let state = compose.field_state_mut(field);
-                        match state {
-                            FieldStateMut::Text(state) => state.backspace(),
-                            FieldStateMut::Area(state) => state.backspace(),
-                        }
-                    };
-                    if modified {
+                    if compose.field_state_mut(field).backspace() {
                         compose.clear_status();
                     }
                     return Ok(());
                 }
                 KeyCode::Delete => {
-                    let modified = {
-                        let state = compose.field_state_mut(field);
-                        match state {
-                            FieldStateMut::Text(state) => state.delete(),
-                            FieldStateMut::Area(state) => state.delete(),
-                        }
-                    };
-                    if modified {
+                    if compose.field_state_mut(field).delete() {
                         compose.clear_status();
                     }
                     return Ok(());
@@ -2086,17 +2278,35 @@ impl App {
                         return Ok(());
                     }
 
-                    let modified = {
-                        let state = compose.field_state_mut(field);
-                        match state {
-                            FieldStateMut::Text(state) => state.insert(ch),
-                            FieldStateMut::Area(state) => state.insert(ch),
-                        }
-                    };
-                    if modified {
+                    if compose.field_state_mut(field).insert(ch) {
                         compose.clear_status();
                     }
                     return Ok(());
+                }
+                _ => {}
+            },
+            ComposeFocus::Body => match key.code {
+                KeyCode::Up => {
+                    compose.focus_prev();
+                    return Ok(());
+                }
+                KeyCode::Down => {
+                    compose.focus_next();
+                    return Ok(());
+                }
+                KeyCode::PageDown => {
+                    compose.scroll_body_pages(1);
+                    return Ok(());
+                }
+                KeyCode::PageUp => {
+                    compose.scroll_body_pages(-1);
+                    return Ok(());
+                }
+                KeyCode::Enter => {
+                    return self.edit_compose_body();
+                }
+                KeyCode::Char(ch) if matches!(ch, 'e' | 'E') => {
+                    return self.edit_compose_body();
                 }
                 _ => {}
             },
@@ -2110,7 +2320,7 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Up => {
-                    compose.set_focus(ComposeFocus::Field(ComposeField::Content));
+                    compose.set_focus(ComposeFocus::Body);
                     return Ok(());
                 }
                 KeyCode::Down => {
@@ -2122,6 +2332,7 @@ impl App {
                 KeyCode::Char(ch) => {
                     let target = match ch {
                         'c' | 'C' => Some(ComposeButton::Cancel),
+                        'e' | 'E' => Some(ComposeButton::Edit),
                         'd' | 'D' => Some(ComposeButton::Draft),
                         's' | 'S' => Some(ComposeButton::Send),
                         _ => None,
@@ -2143,9 +2354,113 @@ impl App {
                 self.cancel_compose();
                 Ok(())
             }
+            ComposeButton::Edit => self.edit_compose_body(),
             ComposeButton::Draft => self.save_current_draft(),
             ComposeButton::Send => self.send_current_compose(),
         }
+    }
+
+    fn edit_compose_body(&mut self) -> Result<()> {
+        let markdown_source = match self.compose.as_ref() {
+            Some(compose) => match compose.body_markdown() {
+                Ok(content) => content,
+                Err(err) => {
+                    if let Some(compose) = self.compose.as_mut() {
+                        compose.set_status(format!("Failed to prepare editor content: {err}"));
+                    }
+                    return Ok(());
+                }
+            },
+            None => return Ok(()),
+        };
+
+        let editor_command = env::var("EDITOR")
+            .or_else(|_| env::var("VISUAL"))
+            .unwrap_or_else(|_| "vi".to_string());
+        let mut argv =
+            shell_split(&editor_command).unwrap_or_else(|_| vec![editor_command.clone()]);
+        if argv.is_empty() {
+            argv.push(editor_command);
+        }
+
+        let mut temp_file = match NamedTempFile::new() {
+            Ok(file) => file,
+            Err(err) => {
+                if let Some(compose) = self.compose.as_mut() {
+                    compose.set_status(format!("Failed to create temp file: {err}"));
+                }
+                return Ok(());
+            }
+        };
+
+        if let Err(err) = temp_file.write_all(markdown_source.as_bytes()) {
+            if let Some(compose) = self.compose.as_mut() {
+                compose.set_status(format!("Failed to write temp file: {err}"));
+            }
+            return Ok(());
+        }
+
+        if let Err(err) = temp_file.flush() {
+            if let Some(compose) = self.compose.as_mut() {
+                compose.set_status(format!("Failed to flush temp file: {err}"));
+            }
+            return Ok(());
+        }
+
+        let temp_path: PathBuf = temp_file.path().to_path_buf();
+
+        let editor_status = if let Some((program, args)) = argv.split_first() {
+            let mut command = Command::new(program);
+            if !args.is_empty() {
+                command.args(args);
+            }
+            command.arg(&temp_path);
+            command.status()
+        } else {
+            Command::new("vi").arg(&temp_path).status()
+        };
+
+        let status = match editor_status {
+            Ok(status) => status,
+            Err(err) => {
+                if let Some(compose) = self.compose.as_mut() {
+                    compose.set_status(format!("Failed to launch editor: {err}"));
+                }
+                return Ok(());
+            }
+        };
+
+        if !status.success() {
+            if let Some(compose) = self.compose.as_mut() {
+                compose.set_status("Editor cancelled message update.");
+            }
+            return Ok(());
+        }
+
+        let edited_markdown = match fs::read_to_string(&temp_path) {
+            Ok(contents) => contents,
+            Err(err) => {
+                if let Some(compose) = self.compose.as_mut() {
+                    compose.set_status(format!("Failed to read editor output: {err}"));
+                }
+                return Ok(());
+            }
+        };
+
+        if let Some(compose) = self.compose.as_mut() {
+            match compose.update_body_from_markdown(&edited_markdown) {
+                Ok(()) => {
+                    compose.clear_status();
+                    compose.set_status("Message updated.");
+                    compose.set_focus(ComposeFocus::Body);
+                }
+                Err(err) => {
+                    compose.set_status(format!("{err}"));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn cancel_compose(&mut self) {
@@ -2161,7 +2476,18 @@ impl App {
 
     fn send_current_compose(&mut self) -> Result<()> {
         let (draft_id, message) = match self.compose.as_ref() {
-            Some(compose) => (compose.draft_id(), compose.to_outgoing()),
+            Some(compose) => {
+                let draft_id = compose.draft_id();
+                match compose.to_outgoing() {
+                    Ok(message) => (draft_id, message),
+                    Err(err) => {
+                        if let Some(compose) = self.compose.as_mut() {
+                            compose.set_status(format!("Failed to prepare message: {err}"));
+                        }
+                        return Ok(());
+                    }
+                }
+            }
             None => return Ok(()),
         };
 
@@ -2196,7 +2522,18 @@ impl App {
 
     fn save_current_draft(&mut self) -> Result<()> {
         let (draft_id, message) = match self.compose.as_ref() {
-            Some(compose) => (compose.draft_id(), compose.to_outgoing()),
+            Some(compose) => {
+                let draft_id = compose.draft_id();
+                match compose.to_outgoing() {
+                    Ok(message) => (draft_id, message),
+                    Err(err) => {
+                        if let Some(compose) = self.compose.as_mut() {
+                            compose.set_status(format!("Failed to prepare draft: {err}"));
+                        }
+                        return Ok(());
+                    }
+                }
+            }
             None => return Ok(()),
         };
 
@@ -2247,7 +2584,7 @@ impl App {
             .load_message(message.id)
             .with_context(|| format!("failed to load draft {}", message.id))?;
 
-        let body = compose_body_from_content(&content);
+        let body = document_from_message_content(&content);
 
         let compose = ComposeState::from_draft(
             message.id,

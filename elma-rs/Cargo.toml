@@ -19,3 +19,5 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 imap-proto = "0.16"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "native-tls"] }
+shell-words = "1"
+tempfile = "3"

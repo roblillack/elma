@@ -52,7 +52,8 @@ pub struct OutgoingMessage {
     pub cc: Vec<String>,
     pub bcc: Vec<String>,
     pub subject: String,
-    pub content: String,
+    pub text_body: String,
+    pub html_body: String,
 }
 
 /// Abstraction over a mail provider implementation.

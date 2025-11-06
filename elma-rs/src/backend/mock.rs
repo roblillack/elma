@@ -413,7 +413,8 @@ impl MockBackend {
             cc,
             bcc,
             subject,
-            content,
+            text_body,
+            html_body,
         } = outgoing;
 
         let mut recipients = Vec::new();
@@ -421,7 +422,7 @@ impl MockBackend {
         recipients.extend(cc.into_iter());
         recipients.extend(bcc.into_iter());
 
-        let size = content.len() + subject.len();
+        let size = text_body.len() + html_body.len() + subject.len();
 
         let mut message = Message {
             id,
@@ -449,7 +450,11 @@ impl MockBackend {
         content_state.mailer = format!("{MAILER_NAME} compose");
         content_state.parts.push(MessageContentPart {
             content_type: "text/plain".to_string(),
-            content: content.into_bytes(),
+            content: text_body.into_bytes(),
+        });
+        content_state.parts.push(MessageContentPart {
+            content_type: "text/html".to_string(),
+            content: html_body.into_bytes(),
         });
 
         let mut mailboxes = self.mailboxes.lock().expect("mailboxes mutex poisoned");

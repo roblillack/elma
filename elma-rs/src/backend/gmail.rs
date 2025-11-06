@@ -24,7 +24,8 @@ use imap_proto::types::{
     Response,
 };
 use lettre::{
-    Message as LettreEmail, SmtpTransport, Transport, message::Mailbox as LettreMailbox,
+    Message as LettreEmail, SmtpTransport, Transport,
+    message::{Mailbox as LettreMailbox, MultiPart, SinglePart},
     transport::smtp::authentication::Credentials,
 };
 use mailparse::{self, DispositionType, MailHeaderMap, ParsedMail};
@@ -976,7 +977,8 @@ impl GmailInner {
             cc,
             bcc,
             subject,
-            content,
+            text_body,
+            html_body,
         } = outgoing;
 
         if to.is_empty() && cc.is_empty() && bcc.is_empty() {
@@ -1013,8 +1015,12 @@ impl GmailInner {
 
         builder = builder.subject(subject);
 
+        let multipart = MultiPart::alternative()
+            .singlepart(SinglePart::plain(text_body))
+            .singlepart(SinglePart::html(html_body));
+
         builder
-            .body(content)
+            .multipart(multipart)
             .context("serialising compose body for SMTP")
     }
 
