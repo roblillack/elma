@@ -5,7 +5,12 @@ mod ui;
 mod viewer;
 
 use crate::app::{AccountDescriptor, App};
-use crate::backend::{MailBackend, gmail::GmailBackend, mock::MockBackend};
+use crate::backend::{
+    MailBackend,
+    gmail::GmailBackend,
+    jmap::{JmapAuth, JmapBackend, JmapConfig},
+    mock::MockBackend,
+};
 use anyhow::{Context, Result, anyhow};
 use crossterm::{
     event::{self, Event},
@@ -153,7 +158,7 @@ fn load_accounts_from_config() -> Result<Option<Vec<AccountDescriptor>>> {
     Ok(Some(Vec::new()))
 }
 
-fn build_account_from_config(config: AccountConfig, index: usize) -> Result<AccountDescriptor> {
+fn build_account_from_config(mut config: AccountConfig, index: usize) -> Result<AccountDescriptor> {
     let backend_name = config.r#type.to_ascii_lowercase();
     match backend_name.as_str() {
         "gmail" => {
@@ -172,6 +177,47 @@ fn build_account_from_config(config: AccountConfig, index: usize) -> Result<Acco
             let name = config.name.unwrap_or("Demo".to_string());
             let backend: Arc<dyn MailBackend> = Arc::new(MockBackend::demo());
             Ok(AccountDescriptor::new(name, backend))
+        }
+        "jmap" => {
+            let username = config
+                .username
+                .take()
+                .or_else(|| config.email.clone())
+                .ok_or_else(|| anyhow!("accounts[{index}].username missing for JMAP backend"))?;
+            let auth = if let Some(token) = config.token.take() {
+                JmapAuth::Bearer { token }
+            } else {
+                let password = config.password.take().ok_or_else(|| {
+                    anyhow!("accounts[{index}].password or token missing for JMAP backend")
+                })?;
+                JmapAuth::Basic {
+                    username: username.clone(),
+                    password,
+                }
+            };
+            let mut base_url = config
+                .url
+                .take()
+                .unwrap_or_else(|| "https://api.fastmail.com/jmap/session".to_string());
+            normalize_fastmail_url(&mut base_url);
+            let mut trusted_hosts = config.redirect_hosts.take().unwrap_or_default();
+            if let Some(host) = url_host(&base_url) {
+                if !trusted_hosts
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(host))
+                {
+                    trusted_hosts.push(host.to_string());
+                }
+                extend_fastmail_hosts(host, &mut trusted_hosts);
+            }
+            let backend = JmapBackend::new(JmapConfig {
+                base_url,
+                auth,
+                trusted_hosts,
+            })
+            .with_context(|| format!("failed to initialize JMAP backend for {username}"))?;
+            let name = config.name.unwrap_or(username);
+            Ok(AccountDescriptor::new(name, Arc::new(backend)))
         }
         other => Err(anyhow!("accounts[{index}]: unsupported backend '{other}'")),
     }
@@ -193,4 +239,63 @@ struct AccountConfig {
     r#type: String,
     email: Option<String>,
     password: Option<String>,
+    username: Option<String>,
+    token: Option<String>,
+    url: Option<String>,
+    #[serde(alias = "redirect_hosts")]
+    redirect_hosts: Option<Vec<String>>,
+}
+
+fn url_host(url: &str) -> Option<&str> {
+    let without_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let host = without_scheme.split('/').next()?.trim();
+    if host.is_empty() { None } else { Some(host) }
+}
+
+fn extend_fastmail_hosts(host: &str, list: &mut Vec<String>) {
+    if host.ends_with("fastmail.com") {
+        for candidate in [
+            "fastmail.com",
+            "www.fastmail.com",
+            "api.fastmail.com",
+            "jmap.fastmail.com",
+        ] {
+            if !list
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(candidate))
+            {
+                list.push(candidate.to_string());
+            }
+        }
+    }
+}
+
+fn normalize_fastmail_url(url: &mut String) {
+    if url.eq_ignore_ascii_case("https://jmap.fastmail.com")
+        || url.eq_ignore_ascii_case("https://jmap.fastmail.com/")
+        || url.eq_ignore_ascii_case("https://jmap.fastmail.com/.well-known/jmap")
+    {
+        *url = "https://api.fastmail.com/jmap/session".to_string();
+        return;
+    }
+
+    if url.eq_ignore_ascii_case("https://api.fastmail.com")
+        || url.eq_ignore_ascii_case("https://api.fastmail.com/")
+    {
+        *url = "https://api.fastmail.com/jmap/session".to_string();
+        return;
+    }
+
+    if url.ends_with('/') && !url.contains("/jmap/session") {
+        while url.ends_with('/') {
+            url.pop();
+        }
+    }
+
+    if url.eq_ignore_ascii_case("api.fastmail.com") {
+        *url = "https://api.fastmail.com/jmap/session".to_string();
+    }
 }

@@ -13,6 +13,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
 async-native-tls = { version = "0.5", default-features = false, features = ["runtime-tokio"] }
 futures = "0.3"
+jmap-client = "0.4"
 mailparse = "0.15"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde = { version = "1", features = ["derive"] }

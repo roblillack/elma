@@ -11,6 +11,7 @@ use anyhow::Result;
 use std::sync::mpsc::Receiver;
 
 pub mod gmail;
+pub mod jmap;
 pub mod mock;
 
 /// Notifications that backends emit when something about the mailbox changes.
