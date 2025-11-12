@@ -244,25 +244,25 @@ impl JmapInner {
         let previous_highest = state.highest_received_index;
         let mut remaining_ids = state.current_sequence.clone();
         let mailbox_cache = self.mailboxes.lock().await.clone();
-        let mut added = Vec::new();
-        let mut updated = Vec::new();
-        let mut new_messages = Vec::with_capacity(emails.len());
+        let mut added_ids = Vec::new();
+        let mut updated_ids = Vec::new();
 
         let mut new_stored = HashMap::new();
 
         let page_len = emails.len();
         let capacity = remaining_ids.len().max(page_len);
         let mut new_sequence = Vec::with_capacity(capacity);
+        let mut page_ids = Vec::with_capacity(page_len);
 
         for (index, data) in emails.into_iter().enumerate() {
             let (message_id, uid, is_new) = state.ensure_ids(&data.jmap_id);
             let message = build_message(message_id, uid, index as u32 + 1, &data, &mailbox_cache)?;
 
             if is_new {
-                added.push(message.clone());
+                added_ids.push(message_id);
             } else if let Some(previous) = state.messages.get(&message_id) {
                 if flags_changed(&previous.message, &message) {
-                    updated.push(message.clone());
+                    updated_ids.push(message_id);
                 }
             }
 
@@ -271,7 +271,7 @@ impl JmapInner {
             }
 
             new_sequence.push(message_id);
-            new_messages.push(message.clone());
+            page_ids.push(message_id);
             new_stored.insert(
                 message_id,
                 StoredMessage {
@@ -288,6 +288,29 @@ impl JmapInner {
         state.highest_received_index = previous_highest.max(new_highest);
         let more_available = has_more && state.highest_received_index < total;
         state.set_more_available(more_available);
+
+        let mut new_messages = Vec::with_capacity(page_ids.len());
+        for id in &page_ids {
+            if let Some(stored) = state.messages.get(id) {
+                new_messages.push(stored.message.clone());
+            }
+        }
+        let mut added = Vec::with_capacity(added_ids.len());
+        for id in added_ids {
+            if let Some(stored) = state.messages.get(&id) {
+                added.push(stored.message.clone());
+            }
+        }
+        let mut updated = Vec::with_capacity(updated_ids.len());
+        for id in updated_ids {
+            if let Some(stored) = state.messages.get(&id) {
+                updated.push(stored.message.clone());
+            }
+        }
+
+        new_messages.sort_by_key(|msg| msg.seq);
+        added.sort_by_key(|msg| msg.seq);
+        updated.sort_by_key(|msg| msg.seq);
 
         drop(state);
 
@@ -1098,17 +1121,24 @@ impl JmapState {
     }
 
     fn append_backfill(&mut self, entries: Vec<(MessageId, StoredMessage)>) -> Vec<Message> {
-        let mut emitted = Vec::new();
+        let mut new_ids = Vec::new();
         for (id, stored) in entries {
-            let message_clone = stored.message.clone();
             let already_present = self.current_sequence.contains(&id);
             self.messages.insert(id, stored);
             if !already_present {
                 self.current_sequence.push(id);
-                emitted.push(message_clone);
+                new_ids.push(id);
             }
         }
         self.resequence();
+
+        let mut emitted = Vec::with_capacity(new_ids.len());
+        for id in new_ids {
+            if let Some(stored) = self.messages.get(&id) {
+                emitted.push(stored.message.clone());
+            }
+        }
+        emitted.sort_by_key(|msg| msg.seq);
         emitted
     }
 
@@ -1129,12 +1159,10 @@ impl JmapState {
             let msg_a = self.messages.get(a).map(|stored| &stored.message);
             let msg_b = self.messages.get(b).map(|stored| &stored.message);
             match (msg_a, msg_b) {
-                (Some(ma), Some(mb)) => {
-                    match ma.sent.cmp(&mb.sent) {
-                        Ordering::Equal => ma.id.cmp(&mb.id),
-                        other => other,
-                    }
-                }
+                (Some(ma), Some(mb)) => match ma.sent.cmp(&mb.sent) {
+                    Ordering::Equal => ma.id.cmp(&mb.id),
+                    other => other,
+                },
                 (None, None) => Ordering::Equal,
                 (Some(_), None) => Ordering::Less,
                 (None, Some(_)) => Ordering::Greater,
