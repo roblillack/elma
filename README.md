@@ -1,34 +1,32 @@
-# elma-rs
+# Elma – Electronic Mail Agent
 
-`elma-rs` is a Ratatui-based experimental port of the ELMA terminal mail agent. This prototype
-focuses on re-creating the classic inbox and message views while relying on the
-[`tdoc`](https://crates.io/crates/tdoc) toolkit to parse HTML into FTML documents for terminal
-rendering.
+Elma is a Ratatui-based terminal mail user agent. It focuses on keyboard-driven
+navigation and efficiency, inspired by tools like Mutt, Pine, and Elm, while
+offering a modern feature set out-of-the-box, including:
 
-## Features
+- Crisp HTML email rendering,
+- Server-side search, spam handling, and draft management,
+- Support for special-use mailboxes and labels, like starring and marking as
+  important,
+- Multiple account support,
+- Scheduled message actions (archive/delete),
+- Extensibility for additional backends.
 
-- Ratatui inbox layout with action bar, tview-style message table, and matching colours.
-- Full-screen message view with FTML formatting and message part summaries rendered by `tdoc`.
-- Mock backend that continually injects fresh sample messages with realistic senders and dates.
-- Keybindings mirror the Go implementation (star/archive/delete/commit, `j`/`k` navigation, etc.).
-
-## Differences from the Go implementation
-
-- Only the inbox view is implemented; modal dialogs, menus, and the multi-screen controller stack from the Go code are not yet ported.
-- Message actions are simulated in-memory; archive/delete just update the local list and do not persist between runs.
-- FTML rendering uses the `tdoc` crate directly rather than the Go `ftml` bindings, so styling may vary on edge cases.
-- Help overlays, context menus (the Go `.` menu), and mouse interactions beyond basic selection are not implemented.
-- Logging/debug output differs: the Rust version does not emit action/event logs compatible with `elma.log`.
-- Theming and clipboard/web integration hooks from the Go app are currently missing.
+Elma strives to provide a productive and enjoyable email experience directly
+from the terminal while staying compatible with the established workflows of
+current web-based email services.
 
 ## Running
+
+A “mock” backend is available via `--demo` for you to try out Elma without
+setting up an email account:
 
 ```bash
 cargo run -- --demo
 ```
 
-The mock backend remains available via `--demo`. Without that flag the application loads accounts
-from `~/.elmarc`. Multiple accounts are supported via the `[[accounts]]` table:
+Without that flag the application loads accounts from `~/.elmarc`. Multiple
+accounts are supported via the `[[accounts]]` table:
 
 ```toml
 [[accounts]]
@@ -42,11 +40,16 @@ name = "Demo"
 backend = "demo"
 ```
 
-`backend = "gmail"` expects an app password; `backend = "demo"` (or `"mock"`) uses the bundled
-mock backend. For backwards compatibility, the legacy `[gmail]` section remains supported and is
-treated as a single Gmail account. If no configuration is found the client falls back to the mock
-backend so you can continue exploring the UI without network access. New mock messages arrive every
-few seconds to keep the inbox active.
+Supported backends are:
+
+- `gmail`: Connects to Gmail via IMAP and SMTP.
+- `jmap`: Connects to any JMAP-compatible server (e.g., Fastmail).
+- `demo`: A mock backend that generates fake messages for demonstration
+  purposes.
+
+If no configuration is found the client falls back to the mock backend so you
+can continue exploring the UI without network access. New mock messages arrive
+every few seconds to keep the inbox active.
 
 ### General use
 
@@ -111,45 +114,3 @@ Message status is indicated by a four symbol character prefix in the message lis
   - `t` Sent
   - `S` Spam (Should be `j` or even `!`?)
   - `T` Trash (Should be `g` `r` or even `g` `#`?)
-
-### Todo
-
-- [ ] Rename special use mailboxes to standard names (Junk, Flagged)?
-- [ ] Implement transparent support of accounts which have Archive support vs. All Mail support?
-- [x] Add `!` to report as spam
-- [x] Add `g` `S` (Should be `g` `j` or even `g` `!`) to go to spam mailbox
-- [ ] Implement `r` to reply to message
-- [ ] Implement `a` to reply all
-- [ ] Implement `f` to forward message
-- [x] Add "Important" flag support
-- [ ] Add attachment indicator to message list
-- [x] `=`/`+` and `-` to mark as important/unimportant
-- [ ] Implement search (`/` and `n`/`N`)
-- [x] Implement composing new message (`c`)
-- [ ] Implement help overlay (`?`)
-- [ ] Implement `j` and `k` to move to next/previous message in mailbox view
-- [x] Implement `j` and `k` to move to next/previous message in message view
-- [ ] Implement `.` to open context menu for selected message
-- [x] Add support for multiple accounts/backends (`G` to Go to different account?)
-- [x] In "Drafts" mailbox, show recipients in the message list
-- [x] Allow continued editing of drafts (Enter to open draft in compose view again)
-- [ ] Add auto-complete for email addresses when composing messages based on the user's contacts or previously sent emails and last 1000 messages
-- [x] Add showing labels in the message view
-- [ ] Show FTML-based preview in compose dialog -- for editing open the draft as Markdown in the user's $EDITOR
-- [ ] Add support for attachments when composing messages
-- [ ] Switch from hardcoded folder named in Gmail backend to standard "Special Use" folders via IMAP (See [RFC 6154](https://datatracker.ietf.org/doc/html/rfc6154)) as per [Google Developer Docs](https://developers.google.com/workspace/gmail/imap/imap-extensions#special-use_extension_of_the_list_command)
-- [ ] Add command (`o`?) to open the current message in the web interface
-- [ ] Add support to copy the current message's content to the clipboard as Markdown (context menu?)
-- [ ] Add theming support (light/dark mode, custom colours)
-- [x] Log network actions and user events for debugging
-- [ ] Formatted date does not match web interface -- are we missing locale info somewhere?
-- [x] Load mailbox while already showing it
-- [ ] Only start connecting to backends when the user first tries to access them
-- [ ] Backends should be able to express if they have support for "Important" flags & virtual folders
-- [ ] Backends should be able to express if they have support for "Archive" vs "All Mail" folders (Gmail, sadly, does not have a true Archive folder)
-
-## Project layout
-
-- `src/backend`: backend trait and the mock implementation.
-- `src/ui`: Ratatui widgets and layout code.
-- `src/viewer.rs`: FTML rendering helpers backed by `tdoc`.
