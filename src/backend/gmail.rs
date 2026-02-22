@@ -2035,7 +2035,7 @@ mod tests {
             state.insert(stored);
         }
 
-        assert_eq!(state.len(), 5);
+        assert_eq!(state.messages.len(), 5);
 
         let first = state.remove_by_seq(3).expect("first removal");
         assert_eq!(first.id, 3);
@@ -2048,7 +2048,7 @@ mod tests {
         assert_eq!(third.seq, 3);
         assert!(state.remove_by_seq(3).is_none());
 
-        assert_eq!(state.len(), 2);
+        assert_eq!(state.messages.len(), 2);
         assert!(state.seq_to_id.contains_key(&1));
         assert!(state.seq_to_id.contains_key(&2));
     }

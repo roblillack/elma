@@ -13,10 +13,10 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     ops::Range,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
     },
@@ -43,6 +43,12 @@ const ATTACHMENT_TEMPLATES: &[(&str, &str)] = &[
     ("archive.zip", "application/zip"),
 ];
 
+/// An action paired with the channel it should report completion on.
+struct WorkItem {
+    action: Action,
+    result_tx: Sender<ActionStatus>,
+}
+
 /// Simple in-memory backend for demos and integration tests.
 ///
 /// Messages are generated deterministically at startup so the UI can exercise the
@@ -52,6 +58,7 @@ pub struct MockBackend {
     contents: Arc<Mutex<HashMap<MessageId, MessageContent>>>,
     event_sender: Arc<Mutex<Option<Sender<BackendEvent>>>>,
     id_counter: Arc<AtomicU64>,
+    work_queue: Arc<(Mutex<VecDeque<WorkItem>>, Condvar)>,
 }
 
 #[derive(Clone)]
@@ -82,16 +89,19 @@ impl MockBackend {
         let contents = Arc::new(Mutex::new(HashMap::new()));
         let event_sender = Arc::new(Mutex::new(None));
         let id_counter = Arc::new(AtomicU64::new(0));
+        let work_queue = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
 
         let backend = Self {
             mailboxes: Arc::clone(&mailboxes),
             contents: Arc::clone(&contents),
             event_sender: Arc::clone(&event_sender),
             id_counter: Arc::clone(&id_counter),
+            work_queue: Arc::clone(&work_queue),
         };
 
         backend.populate_initial_mailboxes(INITIAL_MESSAGE_COUNT);
         backend.spawn_incoming_mail_generator(mailboxes, contents, event_sender, id_counter);
+        backend.spawn_action_worker(work_queue);
         backend
     }
 
@@ -229,6 +239,39 @@ impl MockBackend {
                         *guard = None;
                     }
                 }
+            }
+        });
+    }
+
+    fn spawn_action_worker(
+        &self,
+        work_queue: Arc<(Mutex<VecDeque<WorkItem>>, Condvar)>,
+    ) {
+        let mailboxes = Arc::clone(&self.mailboxes);
+        let contents = Arc::clone(&self.contents);
+
+        thread::spawn(move || {
+            let mut delay_rng = SimpleRng::new(random_seed() ^ 0xa511f93acb5d7a77);
+            loop {
+                let item = {
+                    let (lock, cvar) = &*work_queue;
+                    let mut queue = lock.lock().expect("work queue mutex poisoned");
+                    while queue.is_empty() {
+                        queue = cvar.wait(queue).expect("work queue condvar poisoned");
+                    }
+                    queue.pop_front().expect("queue was non-empty")
+                };
+
+                let delay_ms = delay_rng.gen_range_usize_inclusive(50, 500) as u64;
+                thread::sleep(Duration::from_millis(delay_ms));
+
+                let result = MockBackend::apply_action_now(&mailboxes, &contents, &item.action)
+                    .map_err(|err| err.to_string());
+                // Receiver may have been dropped — ignore send errors.
+                let _ = item.result_tx.send(ActionStatus {
+                    action: item.action,
+                    result,
+                });
             }
         });
     }
@@ -534,29 +577,37 @@ impl MailBackend for MockBackend {
             .ok_or_else(|| anyhow!("message {message_id} not found"))
     }
 
-    /// Spawn a worker that applies each action with a short random delay.
+    /// Queue actions for the persistent worker thread.
     ///
-    /// The jitter (50–500 ms) mimics the round trips that the Gmail backend incurs,
+    /// Actions are appended to the back of the work queue so any previously
+    /// submitted or immediate work runs first.  The worker adds jitter (50–500 ms) mimics the round trips that the Gmail backend incurs,
     /// giving the UI a realistic opportunity to render progress.
     fn apply_actions(&self, actions: Vec<Action>) -> Result<Receiver<ActionStatus>> {
         let (tx, rx) = mpsc::channel();
-        let mailboxes = Arc::clone(&self.mailboxes);
-        let contents = Arc::clone(&self.contents);
+        let (lock, cvar) = &*self.work_queue;
+        let mut queue = lock.lock().expect("work queue mutex poisoned");
+        for action in actions {
+            queue.push_back(WorkItem {
+                action,
+                result_tx: tx.clone(),
+            });
+        }
+        cvar.notify_one();
+        Ok(rx)
+    }
 
-        thread::spawn(move || {
-            let mut delay_rng = SimpleRng::new(random_seed() ^ 0xa511f93acb5d7a77);
-            for action in actions {
-                let delay_ms = delay_rng.gen_range_usize_inclusive(50, 500) as u64;
-                thread::sleep(Duration::from_millis(delay_ms));
-
-                let result = MockBackend::apply_action_now(&mailboxes, &contents, &action)
-                    .map_err(|err| err.to_string());
-                if tx.send(ActionStatus { action, result }).is_err() {
-                    break;
-                }
-            }
-        });
-
+    /// Queue actions at the front so they execute before pending scheduled work.
+    fn apply_immediate_actions(&self, actions: Vec<Action>) -> Result<Receiver<ActionStatus>> {
+        let (tx, rx) = mpsc::channel();
+        let (lock, cvar) = &*self.work_queue;
+        let mut queue = lock.lock().expect("work queue mutex poisoned");
+        for (i, action) in actions.into_iter().enumerate() {
+            queue.insert(i, WorkItem {
+                action,
+                result_tx: tx.clone(),
+            });
+        }
+        cvar.notify_one();
         Ok(rx)
     }
 

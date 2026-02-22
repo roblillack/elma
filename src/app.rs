@@ -140,6 +140,10 @@ struct CommitBatchState {
     completed: usize,
     failed: Vec<(Action, String)>,
     finished: bool,
+    /// When true this batch contains flag-only changes (star, important,
+    /// read/unread) that were applied immediately.  Finalisation must NOT
+    /// remove messages from the mailbox view for these batches.
+    immediate: bool,
 }
 
 impl CommitBatchState {
@@ -151,6 +155,18 @@ impl CommitBatchState {
             completed: 0,
             failed: Vec::new(),
             finished: false,
+            immediate: false,
+        }
+    }
+
+    fn new_immediate(actions: Vec<Action>, receiver: Receiver<ActionStatus>) -> Self {
+        Self {
+            actions,
+            receiver,
+            completed: 0,
+            failed: Vec::new(),
+            finished: false,
+            immediate: true,
         }
     }
 
@@ -204,6 +220,17 @@ pub enum ActiveView {
     Mailbox,
     Message,
     Compose,
+}
+
+/// Result of attempting to schedule a move/delete action.
+#[derive(Debug, PartialEq, Eq)]
+enum ScheduleOutcome {
+    /// New action was added to the queue.
+    Added,
+    /// An existing action for the same message was replaced with this one.
+    Replaced,
+    /// The same action was already scheduled; it has been removed (toggle-off).
+    Toggled { original_status: MessageStatus },
 }
 
 #[derive(Clone, Copy)]
@@ -1668,7 +1695,39 @@ impl App {
                 }
             }
 
-            if batch.failed.is_empty() {
+            if batch.immediate {
+                // Immediate batches: never remove messages from the view.
+                // On failure, revert the local flag change.
+                if !batch.failed.is_empty() {
+                    for (action, _error) in &batch.failed {
+                        if let Some(msg) = self
+                            .mailbox
+                            .messages
+                            .iter_mut()
+                            .find(|m| m.id == action.message_id)
+                        {
+                            match action.action_type {
+                                ActionType::MarkAsStarred => msg.starred = false,
+                                ActionType::MarkAsUnstarred => msg.starred = true,
+                                ActionType::MarkAsImportant => msg.important = false,
+                                ActionType::MarkAsUnimportant => msg.important = true,
+                                ActionType::MoveToInboxUnread => {
+                                    msg.status = MessageStatus::Read;
+                                }
+                                ActionType::MoveToInboxRead => {
+                                    msg.status = MessageStatus::New;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    let summary = format!(
+                        "Failed to apply {} action(s).",
+                        batch.failed.len()
+                    );
+                    self.mailbox.status_line = Some(summary);
+                }
+            } else if batch.failed.is_empty() {
                 self.mailbox.messages.retain(|msg| {
                     msg.status != MessageStatus::Archived
                         && msg.status != MessageStatus::Deleted
@@ -2640,6 +2699,42 @@ impl App {
         }
     }
 
+    /// Schedule a move/delete action with dedup and toggle-off logic.
+    ///
+    /// - Same action type for the same message already exists → toggle off (remove it),
+    ///   return `Toggled` with the original status so the caller can restore it.
+    /// - Different move action for same message exists → replace in-place, return `Replaced`.
+    /// - No existing action → push new action, return `Added`.
+    fn schedule_action(
+        &mut self,
+        action_type: ActionType,
+        message_id: MessageId,
+        current_status: MessageStatus,
+    ) -> ScheduleOutcome {
+        if let Some(pos) = self
+            .scheduled_actions
+            .iter()
+            .position(|a| a.message_id == message_id)
+        {
+            if self.scheduled_actions[pos].action_type == action_type {
+                // Same action → toggle off
+                let removed = self.scheduled_actions.remove(pos);
+                let original_status = removed.original_status.unwrap_or(current_status);
+                return ScheduleOutcome::Toggled { original_status };
+            }
+            // Different action → replace, keep original_status from first scheduling
+            let original = self.scheduled_actions[pos].original_status;
+            self.scheduled_actions[pos].action_type = action_type;
+            self.scheduled_actions[pos].original_status =
+                original.or(Some(current_status));
+            return ScheduleOutcome::Replaced;
+        }
+
+        self.scheduled_actions
+            .push(Action::with_original_status(action_type, message_id, current_status));
+        ScheduleOutcome::Added
+    }
+
     fn toggle_star(&mut self) {
         if self.mailbox.selected.is_none() {
             return;
@@ -2660,8 +2755,10 @@ impl App {
         };
         let message_id = msg.id;
 
-        self.scheduled_actions
-            .push(Action::new(action_type, message_id));
+        let action = Action::new(action_type, message_id);
+        if let Err(_err) = self.submit_immediate_actions(vec![action]) {
+            self.mailbox.status_line = Some("Failed to apply star change.".to_string());
+        }
         self.mailbox.status_line = None;
         self.sync_message_view_state();
     }
@@ -2690,8 +2787,10 @@ impl App {
         };
         let message_id = msg.id;
 
-        self.scheduled_actions
-            .push(Action::new(action_type, message_id));
+        let action = Action::new(action_type, message_id);
+        if let Err(_err) = self.submit_immediate_actions(vec![action]) {
+            self.mailbox.status_line = Some("Failed to apply importance change.".to_string());
+        }
         self.mailbox.status_line = None;
         self.sync_message_view_state();
     }
@@ -2713,12 +2812,22 @@ impl App {
             return;
         };
 
-        msg.status = MessageStatus::Archived;
         let message_id = msg.id;
+        let current_status = msg.status;
 
-        self.scheduled_actions
-            .push(Action::new(ActionType::Archive, message_id));
-        self.advance_selection_after_action(idx);
+        match self.schedule_action(ActionType::Archive, message_id, current_status) {
+            ScheduleOutcome::Toggled { original_status } => {
+                if let Some(msg) = self.mailbox.messages.iter_mut().find(|m| m.id == message_id) {
+                    msg.status = original_status;
+                }
+            }
+            ScheduleOutcome::Added | ScheduleOutcome::Replaced => {
+                if let Some(msg) = self.mailbox.messages.iter_mut().find(|m| m.id == message_id) {
+                    msg.status = MessageStatus::Archived;
+                }
+                self.advance_selection_after_action(idx);
+            }
+        }
         self.sync_message_view_state();
     }
 
@@ -2739,12 +2848,22 @@ impl App {
             return;
         };
 
-        msg.status = MessageStatus::Deleted;
         let message_id = msg.id;
+        let current_status = msg.status;
 
-        self.scheduled_actions
-            .push(Action::new(ActionType::Delete, message_id));
-        self.advance_selection_after_action(idx);
+        match self.schedule_action(ActionType::Delete, message_id, current_status) {
+            ScheduleOutcome::Toggled { original_status } => {
+                if let Some(msg) = self.mailbox.messages.iter_mut().find(|m| m.id == message_id) {
+                    msg.status = original_status;
+                }
+            }
+            ScheduleOutcome::Added | ScheduleOutcome::Replaced => {
+                if let Some(msg) = self.mailbox.messages.iter_mut().find(|m| m.id == message_id) {
+                    msg.status = MessageStatus::Deleted;
+                }
+                self.advance_selection_after_action(idx);
+            }
+        }
         self.sync_message_view_state();
     }
 
@@ -2760,12 +2879,22 @@ impl App {
             return;
         };
 
-        msg.status = MessageStatus::Spam;
         let message_id = msg.id;
+        let current_status = msg.status;
 
-        self.scheduled_actions
-            .push(Action::new(ActionType::MoveToSpam, message_id));
-        self.advance_selection_after_action(idx);
+        match self.schedule_action(ActionType::MoveToSpam, message_id, current_status) {
+            ScheduleOutcome::Toggled { original_status } => {
+                if let Some(msg) = self.mailbox.messages.iter_mut().find(|m| m.id == message_id) {
+                    msg.status = original_status;
+                }
+            }
+            ScheduleOutcome::Added | ScheduleOutcome::Replaced => {
+                if let Some(msg) = self.mailbox.messages.iter_mut().find(|m| m.id == message_id) {
+                    msg.status = MessageStatus::Spam;
+                }
+                self.advance_selection_after_action(idx);
+            }
+        }
         self.mailbox.status_line = None;
         self.sync_message_view_state();
     }
@@ -2783,17 +2912,27 @@ impl App {
         };
 
         let restore_unread = matches!(msg.status, MessageStatus::New);
-        msg.status = MessageStatus::PendingInbox;
         let action_type = if restore_unread {
             ActionType::MoveToInboxUnread
         } else {
             ActionType::MoveToInboxRead
         };
         let message_id = msg.id;
+        let current_status = msg.status;
 
-        self.scheduled_actions
-            .push(Action::new(action_type, message_id));
-        self.advance_selection_after_action(idx);
+        match self.schedule_action(action_type, message_id, current_status) {
+            ScheduleOutcome::Toggled { original_status } => {
+                if let Some(msg) = self.mailbox.messages.iter_mut().find(|m| m.id == message_id) {
+                    msg.status = original_status;
+                }
+            }
+            ScheduleOutcome::Added | ScheduleOutcome::Replaced => {
+                if let Some(msg) = self.mailbox.messages.iter_mut().find(|m| m.id == message_id) {
+                    msg.status = MessageStatus::PendingInbox;
+                }
+                self.advance_selection_after_action(idx);
+            }
+        }
         self.mailbox.status_line = None;
         self.sync_message_view_state();
     }
@@ -2810,25 +2949,59 @@ impl App {
             return;
         };
 
-        let action_type = match msg.status {
+        match msg.status {
             MessageStatus::New | MessageStatus::Read => {
-                msg.status = MessageStatus::New;
-                ActionType::MoveToInboxUnread
+                // Immediate flag flip — apply right away
+                let new_status = if msg.status == MessageStatus::New {
+                    MessageStatus::Read
+                } else {
+                    MessageStatus::New
+                };
+                msg.status = new_status;
+                let action_type = if new_status == MessageStatus::New {
+                    ActionType::MoveToInboxUnread
+                } else {
+                    ActionType::MoveToInboxRead
+                };
+                let message_id = msg.id;
+                let action = Action::new(action_type, message_id);
+                if let Err(_err) = self.submit_immediate_actions(vec![action]) {
+                    self.mailbox.status_line =
+                        Some("Failed to apply read/unread change.".to_string());
+                }
             }
             MessageStatus::Deleted | MessageStatus::Archived | MessageStatus::Spam => {
-                msg.status = MessageStatus::Read;
-                ActionType::MoveToInboxRead
+                // Rescue operation — use scheduled action with dedup
+                let message_id = msg.id;
+                let current_status = msg.status;
+
+                match self.schedule_action(
+                    ActionType::MoveToInboxRead,
+                    message_id,
+                    current_status,
+                ) {
+                    ScheduleOutcome::Toggled { original_status } => {
+                        if let Some(msg) =
+                            self.mailbox.messages.iter_mut().find(|m| m.id == message_id)
+                        {
+                            msg.status = original_status;
+                        }
+                    }
+                    ScheduleOutcome::Added | ScheduleOutcome::Replaced => {
+                        if let Some(msg) =
+                            self.mailbox.messages.iter_mut().find(|m| m.id == message_id)
+                        {
+                            msg.status = MessageStatus::PendingInbox;
+                        }
+                    }
+                }
             }
             MessageStatus::PendingInbox => {
                 self.mailbox.status_line =
                     Some("Message already scheduled to move to inbox.".to_string());
                 return;
             }
-        };
-        let message_id = msg.id;
-
-        self.scheduled_actions
-            .push(Action::new(action_type, message_id));
+        }
         self.mailbox.status_line = None;
         self.sync_message_view_state();
     }
@@ -2847,6 +3020,44 @@ impl App {
             .or_else(|| previous_loaded_index(&self.mailbox.messages, current_idx));
 
         self.mailbox.selected = candidate.or_else(|| last_loaded_index(&self.mailbox.messages));
+    }
+
+    /// Submit immediate actions (star, important, read/unread) to the backend
+    /// with priority and track them as an immediate batch.  Finalisation will
+    /// NOT remove messages from the mailbox view for these batches.
+    fn submit_immediate_actions(&mut self, actions: Vec<Action>) -> Result<()> {
+        if actions.is_empty() {
+            return Ok(());
+        }
+
+        let action_count = actions.len();
+        if let Some(progress) = self.commit_progress.as_mut() {
+            progress.total += action_count;
+        } else {
+            self.commit_progress = Some(CommitProgress {
+                total: action_count,
+                completed: 0,
+            });
+        }
+
+        let receiver = match self.backend.apply_immediate_actions(actions.clone()) {
+            Ok(receiver) => receiver,
+            Err(err) => {
+                if let Some(progress) = self.commit_progress.as_mut() {
+                    progress.total = progress.total.saturating_sub(action_count);
+                    progress.completed = progress.completed.min(progress.total);
+                    if progress.total == 0 {
+                        self.commit_progress = None;
+                    }
+                }
+                return Err(err);
+            }
+        };
+
+        self.commit_batches
+            .push_back(CommitBatchState::new_immediate(actions, receiver));
+
+        Ok(())
     }
 
     /// Hand the current batch of scheduled actions to the backend.
@@ -3111,5 +3322,362 @@ impl Deref for App {
 impl DerefMut for App {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.accounts[self.active_account]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{ActionStatus, BackendEvent, MailBackend, MailboxSnapshot, OutgoingMessage};
+    use crate::model::{Action, ActionType, Message, MessageId, MessageStatus};
+    use std::sync::mpsc;
+    use time::OffsetDateTime;
+
+    // -- Test infrastructure --------------------------------------------------
+
+    struct NoopBackend;
+
+    impl MailBackend for NoopBackend {
+        fn load_mailbox(
+            &self,
+            _mailbox: MailboxKind,
+        ) -> anyhow::Result<(MailboxSnapshot, mpsc::Receiver<BackendEvent>)> {
+            let (_tx, rx) = mpsc::channel();
+            Ok((MailboxSnapshot { total: 0, messages: vec![] }, rx))
+        }
+
+        fn load_message(&self, _message_id: MessageId) -> anyhow::Result<MessageContent> {
+            Ok(MessageContent::default())
+        }
+
+        fn apply_actions(
+            &self,
+            actions: Vec<Action>,
+        ) -> anyhow::Result<mpsc::Receiver<ActionStatus>> {
+            let (tx, rx) = mpsc::channel();
+            for action in actions {
+                let _ = tx.send(ActionStatus {
+                    action,
+                    result: Ok(()),
+                });
+            }
+            Ok(rx)
+        }
+
+        fn send_message(&self, _message: OutgoingMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn save_draft(&self, _message: OutgoingMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn make_message(id: MessageId, status: MessageStatus) -> Message {
+        Message {
+            id,
+            sent: OffsetDateTime::UNIX_EPOCH,
+            sender: format!("sender-{id}"),
+            recipients: vec![],
+            subject: format!("Subject {id}"),
+            size: 100,
+            starred: false,
+            important: false,
+            answered: false,
+            forwarded: false,
+            status,
+            labels: vec![],
+            uid: id as u32,
+            seq: id as u32,
+            has_attachments: false,
+        }
+    }
+
+    fn test_app(messages: Vec<Message>) -> App {
+        let backend = Arc::new(NoopBackend);
+        let (_tx, events) = mpsc::channel();
+        let selected = if messages.is_empty() { None } else { Some(0) };
+        let account = AccountState {
+            name: "test".to_string(),
+            backend,
+            mailbox: MailboxState {
+                messages,
+                selected,
+                events,
+                event_count: 0,
+                status_line: None,
+                scroll_top: 0,
+            },
+            message_view: None,
+            commit_batches: VecDeque::new(),
+            commit_progress: None,
+            mailbox_loader: None,
+            mailbox_load_progress: None,
+            scheduled_actions: vec![],
+            current_mailbox: MailboxKind::Inbox,
+        };
+
+        App {
+            accounts: vec![account],
+            active_account: 0,
+            compose: None,
+            should_quit: false,
+            pending_shortcut: None,
+            pending_navigation: None,
+        }
+    }
+
+    // -- schedule_action basics -----------------------------------------------
+
+    #[test]
+    fn schedule_adds_new_action() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        let outcome = app.schedule_action(ActionType::Delete, 1, MessageStatus::Read);
+        assert_eq!(outcome, ScheduleOutcome::Added);
+        assert_eq!(app.scheduled_actions.len(), 1);
+        assert_eq!(app.scheduled_actions[0].action_type, ActionType::Delete);
+    }
+
+    #[test]
+    fn schedule_toggles_off_same_action() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        app.schedule_action(ActionType::Delete, 1, MessageStatus::Read);
+        let outcome = app.schedule_action(ActionType::Delete, 1, MessageStatus::Deleted);
+        assert!(matches!(outcome, ScheduleOutcome::Toggled { original_status: MessageStatus::Read }));
+        assert!(app.scheduled_actions.is_empty());
+    }
+
+    #[test]
+    fn toggle_preserves_original_status() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::New)]);
+        app.schedule_action(ActionType::Delete, 1, MessageStatus::New);
+        let outcome = app.schedule_action(ActionType::Delete, 1, MessageStatus::Deleted);
+        match outcome {
+            ScheduleOutcome::Toggled { original_status } => {
+                assert_eq!(original_status, MessageStatus::New);
+            }
+            _ => panic!("expected Toggled"),
+        }
+    }
+
+    // -- Move-group replacement -----------------------------------------------
+
+    #[test]
+    fn schedule_replaces_delete_with_archive() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        app.schedule_action(ActionType::Delete, 1, MessageStatus::Read);
+        let outcome = app.schedule_action(ActionType::Archive, 1, MessageStatus::Deleted);
+        assert_eq!(outcome, ScheduleOutcome::Replaced);
+        assert_eq!(app.scheduled_actions.len(), 1);
+        assert_eq!(app.scheduled_actions[0].action_type, ActionType::Archive);
+    }
+
+    #[test]
+    fn schedule_replaces_archive_with_delete() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        app.schedule_action(ActionType::Archive, 1, MessageStatus::Read);
+        let outcome = app.schedule_action(ActionType::Delete, 1, MessageStatus::Archived);
+        assert_eq!(outcome, ScheduleOutcome::Replaced);
+        assert_eq!(app.scheduled_actions.len(), 1);
+        assert_eq!(app.scheduled_actions[0].action_type, ActionType::Delete);
+    }
+
+    #[test]
+    fn schedule_replaces_with_spam() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        app.schedule_action(ActionType::Delete, 1, MessageStatus::Read);
+        let outcome = app.schedule_action(ActionType::MoveToSpam, 1, MessageStatus::Deleted);
+        assert_eq!(outcome, ScheduleOutcome::Replaced);
+        assert_eq!(app.scheduled_actions.len(), 1);
+        assert_eq!(app.scheduled_actions[0].action_type, ActionType::MoveToSpam);
+    }
+
+    #[test]
+    fn schedule_replaces_move_to_inbox_variants() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Deleted)]);
+        app.schedule_action(ActionType::MoveToInboxRead, 1, MessageStatus::Deleted);
+        let outcome =
+            app.schedule_action(ActionType::MoveToInboxUnread, 1, MessageStatus::PendingInbox);
+        assert_eq!(outcome, ScheduleOutcome::Replaced);
+        assert_eq!(app.scheduled_actions.len(), 1);
+        assert_eq!(
+            app.scheduled_actions[0].action_type,
+            ActionType::MoveToInboxUnread
+        );
+    }
+
+    #[test]
+    fn replace_preserves_original_status() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::New)]);
+        app.schedule_action(ActionType::Delete, 1, MessageStatus::New);
+        app.schedule_action(ActionType::Archive, 1, MessageStatus::Deleted);
+        // The original_status should still be New (from the first scheduling)
+        assert_eq!(
+            app.scheduled_actions[0].original_status,
+            Some(MessageStatus::New)
+        );
+    }
+
+    // -- Multi-message independence -------------------------------------------
+
+    #[test]
+    fn different_messages_are_independent() {
+        let mut app = test_app(vec![
+            make_message(1, MessageStatus::Read),
+            make_message(2, MessageStatus::Read),
+        ]);
+        app.schedule_action(ActionType::Delete, 1, MessageStatus::Read);
+        app.schedule_action(ActionType::Delete, 2, MessageStatus::Read);
+        assert_eq!(app.scheduled_actions.len(), 2);
+    }
+
+    #[test]
+    fn replace_only_affects_target_message() {
+        let mut app = test_app(vec![
+            make_message(1, MessageStatus::Read),
+            make_message(2, MessageStatus::Read),
+        ]);
+        app.schedule_action(ActionType::Delete, 1, MessageStatus::Read);
+        app.schedule_action(ActionType::Delete, 2, MessageStatus::Read);
+        // Replace msg 1 with archive
+        app.schedule_action(ActionType::Archive, 1, MessageStatus::Deleted);
+        assert_eq!(app.scheduled_actions.len(), 2);
+        assert_eq!(app.scheduled_actions[0].action_type, ActionType::Archive);
+        assert_eq!(app.scheduled_actions[0].message_id, 1);
+        assert_eq!(app.scheduled_actions[1].action_type, ActionType::Delete);
+        assert_eq!(app.scheduled_actions[1].message_id, 2);
+    }
+
+    #[test]
+    fn toggle_only_affects_target_message() {
+        let mut app = test_app(vec![
+            make_message(1, MessageStatus::Read),
+            make_message(2, MessageStatus::Read),
+        ]);
+        app.schedule_action(ActionType::Delete, 1, MessageStatus::Read);
+        app.schedule_action(ActionType::Delete, 2, MessageStatus::Read);
+        // Toggle off msg 1
+        app.schedule_action(ActionType::Delete, 1, MessageStatus::Deleted);
+        assert_eq!(app.scheduled_actions.len(), 1);
+        assert_eq!(app.scheduled_actions[0].message_id, 2);
+    }
+
+    // -- Complex sequences ----------------------------------------------------
+
+    #[test]
+    fn schedule_delete_toggle_off_then_archive() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        // Delete
+        app.schedule_action(ActionType::Delete, 1, MessageStatus::Read);
+        // Toggle off
+        app.schedule_action(ActionType::Delete, 1, MessageStatus::Deleted);
+        assert!(app.scheduled_actions.is_empty());
+        // Archive
+        let outcome = app.schedule_action(ActionType::Archive, 1, MessageStatus::Read);
+        assert_eq!(outcome, ScheduleOutcome::Added);
+        assert_eq!(app.scheduled_actions.len(), 1);
+        assert_eq!(app.scheduled_actions[0].action_type, ActionType::Archive);
+    }
+
+    #[test]
+    fn replace_then_toggle_off() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        // Delete
+        app.schedule_action(ActionType::Delete, 1, MessageStatus::Read);
+        // Replace with archive
+        app.schedule_action(ActionType::Archive, 1, MessageStatus::Deleted);
+        assert_eq!(app.scheduled_actions.len(), 1);
+        // Toggle off archive
+        let outcome = app.schedule_action(ActionType::Archive, 1, MessageStatus::Archived);
+        match outcome {
+            ScheduleOutcome::Toggled { original_status } => {
+                assert_eq!(original_status, MessageStatus::Read);
+            }
+            _ => panic!("expected Toggled"),
+        }
+        assert!(app.scheduled_actions.is_empty());
+    }
+
+    #[test]
+    fn multiple_messages_interleaved_actions() {
+        let mut app = test_app(vec![
+            make_message(1, MessageStatus::Read),
+            make_message(2, MessageStatus::New),
+            make_message(3, MessageStatus::Read),
+        ]);
+
+        // Delete msg 1
+        app.schedule_action(ActionType::Delete, 1, MessageStatus::Read);
+        // Archive msg 2
+        app.schedule_action(ActionType::Archive, 2, MessageStatus::New);
+        // Spam msg 3
+        app.schedule_action(ActionType::MoveToSpam, 3, MessageStatus::Read);
+        assert_eq!(app.scheduled_actions.len(), 3);
+
+        // Replace msg 1 delete with archive
+        app.schedule_action(ActionType::Archive, 1, MessageStatus::Deleted);
+        assert_eq!(app.scheduled_actions.len(), 3);
+        assert_eq!(app.scheduled_actions[0].action_type, ActionType::Archive);
+
+        // Toggle off msg 2
+        app.schedule_action(ActionType::Archive, 2, MessageStatus::Archived);
+        assert_eq!(app.scheduled_actions.len(), 2);
+
+        // Verify final state: msg 1 archive, msg 3 spam
+        assert_eq!(app.scheduled_actions[0].message_id, 1);
+        assert_eq!(app.scheduled_actions[0].action_type, ActionType::Archive);
+        assert_eq!(app.scheduled_actions[1].message_id, 3);
+        assert_eq!(app.scheduled_actions[1].action_type, ActionType::MoveToSpam);
+    }
+
+    // -- Stress / invariant checking ------------------------------------------
+
+    #[test]
+    fn random_action_sequences_preserve_invariants() {
+        let action_types = [
+            ActionType::Delete,
+            ActionType::Archive,
+            ActionType::MoveToSpam,
+            ActionType::MoveToInboxRead,
+            ActionType::MoveToInboxUnread,
+        ];
+        let message_ids: Vec<MessageId> = (1..=5).collect();
+        let messages: Vec<Message> = message_ids
+            .iter()
+            .map(|&id| make_message(id, MessageStatus::Read))
+            .collect();
+        let mut app = test_app(messages);
+
+        // Apply 100 random-ish actions using a simple deterministic sequence
+        for i in 0..100 {
+            let msg_id = message_ids[i % message_ids.len()];
+            let action_type = action_types[(i * 7 + i / 3) % action_types.len()];
+            app.schedule_action(action_type, msg_id, MessageStatus::Read);
+
+            // Invariant: at most one action per message
+            let mut seen_ids: Vec<MessageId> = app
+                .scheduled_actions
+                .iter()
+                .map(|a| a.message_id)
+                .collect();
+            seen_ids.sort();
+            seen_ids.dedup();
+            assert_eq!(
+                seen_ids.len(),
+                app.scheduled_actions.len(),
+                "duplicate message_id in scheduled_actions at iteration {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn rapid_toggle_on_off_leaves_clean_state() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        for _ in 0..50 {
+            app.schedule_action(ActionType::Delete, 1, MessageStatus::Read);
+            assert_eq!(app.scheduled_actions.len(), 1);
+            app.schedule_action(ActionType::Delete, 1, MessageStatus::Deleted);
+            assert!(app.scheduled_actions.is_empty());
+        }
     }
 }

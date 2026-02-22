@@ -111,6 +111,13 @@ pub trait MailBackend: Send + Sync {
     fn load_message(&self, message_id: MessageId) -> Result<MessageContent>;
     /// Begin processing a batch of actions and return a channel with completion updates.
     fn apply_actions(&self, actions: Vec<Action>) -> Result<Receiver<ActionStatus>>;
+    /// Submit actions that should be executed ahead of any pending queued work.
+    ///
+    /// Backends with an internal work queue should insert these at the front.
+    /// The default implementation simply delegates to [`apply_actions`](MailBackend::apply_actions).
+    fn apply_immediate_actions(&self, actions: Vec<Action>) -> Result<Receiver<ActionStatus>> {
+        self.apply_actions(actions)
+    }
     /// Send a fully composed message.
     fn send_message(&self, message: OutgoingMessage) -> Result<()>;
     /// Store a draft message.
