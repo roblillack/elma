@@ -1095,9 +1095,7 @@ impl GmailInner {
             .await
             .with_context(|| format!("applying action {:?}", action.action_type));
         let restart = self.start_idle_loop().await;
-        if let Err(err) = restart {
-            return Err(err);
-        }
+        restart?;
         result
     }
 
@@ -1365,18 +1363,17 @@ impl GmailInner {
                 }
             }
 
-            if let Some(label_list) = labels {
-                if state.update_labels(uid, label_list).is_some() {
-                    changed = true;
-                }
+            if let Some(label_list) = labels
+                && state.update_labels(uid, label_list).is_some()
+            {
+                changed = true;
             }
 
-            if changed {
-                if let Some(id) = state.uid_to_id.get(&uid).copied() {
-                    if let Some(stored) = state.messages.get(&id) {
-                        updated_message = Some(stored.message.clone());
-                    }
-                }
+            if changed
+                && let Some(id) = state.uid_to_id.get(&uid).copied()
+                && let Some(stored) = state.messages.get(&id)
+            {
+                updated_message = Some(stored.message.clone());
             }
         }
 
@@ -2035,7 +2032,7 @@ mod tests {
             state.insert(stored);
         }
 
-        assert_eq!(state.len(), 5);
+        assert_eq!(state.messages.len(), 5);
 
         let first = state.remove_by_seq(3).expect("first removal");
         assert_eq!(first.id, 3);
@@ -2048,7 +2045,7 @@ mod tests {
         assert_eq!(third.seq, 3);
         assert!(state.remove_by_seq(3).is_none());
 
-        assert_eq!(state.len(), 2);
+        assert_eq!(state.messages.len(), 2);
         assert!(state.seq_to_id.contains_key(&1));
         assert!(state.seq_to_id.contains_key(&2));
     }
