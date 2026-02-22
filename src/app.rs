@@ -144,6 +144,10 @@ struct CommitBatchState {
     /// read/unread) that were applied immediately.  Finalisation must NOT
     /// remove messages from the mailbox view for these batches.
     immediate: bool,
+    /// Messages that were optimistically removed from the mailbox view when
+    /// this batch was committed.  Stored so they can be re-inserted if the
+    /// backend reports a failure.
+    removed_messages: Vec<Message>,
 }
 
 impl CommitBatchState {
@@ -156,6 +160,7 @@ impl CommitBatchState {
             failed: Vec::new(),
             finished: false,
             immediate: false,
+            removed_messages: Vec::new(),
         }
     }
 
@@ -167,6 +172,7 @@ impl CommitBatchState {
             failed: Vec::new(),
             finished: false,
             immediate: true,
+            removed_messages: Vec::new(),
         }
     }
 
@@ -1685,14 +1691,6 @@ impl App {
                 break;
             };
 
-            // Collect all message IDs from this batch before we
-            // potentially move actions into the failed list.
-            let all_batch_ids: std::collections::HashSet<MessageId> = batch
-                .actions
-                .iter()
-                .map(|a| a.message_id)
-                .collect();
-
             if batch.completed < batch.len() {
                 let missing = batch.len().saturating_sub(batch.completed);
                 let message = format!("Commit interrupted ({missing} actions pending).");
@@ -1736,22 +1734,37 @@ impl App {
                     self.mailbox.status_line = Some(summary);
                 }
             } else {
-                let failed_ids: std::collections::HashSet<MessageId> = batch
-                    .failed
-                    .iter()
-                    .map(|(action, _)| action.message_id)
-                    .collect();
-
-                // Only remove messages that were part of THIS batch and
-                // succeeded — never touch messages that belong to a new
-                // staging round.
-                self.mailbox.messages.retain(|msg| {
-                    !all_batch_ids.contains(&msg.id) || failed_ids.contains(&msg.id)
-                });
-
+                // Messages were already optimistically removed in
+                // commit_actions().  On failure, re-insert them with their
+                // original status restored.
                 if batch.failed.is_empty() {
                     self.mailbox.status_line = Some("Actions committed.".to_string());
                 } else {
+                    let failed_ids: std::collections::HashSet<MessageId> = batch
+                        .failed
+                        .iter()
+                        .map(|(action, _)| action.message_id)
+                        .collect();
+
+                    for mut msg in batch.removed_messages {
+                        if !failed_ids.contains(&msg.id) {
+                            continue;
+                        }
+                        // Find the original_status from the failed action.
+                        if let Some((action, _)) = batch
+                            .failed
+                            .iter()
+                            .find(|(a, _)| a.message_id == msg.id)
+                        {
+                            if let Some(original) = action.original_status {
+                                msg.status = original;
+                            }
+                        }
+                        self.mailbox.messages.push(msg);
+                    }
+
+                    resequence_messages(&mut self.mailbox.messages);
+
                     let summary = format!("Failed to apply {} actions.", batch.failed.len());
                     self.mailbox.status_line = Some(summary);
                     self.scheduled_actions
@@ -3129,6 +3142,61 @@ impl App {
             return Err(err.context("failed to queue actions with backend"));
         }
 
+        // Optimistically remove committed messages from the mailbox view.
+        let committed_ids: std::collections::HashSet<MessageId> = actions
+            .iter()
+            .map(|a| a.message_id)
+            .collect();
+
+        // Remember which message the cursor is on so we can restore it.
+        let selected_id = self
+            .mailbox
+            .selected
+            .and_then(|idx| self.mailbox.messages.get(idx))
+            .map(|msg| msg.id);
+
+        let mut removed = Vec::new();
+        let mut kept = Vec::new();
+        for msg in self.mailbox.messages.drain(..) {
+            if committed_ids.contains(&msg.id) {
+                removed.push(msg);
+            } else {
+                kept.push(msg);
+            }
+        }
+        self.mailbox.messages = kept;
+
+        if let Some(batch) = self.commit_batches.back_mut() {
+            batch.removed_messages = removed;
+        }
+
+        resequence_messages(&mut self.mailbox.messages);
+
+        // Restore selection: find the previously selected message in the
+        // remaining list.  If it was removed, clamp the index.
+        if self.mailbox.messages.is_empty() {
+            self.mailbox.selected = None;
+            self.message_view = None;
+        } else if let Some(id) = selected_id {
+            if let Some((new_idx, _)) = self
+                .mailbox
+                .messages
+                .iter()
+                .enumerate()
+                .find(|(_, m)| m.id == id)
+            {
+                self.mailbox.selected = Some(new_idx);
+            } else {
+                // Selected message was removed — keep the same position, clamped.
+                let idx = self.mailbox.selected.unwrap_or(0);
+                self.mailbox.selected =
+                    Some(idx.min(self.mailbox.messages.len() - 1));
+            }
+        }
+
+        self.sync_message_view_state();
+        self.normalize_scroll();
+
         Ok(())
     }
 
@@ -3436,6 +3504,25 @@ mod tests {
                         action,
                         result: Ok(()),
                     });
+                }
+            }
+        }
+
+        /// Complete all pending batches, failing actions whose message ID is
+        /// in `fail_ids`.
+        fn complete_with_failures(&self, fail_ids: &std::collections::HashSet<MessageId>) {
+            let batches: Vec<_> = {
+                let mut guard = self.pending.lock().unwrap();
+                std::mem::take(&mut *guard)
+            };
+            for (actions, tx) in batches {
+                for action in actions {
+                    let result = if fail_ids.contains(&action.message_id) {
+                        Err("simulated failure".to_string())
+                    } else {
+                        Ok(())
+                    };
+                    let _ = tx.send(ActionStatus { action, result });
                 }
             }
         }
@@ -3793,6 +3880,13 @@ mod tests {
         );
         assert_eq!(app.commit_batches.len(), 1, "one batch in flight");
 
+        // Messages are optimistically removed at commit time.
+        assert_eq!(
+            app.mailbox.messages.len(),
+            900,
+            "deleted messages removed immediately on commit"
+        );
+
         // WHILE the delete batch is in flight, stage 100 archival actions
         // (messages 101..=200).
         for id in 101..=200u64 {
@@ -3807,20 +3901,17 @@ mod tests {
             "100 archive actions staged"
         );
 
-        // Mailbox should still show all 1000 messages (nothing finalized yet).
-        assert_eq!(app.mailbox.messages.len(), 1000);
-
         // Now complete the delete batch in the backend.
         backend.complete_all();
 
         // Poll so the app sees the completions and finalizes.
         app.poll_commit_updates();
 
-        // The 100 deleted messages should be removed.
+        // Still 900 — no further removal needed since messages were already gone.
         assert_eq!(
             app.mailbox.messages.len(),
             900,
-            "900 messages remain after deletes committed"
+            "900 messages remain after deletes finalized"
         );
 
         // The 100 archive actions should still be staged (not committed).
@@ -3852,5 +3943,85 @@ mod tests {
             !deleted_present,
             "deleted messages should have been removed"
         );
+    }
+
+    #[test]
+    fn failed_actions_reinsert_messages_with_original_status() {
+        let backend = Arc::new(DeferredBackend::new());
+        let messages: Vec<Message> = (1..=10)
+            .map(|id| make_message(id, MessageStatus::Read))
+            .collect();
+        let mut app =
+            test_app_with_backend(messages, Arc::clone(&backend) as Arc<dyn MailBackend>);
+
+        assert_eq!(app.mailbox.messages.len(), 10);
+
+        // Stage deletions for messages 1..=5.
+        for id in 1..=5u64 {
+            app.schedule_action(ActionType::Delete, id, MessageStatus::Read);
+            if let Some(msg) = app.mailbox.messages.iter_mut().find(|m| m.id == id) {
+                msg.status = MessageStatus::Deleted;
+            }
+        }
+        assert_eq!(app.scheduled_actions.len(), 5);
+
+        // Commit — messages should be optimistically removed.
+        app.commit_actions().unwrap();
+        assert_eq!(
+            app.mailbox.messages.len(),
+            5,
+            "5 messages removed on commit"
+        );
+        assert!(app.scheduled_actions.is_empty());
+
+        // Complete the batch with failures for messages 2 and 4.
+        let fail_ids: std::collections::HashSet<MessageId> = [2, 4].iter().copied().collect();
+        backend.complete_with_failures(&fail_ids);
+
+        // Poll and finalize.
+        app.poll_commit_updates();
+
+        // Messages 2 and 4 should be re-inserted with original status (Read).
+        assert_eq!(
+            app.mailbox.messages.len(),
+            7,
+            "5 remaining + 2 re-inserted = 7"
+        );
+
+        for id in [2, 4] {
+            let msg = app
+                .mailbox
+                .messages
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("message {id} should have been re-inserted"));
+            assert_eq!(
+                msg.status,
+                MessageStatus::Read,
+                "message {id} should have original status restored"
+            );
+        }
+
+        // Successfully deleted messages (1, 3, 5) should still be gone.
+        for id in [1, 3, 5] {
+            assert!(
+                !app.mailbox.messages.iter().any(|m| m.id == id),
+                "message {id} should remain removed (succeeded)"
+            );
+        }
+
+        // Failed actions should be re-queued in scheduled_actions.
+        assert_eq!(
+            app.scheduled_actions.len(),
+            2,
+            "2 failed actions re-queued"
+        );
+        let requeued_ids: std::collections::HashSet<MessageId> = app
+            .scheduled_actions
+            .iter()
+            .map(|a| a.message_id)
+            .collect();
+        assert!(requeued_ids.contains(&2));
+        assert!(requeued_ids.contains(&4));
     }
 }
