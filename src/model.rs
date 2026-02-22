@@ -178,6 +178,7 @@ pub enum ActionType {
 pub struct Action {
     pub action_type: ActionType,
     pub message_id: MessageId,
+    pub original_status: Option<MessageStatus>,
 }
 
 impl Action {
@@ -185,6 +186,19 @@ impl Action {
         Self {
             action_type,
             message_id,
+            original_status: None,
+        }
+    }
+
+    pub fn with_original_status(
+        action_type: ActionType,
+        message_id: MessageId,
+        original_status: MessageStatus,
+    ) -> Self {
+        Self {
+            action_type,
+            message_id,
+            original_status: Some(original_status),
         }
     }
 }
