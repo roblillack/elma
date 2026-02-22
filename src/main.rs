@@ -25,10 +25,10 @@ use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 const TICK_RATE: Duration = Duration::from_millis(100);
 
 fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1);
+    let args = std::env::args().skip(1);
     let mut demo_mode = false;
 
-    while let Some(arg) = args.next() {
+    for arg in args {
         match arg.as_str() {
             "-D" | "--demo" => demo_mode = true,
             "-h" | "--help" => {

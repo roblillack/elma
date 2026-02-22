@@ -1,5 +1,7 @@
 # Elma – Electronic Mail Agent
 
+[![Build Status](https://github.com/roblillack/elma/workflows/build-lint-test/badge.svg)](https://github.com/roblillack/elma/actions)
+
 Elma is a Ratatui-based terminal mail user agent. It focuses on keyboard-driven
 navigation and efficiency, inspired by tools like Mutt, Pine, and Elm, while
 offering a modern feature set out-of-the-box, including:

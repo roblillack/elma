@@ -1,7 +1,16 @@
 [package]
-name = "elma-rs"
+name = "elma-tui"
 version = "0.1.0"
 edition = "2024"
+description = "A modern terminal-based email client"
+authors = ["Rob Lillack <rob@lillack.net>"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/roblillack/elma"
+
+[[bin]]
+name = "elma"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"

@@ -392,8 +392,10 @@ impl ComposeState {
         subject: String,
         body: Document,
     ) -> Self {
-        let mut state = Self::default();
-        state.draft_id = Some(draft_id);
+        let mut state = Self {
+            draft_id: Some(draft_id),
+            ..Default::default()
+        };
         state.to.value = to;
         state.to.cursor = text_len(&state.to.value);
         state.cc.value = cc;
@@ -709,7 +711,7 @@ fn mime_type_matches(part: &MessageContentPart, expected: &str) -> bool {
         .split(';')
         .next()
         .map(|value| value.trim())
-        .map_or(false, |value| value.eq_ignore_ascii_case(expected))
+        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
 }
 
 fn prefix_subject(subject: &str, prefix: &str) -> String {
@@ -789,7 +791,7 @@ fn build_forward_document(original: &Document, message: &Message) -> Document {
 
 fn split_addresses(input: &str) -> Vec<String> {
     input
-        .split(|ch| ch == ',' || ch == ';')
+        .split([',', ';'])
         .map(|part| part.trim())
         .filter(|part| !part.is_empty())
         .map(|part| part.to_string())
@@ -805,12 +807,10 @@ fn byte_index_for(text: &str, char_index: usize) -> usize {
         return 0;
     }
 
-    let mut count = 0usize;
-    for (idx, _) in text.char_indices() {
+    for (count, (idx, _)) in text.char_indices().enumerate() {
         if count == char_index {
             return idx;
         }
-        count += 1;
     }
 
     text.len()
@@ -1241,7 +1241,7 @@ impl App {
                 self.mailbox.status_line = Some("Switch cancelled.".to_string());
                 Ok(true)
             }
-            KeyCode::Char(ch) if matches!(ch, 'y' | 'Y') => {
+            KeyCode::Char('y' | 'Y') => {
                 let queued = self.scheduled_actions.len();
                 self.commit_actions()?;
                 self.pending_navigation = None;
@@ -1259,7 +1259,7 @@ impl App {
                 }
                 Ok(true)
             }
-            KeyCode::Char(ch) if matches!(ch, 'n' | 'N') => {
+            KeyCode::Char('n' | 'N') => {
                 let target = pending.target;
                 let discarded = self.discard_scheduled_actions()?;
                 self.pending_navigation = None;
@@ -1560,7 +1560,7 @@ impl App {
                 let completed = loaded_message_count(&self.mailbox.messages);
                 let progress = self
                     .mailbox_load_progress
-                    .get_or_insert_with(|| CommitProgress { total, completed });
+                    .get_or_insert(CommitProgress { total, completed });
                 progress.total = total;
                 progress.completed = completed;
                 self.mailbox.status_line =
@@ -1592,13 +1592,13 @@ impl App {
                     self.normalize_scroll();
                 }
 
-                if let Some(progress) = self.mailbox_load_progress.as_ref() {
-                    if progress.total > 0 {
-                        self.mailbox.status_line = Some(format!(
-                            "Loading {current}: {}/{} messages",
-                            completed, progress.total
-                        ));
-                    }
+                if let Some(progress) = self.mailbox_load_progress.as_ref()
+                    && progress.total > 0
+                {
+                    self.mailbox.status_line = Some(format!(
+                        "Loading {current}: {}/{} messages",
+                        completed, progress.total
+                    ));
                 }
             }
             MailboxLoadUpdate::Finished { events, status } => {
@@ -1662,13 +1662,13 @@ impl App {
                 }
             }
 
-            if delta_completed > 0 {
-                if let Some(progress) = self.commit_progress.as_mut() {
-                    progress.completed = progress
-                        .completed
-                        .saturating_add(delta_completed)
-                        .min(progress.total);
-                }
+            if delta_completed > 0
+                && let Some(progress) = self.commit_progress.as_mut()
+            {
+                progress.completed = progress
+                    .completed
+                    .saturating_add(delta_completed)
+                    .min(progress.total);
             }
         }
 
@@ -1678,10 +1678,7 @@ impl App {
     /// Integrate any finished batches back into the inbox state.
     fn finalize_commit_batches(&mut self) {
         loop {
-            let ready = match self.commit_batches.front() {
-                Some(batch) if batch.completed >= batch.len() || batch.finished => true,
-                _ => false,
-            };
+            let ready = matches!(self.commit_batches.front(), Some(batch) if batch.completed >= batch.len() || batch.finished);
 
             if !ready {
                 break;
@@ -1750,10 +1747,9 @@ impl App {
                         // Find the original_status from the failed action.
                         if let Some((action, _)) =
                             batch.failed.iter().find(|(a, _)| a.message_id == msg.id)
+                            && let Some(original) = action.original_status
                         {
-                            if let Some(original) = action.original_status {
-                                msg.status = original;
-                            }
+                            msg.status = original;
                         }
                         self.mailbox.messages.push(msg);
                     }
@@ -1768,10 +1764,11 @@ impl App {
             }
 
             self.sync_message_view_state();
-            if let Some(idx) = self.mailbox.selected {
-                if idx >= self.mailbox.messages.len() && !self.mailbox.messages.is_empty() {
-                    self.mailbox.selected = Some(self.mailbox.messages.len() - 1);
-                }
+            if let Some(idx) = self.mailbox.selected
+                && idx >= self.mailbox.messages.len()
+                && !self.mailbox.messages.is_empty()
+            {
+                self.mailbox.selected = Some(self.mailbox.messages.len() - 1);
             }
 
             if self.mailbox.messages.is_empty() {
@@ -1819,71 +1816,69 @@ impl App {
     pub(crate) fn inbox_action_bar(&self) -> String {
         let mut text = String::from("^Q:Quit g:GoToMailbox G:Accounts c:Compose");
 
-        if let Some(idx) = self.mailbox.selected {
-            if let Some(msg) = self.mailbox.messages.get(idx) {
-                if msg.is_placeholder() {
-                    text.push_str(" Loading message...");
-                    return text;
-                }
-                text.push_str(" Enter:Open");
-                if msg.starred {
-                    text.push_str(" s:Unstar");
-                } else {
-                    text.push_str(" s:Star");
-                }
-                if msg.important {
-                    text.push_str(" -:NotImportant");
-                } else {
-                    text.push_str(" +/=:Important");
-                }
+        if let Some(idx) = self.mailbox.selected
+            && let Some(msg) = self.mailbox.messages.get(idx)
+        {
+            if msg.is_placeholder() {
+                text.push_str(" Loading message...");
+                return text;
+            }
+            text.push_str(" Enter:Open");
+            if msg.starred {
+                text.push_str(" s:Unstar");
+            } else {
+                text.push_str(" s:Star");
+            }
+            if msg.important {
+                text.push_str(" -:NotImportant");
+            } else {
+                text.push_str(" +/=:Important");
+            }
 
-                let current_mailbox = self.current_mailbox;
-                let in_archive = current_mailbox == MailboxKind::Archive;
-                let in_trash = current_mailbox == MailboxKind::Trash;
-                let in_spam = current_mailbox == MailboxKind::Spam;
+            let current_mailbox = self.current_mailbox;
+            let in_archive = current_mailbox == MailboxKind::Archive;
+            let in_trash = current_mailbox == MailboxKind::Trash;
+            let in_spam = current_mailbox == MailboxKind::Spam;
 
-                match msg.status {
-                    MessageStatus::New | MessageStatus::Read => {
-                        text.push_str(" r:Reply y:Archive d:Delete");
-                    }
-                    MessageStatus::Deleted => {
-                        if in_trash {
-                            text.push_str(" r:Reply y:Archive d:MoveToInbox");
-                        } else {
-                            text.push_str(" r:Reply y:Archive u:Undelete");
-                        }
-                    }
-                    MessageStatus::Archived => {
-                        if in_archive {
-                            text.push_str(" r:Reply y:MoveToInbox d:Delete");
-                        } else {
-                            text.push_str(" r:Reply u:Unarchive d:Delete");
-                        }
-                    }
-                    MessageStatus::PendingInbox => {
-                        if in_trash {
-                            text.push_str(" r:Reply u:KeepDeleted");
-                        } else if in_archive {
-                            text.push_str(" r:Reply u:KeepArchived");
-                        } else if in_spam {
-                            text.push_str(" r:Reply u:KeepSpam");
-                        } else {
-                            text.push_str(" r:Reply");
-                        }
-                    }
-                    MessageStatus::Spam => {
-                        text.push_str(" r:Reply y:Archive d:Delete");
-                    }
+            match msg.status {
+                MessageStatus::New | MessageStatus::Read => {
+                    text.push_str(" r:Reply y:Archive d:Delete");
                 }
-
-                if msg.status != MessageStatus::PendingInbox {
-                    if in_spam {
-                        text.push_str(" !:MoveToInbox");
-                    } else if matches!(msg.status, MessageStatus::Spam) {
-                        text.push_str(" u:NoSpam");
+                MessageStatus::Deleted => {
+                    if in_trash {
+                        text.push_str(" r:Reply y:Archive d:Undelete");
                     } else {
-                        text.push_str(" !:Spam");
+                        text.push_str(" r:Reply y:Archive u:Undelete");
                     }
+                }
+                MessageStatus::Archived => {
+                    if in_archive {
+                        text.push_str(" r:Reply y:Unarchive d:Delete");
+                    } else {
+                        text.push_str(" r:Reply u:Unarchive d:Delete");
+                    }
+                }
+                MessageStatus::PendingInbox => {
+                    if in_trash {
+                        text.push_str(" r:Reply u:KeepDeleted");
+                    } else if in_archive {
+                        text.push_str(" r:Reply u:KeepArchived");
+                    } else if in_spam {
+                        text.push_str(" r:Reply u:KeepSpam");
+                    } else {
+                        text.push_str(" r:Reply");
+                    }
+                }
+                MessageStatus::Spam => {
+                    text.push_str(" r:Reply y:Archive d:Delete");
+                }
+            }
+
+            if msg.status != MessageStatus::PendingInbox {
+                if matches!(msg.status, MessageStatus::Spam) || in_spam {
+                    text.push_str(" !:NoSpam");
+                } else {
+                    text.push_str(" !:Spam");
                 }
             }
         }
@@ -1916,7 +1911,7 @@ impl App {
         }
 
         let capped_completed = progress.completed.min(progress.total);
-        let filled = (capped_completed * PROGRESS_SEGMENTS + progress.total - 1) / progress.total;
+        let filled = (capped_completed * PROGRESS_SEGMENTS).div_ceil(progress.total);
 
         let mut indicator = String::from("[");
         for idx in 0..PROGRESS_SEGMENTS {
@@ -2005,7 +2000,19 @@ impl App {
             KeyCode::Char('r') | KeyCode::Char('R') => self.open_reply(false)?,
             KeyCode::Char('a') | KeyCode::Char('A') => self.open_reply(true)?,
             KeyCode::Char('f') | KeyCode::Char('F') => self.open_forward()?,
-            KeyCode::Char('!') => self.schedule_move_to_spam(),
+            KeyCode::Char('!') => {
+                if let Some(idx) = self.mailbox.selected
+                    && let Some(msg) = self.mailbox.messages.get(idx)
+                {
+                    if self.current_mailbox == MailboxKind::Spam
+                        || msg.status == MessageStatus::Spam
+                    {
+                        self.schedule_move_to_inbox();
+                    } else {
+                        self.schedule_move_to_spam();
+                    }
+                }
+            }
             KeyCode::Char('$') => self.commit_actions()?,
             KeyCode::Enter => {
                 if !self.try_open_selected_draft()? {
@@ -2063,12 +2070,11 @@ impl App {
                     .find(|message| message.id == id)
                     .map(|msg| msg.starred);
 
-                if let Some(starred) = starred {
-                    if let Some(view) = self.message_view.as_mut() {
-                        if view.message_id == id {
-                            view.message.starred = starred;
-                        }
-                    }
+                if let Some(starred) = starred
+                    && let Some(view) = self.message_view.as_mut()
+                    && view.message_id == id
+                {
+                    view.message.starred = starred;
                 }
             }
             return Ok(());
@@ -2085,12 +2091,11 @@ impl App {
                     .find(|message| message.id == id)
                     .map(|msg| msg.important);
 
-                if let Some(important) = important {
-                    if let Some(view) = self.message_view.as_mut() {
-                        if view.message_id == id {
-                            view.message.important = important;
-                        }
-                    }
+                if let Some(important) = important
+                    && let Some(view) = self.message_view.as_mut()
+                    && view.message_id == id
+                {
+                    view.message.important = important;
                 }
             }
             return Ok(());
@@ -2107,12 +2112,11 @@ impl App {
                     .find(|message| message.id == id)
                     .map(|msg| msg.important);
 
-                if let Some(important) = important {
-                    if let Some(view) = self.message_view.as_mut() {
-                        if view.message_id == id {
-                            view.message.important = important;
-                        }
-                    }
+                if let Some(important) = important
+                    && let Some(view) = self.message_view.as_mut()
+                    && view.message_id == id
+                {
+                    view.message.important = important;
                 }
             }
             return Ok(());
@@ -2172,13 +2176,13 @@ impl App {
     }
 
     fn document_for_message(&mut self, message: &Message) -> Result<Document> {
-        if let Some(view) = self.message_view.as_ref() {
-            if view.message_id == message.id {
-                if let Some(document) = &view.document {
-                    return Ok(document.clone());
-                }
-                return Ok(document_from_message_content(&view.content));
+        if let Some(view) = self.message_view.as_ref()
+            && view.message_id == message.id
+        {
+            if let Some(document) = &view.document {
+                return Ok(document.clone());
             }
+            return Ok(document_from_message_content(&view.content));
         }
 
         let content = self
@@ -2216,10 +2220,10 @@ impl App {
         compose.set_focus(ComposeFocus::Body);
 
         let mut primary_recipient = message.sender.trim().to_string();
-        if primary_recipient.is_empty() {
-            if let Some(first) = message.recipients.first() {
-                primary_recipient = first.trim().to_string();
-            }
+        if primary_recipient.is_empty()
+            && let Some(first) = message.recipients.first()
+        {
+            primary_recipient = first.trim().to_string();
         }
 
         if !primary_recipient.is_empty() {
@@ -2388,7 +2392,7 @@ impl App {
                 KeyCode::Enter => {
                     return self.edit_compose_body();
                 }
-                KeyCode::Char(ch) if matches!(ch, 'e' | 'E') => {
+                KeyCode::Char('e' | 'E') => {
                     return self.edit_compose_body();
                 }
                 _ => {}
@@ -3380,7 +3384,6 @@ impl App {
                 labels: Vec::new(),
                 status: MessageStatus::Read,
                 starred: false,
-                important: false,
             };
         }
 
@@ -3404,7 +3407,6 @@ impl App {
             labels: message.labels.clone(),
             status: message.status,
             starred: message.starred,
-            important: message.important,
         }
     }
 }
@@ -3420,7 +3422,6 @@ pub(crate) struct MessageRow {
     pub(crate) labels: Vec<String>,
     pub(crate) status: MessageStatus,
     pub(crate) starred: bool,
-    pub(crate) important: bool,
 }
 
 impl App {

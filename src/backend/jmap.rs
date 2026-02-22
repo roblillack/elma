@@ -152,10 +152,8 @@ impl MailBackend for JmapBackend {
                 }
             }
 
-            if refresh_needed {
-                if let Err(err) = inner.refresh_current_mailbox().await {
-                    eprintln!("JMAP refresh error after actions: {err:?}");
-                }
+            if refresh_needed && let Err(err) = inner.refresh_current_mailbox().await {
+                eprintln!("JMAP refresh error after actions: {err:?}");
             }
         });
 
@@ -260,10 +258,10 @@ impl JmapInner {
 
             if is_new {
                 added_ids.push(message_id);
-            } else if let Some(previous) = state.messages.get(&message_id) {
-                if flags_changed(&previous.message, &message) {
-                    updated_ids.push(message_id);
-                }
+            } else if let Some(previous) = state.messages.get(&message_id)
+                && flags_changed(&previous.message, &message)
+            {
+                updated_ids.push(message_id);
             }
 
             if let Some(pos) = remaining_ids.iter().position(|id| *id == message_id) {
@@ -1018,11 +1016,11 @@ impl MailboxCache {
     }
 
     fn set_total(&mut self, kind: MailboxKind, total: usize) {
-        if let Some(id) = self.by_kind.get(&kind) {
-            if let Some(info) = self.by_id.get_mut(id) {
-                info.total_emails = total;
-                return;
-            }
+        if let Some(id) = self.by_kind.get(&kind)
+            && let Some(info) = self.by_id.get_mut(id)
+        {
+            info.total_emails = total;
+            return;
         }
         self.totals_override.insert(kind, total);
     }
@@ -1421,14 +1419,14 @@ fn collect_parts(
     parts: &mut Vec<MessageContentPart>,
 ) {
     for segment in segments {
-        if let Some(part_id) = segment.part_id() {
-            if let Some(body) = email.body_value(part_id) {
-                let content_type = segment.content_type().unwrap_or("text/plain").to_string();
-                parts.push(MessageContentPart {
-                    content_type,
-                    content: body.value().as_bytes().to_vec(),
-                });
-            }
+        if let Some(part_id) = segment.part_id()
+            && let Some(body) = email.body_value(part_id)
+        {
+            let content_type = segment.content_type().unwrap_or("text/plain").to_string();
+            parts.push(MessageContentPart {
+                content_type,
+                content: body.value().as_bytes().to_vec(),
+            });
         }
     }
 }
