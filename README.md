@@ -70,6 +70,14 @@ Elma differentiates between two different types of actions on messages:
   message, it is marked for deletion but not removed from the list until you commit all the scheduled changes (by
   pressing `$`). This allows you to quickly go through a large amount of messages and review and modify your scheduled actions before they are finalized.
 
+  Scheduled actions (`d`, `y`, `!`) are **idempotent**: pressing the same key on
+  a message that is already scheduled for that action is a no-op — it keeps the
+  action and advances to the next message. This means you can sweep through a
+  list pressing `d` repeatedly without accidentally undeleting a message you
+  marked earlier. To undo a scheduled action, press `u` — this removes the
+  pending action, restores the message's original status, and advances to the
+  next message.
+
 ### Email flags
 
 Message status is indicated by a four symbol character prefix in the message list:
@@ -101,7 +109,9 @@ Message status is indicated by a four symbol character prefix in the message lis
 - `Enter`/`Right` opens the selected message; `Esc`/`Left` closes the viewer.
 - `d`, `Delete`, or `Backspace` schedule the message for deletion.
 - `y` schedules the message for archival.
-- `s` toggles the star flag; `u` toggles unread/read state.
+- `!` schedules the message to move to spam.
+- `u` unschedules a pending action (delete/archive/spam), or toggles unread/read state on normal messages.
+- `s` toggles the star flag.
 - `$` commits scheduled actions (removing archived/deleted messages from the list).
 - Arrow keys, `PageUp`/`PageDown`, `Home`, `End` move the cursor in the inbox.
 - While a message is open, `j` / `k` jump to the next/previous message and `.` toggles raw HTML.
