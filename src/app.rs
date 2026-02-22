@@ -235,8 +235,8 @@ enum ScheduleOutcome {
     Added,
     /// An existing action for the same message was replaced with this one.
     Replaced,
-    /// The same action was already scheduled; it has been removed (toggle-off).
-    Toggled { original_status: MessageStatus },
+    /// The same action was already scheduled; no change made.
+    AlreadyScheduled,
 }
 
 #[derive(Clone, Copy)]
@@ -2729,10 +2729,9 @@ impl App {
         }
     }
 
-    /// Schedule a move/delete action with dedup and toggle-off logic.
+    /// Schedule a move/delete action with dedup logic.
     ///
-    /// - Same action type for the same message already exists → toggle off (remove it),
-    ///   return `Toggled` with the original status so the caller can restore it.
+    /// - Same action type for the same message already exists → no-op, return `AlreadyScheduled`.
     /// - Different move action for same message exists → replace in-place, return `Replaced`.
     /// - No existing action → push new action, return `Added`.
     fn schedule_action(
@@ -2747,10 +2746,9 @@ impl App {
             .position(|a| a.message_id == message_id)
         {
             if self.scheduled_actions[pos].action_type == action_type {
-                // Same action → toggle off
-                let removed = self.scheduled_actions.remove(pos);
-                let original_status = removed.original_status.unwrap_or(current_status);
-                return ScheduleOutcome::Toggled { original_status };
+                // Same action already scheduled — keep it (idempotent).
+                // Use 'u' to explicitly undo a scheduled action.
+                return ScheduleOutcome::AlreadyScheduled;
             }
             // Different action → replace, keep original_status from first scheduling
             let original = self.scheduled_actions[pos].original_status;
@@ -2846,10 +2844,8 @@ impl App {
         let current_status = msg.status;
 
         match self.schedule_action(ActionType::Archive, message_id, current_status) {
-            ScheduleOutcome::Toggled { original_status } => {
-                if let Some(msg) = self.mailbox.messages.iter_mut().find(|m| m.id == message_id) {
-                    msg.status = original_status;
-                }
+            ScheduleOutcome::AlreadyScheduled => {
+                self.advance_selection_after_action(idx);
             }
             ScheduleOutcome::Added | ScheduleOutcome::Replaced => {
                 if let Some(msg) = self.mailbox.messages.iter_mut().find(|m| m.id == message_id) {
@@ -2882,10 +2878,8 @@ impl App {
         let current_status = msg.status;
 
         match self.schedule_action(ActionType::Delete, message_id, current_status) {
-            ScheduleOutcome::Toggled { original_status } => {
-                if let Some(msg) = self.mailbox.messages.iter_mut().find(|m| m.id == message_id) {
-                    msg.status = original_status;
-                }
+            ScheduleOutcome::AlreadyScheduled => {
+                self.advance_selection_after_action(idx);
             }
             ScheduleOutcome::Added | ScheduleOutcome::Replaced => {
                 if let Some(msg) = self.mailbox.messages.iter_mut().find(|m| m.id == message_id) {
@@ -2913,10 +2907,8 @@ impl App {
         let current_status = msg.status;
 
         match self.schedule_action(ActionType::MoveToSpam, message_id, current_status) {
-            ScheduleOutcome::Toggled { original_status } => {
-                if let Some(msg) = self.mailbox.messages.iter_mut().find(|m| m.id == message_id) {
-                    msg.status = original_status;
-                }
+            ScheduleOutcome::AlreadyScheduled => {
+                self.advance_selection_after_action(idx);
             }
             ScheduleOutcome::Added | ScheduleOutcome::Replaced => {
                 if let Some(msg) = self.mailbox.messages.iter_mut().find(|m| m.id == message_id) {
@@ -2951,10 +2943,8 @@ impl App {
         let current_status = msg.status;
 
         match self.schedule_action(action_type, message_id, current_status) {
-            ScheduleOutcome::Toggled { original_status } => {
-                if let Some(msg) = self.mailbox.messages.iter_mut().find(|m| m.id == message_id) {
-                    msg.status = original_status;
-                }
+            ScheduleOutcome::AlreadyScheduled => {
+                self.advance_selection_after_action(idx);
             }
             ScheduleOutcome::Added | ScheduleOutcome::Replaced => {
                 if let Some(msg) = self.mailbox.messages.iter_mut().find(|m| m.id == message_id) {
@@ -3001,30 +2991,42 @@ impl App {
                 }
             }
             MessageStatus::Deleted | MessageStatus::Archived | MessageStatus::Spam => {
-                // Rescue operation — use scheduled action with dedup
                 let message_id = msg.id;
                 let current_status = msg.status;
+                let idx = self.mailbox.selected.unwrap();
 
-                match self.schedule_action(
-                    ActionType::MoveToInboxRead,
-                    message_id,
-                    current_status,
-                ) {
-                    ScheduleOutcome::Toggled { original_status } => {
-                        if let Some(msg) =
-                            self.mailbox.messages.iter_mut().find(|m| m.id == message_id)
-                        {
-                            msg.status = original_status;
-                        }
+                // If there's a scheduled action for this message, undo it.
+                if let Some(pos) = self
+                    .scheduled_actions
+                    .iter()
+                    .position(|a| a.message_id == message_id)
+                {
+                    let removed = self.scheduled_actions.remove(pos);
+                    let original_status =
+                        removed.original_status.unwrap_or(current_status);
+                    if let Some(msg) =
+                        self.mailbox.messages.iter_mut().find(|m| m.id == message_id)
+                    {
+                        msg.status = original_status;
                     }
-                    ScheduleOutcome::Added | ScheduleOutcome::Replaced => {
-                        if let Some(msg) =
-                            self.mailbox.messages.iter_mut().find(|m| m.id == message_id)
-                        {
-                            msg.status = MessageStatus::PendingInbox;
+                } else {
+                    // Genuinely deleted/archived on server — rescue via scheduled action
+                    match self.schedule_action(
+                        ActionType::MoveToInboxRead,
+                        message_id,
+                        current_status,
+                    ) {
+                        ScheduleOutcome::AlreadyScheduled => {}
+                        ScheduleOutcome::Added | ScheduleOutcome::Replaced => {
+                            if let Some(msg) =
+                                self.mailbox.messages.iter_mut().find(|m| m.id == message_id)
+                            {
+                                msg.status = MessageStatus::PendingInbox;
+                            }
                         }
                     }
                 }
+                self.advance_selection_after_action(idx);
             }
             MessageStatus::PendingInbox => {
                 self.mailbox.status_line =
@@ -3612,21 +3614,9 @@ mod tests {
         let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
         app.schedule_action(ActionType::Delete, 1, MessageStatus::Read);
         let outcome = app.schedule_action(ActionType::Delete, 1, MessageStatus::Deleted);
-        assert!(matches!(outcome, ScheduleOutcome::Toggled { original_status: MessageStatus::Read }));
-        assert!(app.scheduled_actions.is_empty());
-    }
-
-    #[test]
-    fn toggle_preserves_original_status() {
-        let mut app = test_app(vec![make_message(1, MessageStatus::New)]);
-        app.schedule_action(ActionType::Delete, 1, MessageStatus::New);
-        let outcome = app.schedule_action(ActionType::Delete, 1, MessageStatus::Deleted);
-        match outcome {
-            ScheduleOutcome::Toggled { original_status } => {
-                assert_eq!(original_status, MessageStatus::New);
-            }
-            _ => panic!("expected Toggled"),
-        }
+        assert_eq!(outcome, ScheduleOutcome::AlreadyScheduled);
+        assert_eq!(app.scheduled_actions.len(), 1);
+        assert_eq!(app.scheduled_actions[0].action_type, ActionType::Delete);
     }
 
     // -- Move-group replacement -----------------------------------------------
@@ -3718,53 +3708,52 @@ mod tests {
     }
 
     #[test]
-    fn toggle_only_affects_target_message() {
+    fn same_action_again_is_idempotent_per_message() {
         let mut app = test_app(vec![
             make_message(1, MessageStatus::Read),
             make_message(2, MessageStatus::Read),
         ]);
         app.schedule_action(ActionType::Delete, 1, MessageStatus::Read);
         app.schedule_action(ActionType::Delete, 2, MessageStatus::Read);
-        // Toggle off msg 1
-        app.schedule_action(ActionType::Delete, 1, MessageStatus::Deleted);
-        assert_eq!(app.scheduled_actions.len(), 1);
-        assert_eq!(app.scheduled_actions[0].message_id, 2);
+        // Same action on msg 1 again — no-op
+        let outcome = app.schedule_action(ActionType::Delete, 1, MessageStatus::Deleted);
+        assert_eq!(outcome, ScheduleOutcome::AlreadyScheduled);
+        assert_eq!(app.scheduled_actions.len(), 2);
+        assert_eq!(app.scheduled_actions[0].message_id, 1);
+        assert_eq!(app.scheduled_actions[1].message_id, 2);
     }
 
     // -- Complex sequences ----------------------------------------------------
 
     #[test]
-    fn schedule_delete_toggle_off_then_archive() {
+    fn same_action_stays_then_different_replaces() {
         let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
         // Delete
         app.schedule_action(ActionType::Delete, 1, MessageStatus::Read);
-        // Toggle off
-        app.schedule_action(ActionType::Delete, 1, MessageStatus::Deleted);
-        assert!(app.scheduled_actions.is_empty());
-        // Archive
-        let outcome = app.schedule_action(ActionType::Archive, 1, MessageStatus::Read);
-        assert_eq!(outcome, ScheduleOutcome::Added);
+        // Same action — no-op
+        let outcome = app.schedule_action(ActionType::Delete, 1, MessageStatus::Deleted);
+        assert_eq!(outcome, ScheduleOutcome::AlreadyScheduled);
+        assert_eq!(app.scheduled_actions.len(), 1);
+        // Different action replaces
+        let outcome = app.schedule_action(ActionType::Archive, 1, MessageStatus::Deleted);
+        assert_eq!(outcome, ScheduleOutcome::Replaced);
         assert_eq!(app.scheduled_actions.len(), 1);
         assert_eq!(app.scheduled_actions[0].action_type, ActionType::Archive);
     }
 
     #[test]
-    fn replace_then_toggle_off() {
+    fn replace_then_same_action_is_idempotent() {
         let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
         // Delete
         app.schedule_action(ActionType::Delete, 1, MessageStatus::Read);
         // Replace with archive
         app.schedule_action(ActionType::Archive, 1, MessageStatus::Deleted);
         assert_eq!(app.scheduled_actions.len(), 1);
-        // Toggle off archive
+        // Same action again — stays scheduled
         let outcome = app.schedule_action(ActionType::Archive, 1, MessageStatus::Archived);
-        match outcome {
-            ScheduleOutcome::Toggled { original_status } => {
-                assert_eq!(original_status, MessageStatus::Read);
-            }
-            _ => panic!("expected Toggled"),
-        }
-        assert!(app.scheduled_actions.is_empty());
+        assert_eq!(outcome, ScheduleOutcome::AlreadyScheduled);
+        assert_eq!(app.scheduled_actions.len(), 1);
+        assert_eq!(app.scheduled_actions[0].action_type, ActionType::Archive);
     }
 
     #[test]
@@ -3788,15 +3777,18 @@ mod tests {
         assert_eq!(app.scheduled_actions.len(), 3);
         assert_eq!(app.scheduled_actions[0].action_type, ActionType::Archive);
 
-        // Toggle off msg 2
-        app.schedule_action(ActionType::Archive, 2, MessageStatus::Archived);
-        assert_eq!(app.scheduled_actions.len(), 2);
+        // Same action on msg 2 — no-op
+        let outcome = app.schedule_action(ActionType::Archive, 2, MessageStatus::Archived);
+        assert_eq!(outcome, ScheduleOutcome::AlreadyScheduled);
+        assert_eq!(app.scheduled_actions.len(), 3);
 
-        // Verify final state: msg 1 archive, msg 3 spam
+        // Verify final state: msg 1 archive, msg 2 archive, msg 3 spam
         assert_eq!(app.scheduled_actions[0].message_id, 1);
         assert_eq!(app.scheduled_actions[0].action_type, ActionType::Archive);
-        assert_eq!(app.scheduled_actions[1].message_id, 3);
-        assert_eq!(app.scheduled_actions[1].action_type, ActionType::MoveToSpam);
+        assert_eq!(app.scheduled_actions[1].message_id, 2);
+        assert_eq!(app.scheduled_actions[1].action_type, ActionType::Archive);
+        assert_eq!(app.scheduled_actions[2].message_id, 3);
+        assert_eq!(app.scheduled_actions[2].action_type, ActionType::MoveToSpam);
     }
 
     // -- Stress / invariant checking ------------------------------------------
@@ -3840,13 +3832,15 @@ mod tests {
     }
 
     #[test]
-    fn rapid_toggle_on_off_leaves_clean_state() {
+    fn repeated_same_action_stays_scheduled() {
         let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        app.schedule_action(ActionType::Delete, 1, MessageStatus::Read);
+        assert_eq!(app.scheduled_actions.len(), 1);
+        // Pressing delete 50 more times keeps it scheduled
         for _ in 0..50 {
-            app.schedule_action(ActionType::Delete, 1, MessageStatus::Read);
+            let outcome = app.schedule_action(ActionType::Delete, 1, MessageStatus::Deleted);
+            assert_eq!(outcome, ScheduleOutcome::AlreadyScheduled);
             assert_eq!(app.scheduled_actions.len(), 1);
-            app.schedule_action(ActionType::Delete, 1, MessageStatus::Deleted);
-            assert!(app.scheduled_actions.is_empty());
         }
     }
 
