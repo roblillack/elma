@@ -1727,10 +1727,7 @@ impl App {
                             }
                         }
                     }
-                    let summary = format!(
-                        "Failed to apply {} action(s).",
-                        batch.failed.len()
-                    );
+                    let summary = format!("Failed to apply {} action(s).", batch.failed.len());
                     self.mailbox.status_line = Some(summary);
                 }
             } else {
@@ -1751,10 +1748,8 @@ impl App {
                             continue;
                         }
                         // Find the original_status from the failed action.
-                        if let Some((action, _)) = batch
-                            .failed
-                            .iter()
-                            .find(|(a, _)| a.message_id == msg.id)
+                        if let Some((action, _)) =
+                            batch.failed.iter().find(|(a, _)| a.message_id == msg.id)
                         {
                             if let Some(original) = action.original_status {
                                 msg.status = original;
@@ -1846,26 +1841,35 @@ impl App {
                 let in_archive = current_mailbox == MailboxKind::Archive;
                 let in_trash = current_mailbox == MailboxKind::Trash;
                 let in_spam = current_mailbox == MailboxKind::Spam;
+
                 match msg.status {
                     MessageStatus::New | MessageStatus::Read => {
                         text.push_str(" r:Reply y:Archive d:Delete");
                     }
                     MessageStatus::Deleted => {
                         if in_trash {
-                            text.push_str(" r:Reply y:Archive d:Undelete");
+                            text.push_str(" r:Reply y:Archive d:MoveToInbox");
                         } else {
                             text.push_str(" r:Reply y:Archive u:Undelete");
                         }
                     }
                     MessageStatus::Archived => {
                         if in_archive {
-                            text.push_str(" r:Reply y:Unarchive d:Delete");
+                            text.push_str(" r:Reply y:MoveToInbox d:Delete");
                         } else {
                             text.push_str(" r:Reply u:Unarchive d:Delete");
                         }
                     }
                     MessageStatus::PendingInbox => {
-                        text.push_str(" r:Reply");
+                        if in_trash {
+                            text.push_str(" r:Reply u:KeepDeleted");
+                        } else if in_archive {
+                            text.push_str(" r:Reply u:KeepArchived");
+                        } else if in_spam {
+                            text.push_str(" r:Reply u:KeepSpam");
+                        } else {
+                            text.push_str(" r:Reply");
+                        }
                     }
                     MessageStatus::Spam => {
                         text.push_str(" r:Reply y:Archive d:Delete");
@@ -1873,7 +1877,9 @@ impl App {
                 }
 
                 if msg.status != MessageStatus::PendingInbox {
-                    if matches!(msg.status, MessageStatus::Spam) || in_spam {
+                    if in_spam {
+                        text.push_str(" !:MoveToInbox");
+                    } else if matches!(msg.status, MessageStatus::Spam) {
                         text.push_str(" u:NoSpam");
                     } else {
                         text.push_str(" !:Spam");
@@ -2741,13 +2747,15 @@ impl App {
             // Different action → replace, keep original_status from first scheduling
             let original = self.scheduled_actions[pos].original_status;
             self.scheduled_actions[pos].action_type = action_type;
-            self.scheduled_actions[pos].original_status =
-                original.or(Some(current_status));
+            self.scheduled_actions[pos].original_status = original.or(Some(current_status));
             return ScheduleOutcome::Replaced;
         }
 
-        self.scheduled_actions
-            .push(Action::with_original_status(action_type, message_id, current_status));
+        self.scheduled_actions.push(Action::with_original_status(
+            action_type,
+            message_id,
+            current_status,
+        ));
         ScheduleOutcome::Added
     }
 
@@ -2836,7 +2844,12 @@ impl App {
                 self.advance_selection_after_action(idx);
             }
             ScheduleOutcome::Added | ScheduleOutcome::Replaced => {
-                if let Some(msg) = self.mailbox.messages.iter_mut().find(|m| m.id == message_id) {
+                if let Some(msg) = self
+                    .mailbox
+                    .messages
+                    .iter_mut()
+                    .find(|m| m.id == message_id)
+                {
                     msg.status = MessageStatus::Archived;
                 }
                 self.advance_selection_after_action(idx);
@@ -2870,7 +2883,12 @@ impl App {
                 self.advance_selection_after_action(idx);
             }
             ScheduleOutcome::Added | ScheduleOutcome::Replaced => {
-                if let Some(msg) = self.mailbox.messages.iter_mut().find(|m| m.id == message_id) {
+                if let Some(msg) = self
+                    .mailbox
+                    .messages
+                    .iter_mut()
+                    .find(|m| m.id == message_id)
+                {
                     msg.status = MessageStatus::Deleted;
                 }
                 self.advance_selection_after_action(idx);
@@ -2880,6 +2898,11 @@ impl App {
     }
 
     fn schedule_move_to_spam(&mut self) {
+        if self.current_mailbox == MailboxKind::Spam {
+            self.schedule_move_to_inbox();
+            return;
+        }
+
         let Some(idx) = self.mailbox.selected else {
             return;
         };
@@ -2899,7 +2922,12 @@ impl App {
                 self.advance_selection_after_action(idx);
             }
             ScheduleOutcome::Added | ScheduleOutcome::Replaced => {
-                if let Some(msg) = self.mailbox.messages.iter_mut().find(|m| m.id == message_id) {
+                if let Some(msg) = self
+                    .mailbox
+                    .messages
+                    .iter_mut()
+                    .find(|m| m.id == message_id)
+                {
                     msg.status = MessageStatus::Spam;
                 }
                 self.advance_selection_after_action(idx);
@@ -2935,7 +2963,12 @@ impl App {
                 self.advance_selection_after_action(idx);
             }
             ScheduleOutcome::Added | ScheduleOutcome::Replaced => {
-                if let Some(msg) = self.mailbox.messages.iter_mut().find(|m| m.id == message_id) {
+                if let Some(msg) = self
+                    .mailbox
+                    .messages
+                    .iter_mut()
+                    .find(|m| m.id == message_id)
+                {
                     msg.status = MessageStatus::PendingInbox;
                 }
                 self.advance_selection_after_action(idx);
@@ -2990,10 +3023,12 @@ impl App {
                     .position(|a| a.message_id == message_id)
                 {
                     let removed = self.scheduled_actions.remove(pos);
-                    let original_status =
-                        removed.original_status.unwrap_or(current_status);
-                    if let Some(msg) =
-                        self.mailbox.messages.iter_mut().find(|m| m.id == message_id)
+                    let original_status = removed.original_status.unwrap_or(current_status);
+                    if let Some(msg) = self
+                        .mailbox
+                        .messages
+                        .iter_mut()
+                        .find(|m| m.id == message_id)
                     {
                         msg.status = original_status;
                     }
@@ -3006,8 +3041,11 @@ impl App {
                     ) {
                         ScheduleOutcome::AlreadyScheduled => {}
                         ScheduleOutcome::Added | ScheduleOutcome::Replaced => {
-                            if let Some(msg) =
-                                self.mailbox.messages.iter_mut().find(|m| m.id == message_id)
+                            if let Some(msg) = self
+                                .mailbox
+                                .messages
+                                .iter_mut()
+                                .find(|m| m.id == message_id)
                             {
                                 msg.status = MessageStatus::PendingInbox;
                             }
@@ -3017,9 +3055,25 @@ impl App {
                 self.advance_selection_after_action(idx);
             }
             MessageStatus::PendingInbox => {
-                self.mailbox.status_line =
-                    Some("Message already scheduled to move to inbox.".to_string());
-                return;
+                let message_id = msg.id;
+                let idx = self.mailbox.selected.unwrap();
+                if let Some(pos) = self
+                    .scheduled_actions
+                    .iter()
+                    .position(|a| a.message_id == message_id)
+                {
+                    let removed = self.scheduled_actions.remove(pos);
+                    let original_status = removed.original_status.unwrap_or(MessageStatus::Read);
+                    if let Some(msg) = self
+                        .mailbox
+                        .messages
+                        .iter_mut()
+                        .find(|m| m.id == message_id)
+                    {
+                        msg.status = original_status;
+                    }
+                }
+                self.advance_selection_after_action(idx);
             }
         }
         self.mailbox.status_line = None;
@@ -3133,10 +3187,8 @@ impl App {
         }
 
         // Optimistically remove committed messages from the mailbox view.
-        let committed_ids: std::collections::HashSet<MessageId> = actions
-            .iter()
-            .map(|a| a.message_id)
-            .collect();
+        let committed_ids: std::collections::HashSet<MessageId> =
+            actions.iter().map(|a| a.message_id).collect();
 
         // Remember which message the cursor is on so we can restore it.
         let selected_id = self
@@ -3179,8 +3231,7 @@ impl App {
             } else {
                 // Selected message was removed — keep the same position, clamped.
                 let idx = self.mailbox.selected.unwrap_or(0);
-                self.mailbox.selected =
-                    Some(idx.min(self.mailbox.messages.len() - 1));
+                self.mailbox.selected = Some(idx.min(self.mailbox.messages.len() - 1));
             }
         }
 
@@ -3403,9 +3454,11 @@ impl DerefMut for App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{ActionStatus, BackendEvent, MailBackend, MailboxSnapshot, OutgoingMessage};
+    use crate::backend::{
+        ActionStatus, BackendEvent, MailBackend, MailboxSnapshot, OutgoingMessage,
+    };
     use crate::model::{Action, ActionType, Message, MessageId, MessageStatus};
-    use std::sync::{mpsc, Mutex};
+    use std::sync::{Mutex, mpsc};
     use time::OffsetDateTime;
 
     // -- Test infrastructure --------------------------------------------------
@@ -3418,7 +3471,13 @@ mod tests {
             _mailbox: MailboxKind,
         ) -> anyhow::Result<(MailboxSnapshot, mpsc::Receiver<BackendEvent>)> {
             let (_tx, rx) = mpsc::channel();
-            Ok((MailboxSnapshot { total: 0, messages: vec![] }, rx))
+            Ok((
+                MailboxSnapshot {
+                    total: 0,
+                    messages: vec![],
+                },
+                rx,
+            ))
         }
 
         fn load_message(&self, _message_id: MessageId) -> anyhow::Result<MessageContent> {
@@ -3524,7 +3583,13 @@ mod tests {
             _mailbox: MailboxKind,
         ) -> anyhow::Result<(MailboxSnapshot, mpsc::Receiver<BackendEvent>)> {
             let (_tx, rx) = mpsc::channel();
-            Ok((MailboxSnapshot { total: 0, messages: vec![] }, rx))
+            Ok((
+                MailboxSnapshot {
+                    total: 0,
+                    messages: vec![],
+                },
+                rx,
+            ))
         }
 
         fn load_message(&self, _message_id: MessageId) -> anyhow::Result<MessageContent> {
@@ -3643,8 +3708,11 @@ mod tests {
     fn schedule_replaces_move_to_inbox_variants() {
         let mut app = test_app(vec![make_message(1, MessageStatus::Deleted)]);
         app.schedule_action(ActionType::MoveToInboxRead, 1, MessageStatus::Deleted);
-        let outcome =
-            app.schedule_action(ActionType::MoveToInboxUnread, 1, MessageStatus::PendingInbox);
+        let outcome = app.schedule_action(
+            ActionType::MoveToInboxUnread,
+            1,
+            MessageStatus::PendingInbox,
+        );
         assert_eq!(outcome, ScheduleOutcome::Replaced);
         assert_eq!(app.scheduled_actions.len(), 1);
         assert_eq!(
@@ -3804,11 +3872,8 @@ mod tests {
             app.schedule_action(action_type, msg_id, MessageStatus::Read);
 
             // Invariant: at most one action per message
-            let mut seen_ids: Vec<MessageId> = app
-                .scheduled_actions
-                .iter()
-                .map(|a| a.message_id)
-                .collect();
+            let mut seen_ids: Vec<MessageId> =
+                app.scheduled_actions.iter().map(|a| a.message_id).collect();
             seen_ids.sort();
             seen_ids.dedup();
             assert_eq!(
@@ -3933,8 +3998,7 @@ mod tests {
         let messages: Vec<Message> = (1..=10)
             .map(|id| make_message(id, MessageStatus::Read))
             .collect();
-        let mut app =
-            test_app_with_backend(messages, Arc::clone(&backend) as Arc<dyn MailBackend>);
+        let mut app = test_app_with_backend(messages, Arc::clone(&backend) as Arc<dyn MailBackend>);
 
         assert_eq!(app.mailbox.messages.len(), 10);
 
@@ -3993,16 +4057,9 @@ mod tests {
         }
 
         // Failed actions should be re-queued in scheduled_actions.
-        assert_eq!(
-            app.scheduled_actions.len(),
-            2,
-            "2 failed actions re-queued"
-        );
-        let requeued_ids: std::collections::HashSet<MessageId> = app
-            .scheduled_actions
-            .iter()
-            .map(|a| a.message_id)
-            .collect();
+        assert_eq!(app.scheduled_actions.len(), 2, "2 failed actions re-queued");
+        let requeued_ids: std::collections::HashSet<MessageId> =
+            app.scheduled_actions.iter().map(|a| a.message_id).collect();
         assert!(requeued_ids.contains(&2));
         assert!(requeued_ids.contains(&4));
     }

@@ -110,7 +110,7 @@ Message status is indicated by a four symbol character prefix in the message lis
 - `d`, `Delete`, or `Backspace` schedule the message for deletion.
 - `y` schedules the message for archival.
 - `!` schedules the message to move to spam.
-- `u` unschedules a pending action (delete/archive/spam), or toggles unread/read state on normal messages.
+- `u` unschedules a pending action (delete/archive/spam/move-to-inbox), or toggles unread/read state on normal messages.
 - `s` toggles the star flag.
 - `$` commits scheduled actions (removing archived/deleted messages from the list).
 - Arrow keys, `PageUp`/`PageDown`, `Home`, `End` move the cursor in the inbox.
@@ -124,3 +124,6 @@ Message status is indicated by a four symbol character prefix in the message lis
   - `t` Sent
   - `S` Spam (Should be `j` or even `!`?)
   - `T` Trash (Should be `g` `r` or even `g` `#`?)
+
+When viewing a special mailbox (Archive, Spam, Trash), the primary action key for that mailbox is flipped: `d` in Trash, `y` in Archive, and `!` in Spam each schedule a move back to inbox instead. Pressing `u` then unstages that move, keeping the message where it is.
+  
