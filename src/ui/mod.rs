@@ -97,7 +97,7 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
             Constraint::Min(0),
             Constraint::Length(1),
         ])
-        .split(frame.size());
+        .split(frame.area());
 
     render_action_bar(
         frame,
@@ -109,11 +109,11 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
     render_message_table(frame, app, layout[1]);
 
     let mut info_text = app.inbox_info_bar();
-    if let Some(status) = app.inbox_status_line() {
-        if !status.is_empty() {
-            info_text.push_str(" — ");
-            info_text.push_str(status);
-        }
+    if let Some(status) = app.inbox_status_line()
+        && !status.is_empty()
+    {
+        info_text.push_str(" — ");
+        info_text.push_str(status);
     }
     let info_bar = Paragraph::new(info_text)
         .style(action_bar_style())
@@ -127,7 +127,7 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
         return;
     }
 
-    let frame_area = frame.size();
+    let frame_area = frame.area();
     let dialog_width = if frame_area.width >= 90 {
         80u16.min(frame_area.width)
     } else {
@@ -230,7 +230,7 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(status, layout[4]);
 
     if let Some((x, y)) = cursor_pos {
-        frame.set_cursor(x, y);
+        frame.set_cursor_position((x, y));
     }
 }
 
@@ -439,14 +439,14 @@ fn render_message(frame: &mut Frame<'_>, app: &mut App) {
             Constraint::Min(0),
             Constraint::Length(1),
         ])
-        .split(frame.size());
+        .split(frame.area());
 
     let action_bar_text = message_action_bar(app, view);
     render_action_bar(frame, layout[0], action_bar_text, app.commit_indicator());
 
     render_message_body(frame, view, layout[1]);
 
-    let info_text = view.info_line.clone().unwrap_or_else(|| String::new());
+    let info_text = view.info_line.clone().unwrap_or_else(String::new);
     let info_bar = Paragraph::new(info_text)
         .style(action_bar_style())
         .block(Block::default());
@@ -526,16 +526,16 @@ fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let table = Table::new(visible_rows, widths)
         .block(Block::default().borders(Borders::NONE))
         .column_spacing(column_spacing)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("");
 
     let mut state = TableState::default();
-    if let Some(selected) = app.inbox_selected() {
-        if selected >= top {
-            let relative = selected - top;
-            if height == 0 || relative < height {
-                state.select(Some(relative));
-            }
+    if let Some(selected) = app.inbox_selected()
+        && selected >= top
+    {
+        let relative = selected - top;
+        if height == 0 || relative < height {
+            state.select(Some(relative));
         }
     }
 
@@ -737,7 +737,10 @@ fn fit_text_with_padding(text: &str, target_width: usize, pad: bool) -> String {
             return text.to_string();
         }
         let mut result = text.to_string();
-        result.extend(std::iter::repeat(' ').take(target_width.saturating_sub(current_width)));
+        result.extend(std::iter::repeat_n(
+            ' ',
+            target_width.saturating_sub(current_width),
+        ));
         return result;
     }
 
@@ -754,7 +757,7 @@ fn fit_text_with_padding(text: &str, target_width: usize, pad: bool) -> String {
     if pad {
         let result_width = text_width(&result);
         if result_width < target_width {
-            result.extend(std::iter::repeat(' ').take(target_width - result_width));
+            result.extend(std::iter::repeat_n(' ', target_width - result_width));
         }
     }
 
@@ -801,7 +804,7 @@ fn render_shortcut_menu(frame: &mut Frame<'_>, menu: &ShortcutMenu) {
     let width = inner_width + 2;
     let height = inner_height + 2;
 
-    let frame_area = frame.size();
+    let frame_area = frame.area();
     if frame_area.width < width || frame_area.height < height {
         return;
     }
@@ -866,7 +869,7 @@ fn render_message_body(frame: &mut Frame<'_>, view: &MessageViewState, area: Rec
             lines.push(Line::raw("No raw content available."));
         }
     } else if let Some(document) = &view.document {
-        match viewer::render_document(document, content_width as u16) {
+        match viewer::render_document(document, content_width) {
             Ok(rendered) => {
                 for line in rendered {
                     lines.push(Line::raw(line));

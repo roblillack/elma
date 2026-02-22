@@ -59,13 +59,13 @@ struct MockMessage {
     message: Message,
 }
 
-impl MockBackend {
-    /// Build the default mock backend, pre-populating the inbox and starting the
-    /// background generator that drip-feeds new messages.
-    pub fn default() -> Self {
+impl Default for MockBackend {
+    fn default() -> Self {
         Self::demo()
     }
+}
 
+impl MockBackend {
     /// Create a mock backend configured for the CLI demo mode.
     ///
     /// The builder loads a stock set of messages, spins up a background thread that
@@ -106,7 +106,7 @@ impl MockBackend {
             contents.insert(id, content);
             mailboxes
                 .entry(MailboxKind::Inbox)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(MockMessage { message });
         }
 
@@ -121,7 +121,7 @@ impl MockBackend {
         ];
 
         for (kind, count, status) in templates {
-            let list = mailboxes.entry(kind).or_insert_with(Vec::new);
+            let list = mailboxes.entry(kind).or_default();
             for _ in 0..count {
                 let id = self.next_id();
                 let sent = OffsetDateTime::now_utc()
@@ -212,7 +212,7 @@ impl MockBackend {
                     content_lock.insert(id, content);
                     message_lock
                         .entry(MailboxKind::Inbox)
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(MockMessage {
                             message: message.clone(),
                         });
@@ -223,11 +223,11 @@ impl MockBackend {
                     guard.clone()
                 };
 
-                if let Some(sender) = sender {
-                    if sender.send(BackendEvent::NewMessage(message)).is_err() {
-                        let mut guard = event_sender.lock().expect("event sender mutex poisoned");
-                        *guard = None;
-                    }
+                if let Some(sender) = sender
+                    && sender.send(BackendEvent::NewMessage(message)).is_err()
+                {
+                    let mut guard = event_sender.lock().expect("event sender mutex poisoned");
+                    *guard = None;
                 }
             }
         });
@@ -253,15 +253,14 @@ impl MockBackend {
 
         let mut removed = None;
         for kind in MailboxKind::ALL {
-            if let Some(list) = mailboxes.get_mut(&kind) {
-                if let Some(index) = list
+            if let Some(list) = mailboxes.get_mut(&kind)
+                && let Some(index) = list
                     .iter()
                     .position(|mock| mock.message.id == action.message_id)
-                {
-                    let mock = list.remove(index);
-                    removed = Some((kind, mock));
-                    break;
-                }
+            {
+                let mock = list.remove(index);
+                removed = Some((kind, mock));
+                break;
             }
         }
 
@@ -418,9 +417,9 @@ impl MockBackend {
         } = outgoing;
 
         let mut recipients = Vec::new();
-        recipients.extend(to.into_iter());
-        recipients.extend(cc.into_iter());
-        recipients.extend(bcc.into_iter());
+        recipients.extend(to);
+        recipients.extend(cc);
+        recipients.extend(bcc);
 
         let size = text_body.len() + html_body.len() + subject.len();
 
@@ -446,8 +445,10 @@ impl MockBackend {
             message.labels.push(label.to_string());
         }
 
-        let mut content_state = MessageContent::default();
-        content_state.mailer = format!("{MAILER_NAME} compose");
+        let mut content_state = MessageContent {
+            mailer: format!("{MAILER_NAME} compose"),
+            ..Default::default()
+        };
         content_state.parts.push(MessageContentPart {
             content_type: "text/plain".to_string(),
             content: text_body.into_bytes(),
@@ -461,7 +462,7 @@ impl MockBackend {
         let mut contents = self.contents.lock().expect("contents mutex poisoned");
         contents.insert(id, content_state);
 
-        let entry = mailboxes.entry(mailbox).or_insert_with(Vec::new);
+        let entry = mailboxes.entry(mailbox).or_default();
         entry.push(MockMessage { message });
         entry.sort_by_key(|mock| mock.message.sent);
 
