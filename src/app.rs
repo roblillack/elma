@@ -1874,7 +1874,7 @@ impl App {
 
                 if msg.status != MessageStatus::PendingInbox {
                     if matches!(msg.status, MessageStatus::Spam) || in_spam {
-                        text.push_str(" !:NoSpam");
+                        text.push_str(" u:NoSpam");
                     } else {
                         text.push_str(" !:Spam");
                     }
@@ -1999,19 +1999,7 @@ impl App {
             KeyCode::Char('r') | KeyCode::Char('R') => self.open_reply(false)?,
             KeyCode::Char('a') | KeyCode::Char('A') => self.open_reply(true)?,
             KeyCode::Char('f') | KeyCode::Char('F') => self.open_forward()?,
-            KeyCode::Char('!') => {
-                if let Some(idx) = self.mailbox.selected {
-                    if let Some(msg) = self.mailbox.messages.get(idx) {
-                        if self.current_mailbox == MailboxKind::Spam
-                            || msg.status == MessageStatus::Spam
-                        {
-                            self.schedule_move_to_inbox();
-                        } else {
-                            self.schedule_move_to_spam();
-                        }
-                    }
-                }
-            }
+            KeyCode::Char('!') => self.schedule_move_to_spam(),
             KeyCode::Char('$') => self.commit_actions()?,
             KeyCode::Enter => {
                 if !self.try_open_selected_draft()? {
