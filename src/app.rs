@@ -1685,6 +1685,14 @@ impl App {
                 break;
             };
 
+            // Collect all message IDs from this batch before we
+            // potentially move actions into the failed list.
+            let all_batch_ids: std::collections::HashSet<MessageId> = batch
+                .actions
+                .iter()
+                .map(|a| a.message_id)
+                .collect();
+
             if batch.completed < batch.len() {
                 let missing = batch.len().saturating_sub(batch.completed);
                 let message = format!("Commit interrupted ({missing} actions pending).");
@@ -1727,19 +1735,28 @@ impl App {
                     );
                     self.mailbox.status_line = Some(summary);
                 }
-            } else if batch.failed.is_empty() {
-                self.mailbox.messages.retain(|msg| {
-                    msg.status != MessageStatus::Archived
-                        && msg.status != MessageStatus::Deleted
-                        && msg.status != MessageStatus::PendingInbox
-                        && msg.status != MessageStatus::Spam
-                });
-                self.mailbox.status_line = Some("Actions committed.".to_string());
             } else {
-                let summary = format!("Failed to apply {} actions.", batch.failed.len());
-                self.mailbox.status_line = Some(summary);
-                self.scheduled_actions
-                    .extend(batch.failed.into_iter().map(|(action, _error)| action));
+                let failed_ids: std::collections::HashSet<MessageId> = batch
+                    .failed
+                    .iter()
+                    .map(|(action, _)| action.message_id)
+                    .collect();
+
+                // Only remove messages that were part of THIS batch and
+                // succeeded — never touch messages that belong to a new
+                // staging round.
+                self.mailbox.messages.retain(|msg| {
+                    !all_batch_ids.contains(&msg.id) || failed_ids.contains(&msg.id)
+                });
+
+                if batch.failed.is_empty() {
+                    self.mailbox.status_line = Some("Actions committed.".to_string());
+                } else {
+                    let summary = format!("Failed to apply {} actions.", batch.failed.len());
+                    self.mailbox.status_line = Some(summary);
+                    self.scheduled_actions
+                        .extend(batch.failed.into_iter().map(|(action, _error)| action));
+                }
             }
 
             self.sync_message_view_state();
@@ -3330,7 +3347,7 @@ mod tests {
     use super::*;
     use crate::backend::{ActionStatus, BackendEvent, MailBackend, MailboxSnapshot, OutgoingMessage};
     use crate::model::{Action, ActionType, Message, MessageId, MessageStatus};
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Mutex};
     use time::OffsetDateTime;
 
     // -- Test infrastructure --------------------------------------------------
@@ -3393,8 +3410,69 @@ mod tests {
         }
     }
 
-    fn test_app(messages: Vec<Message>) -> App {
-        let backend = Arc::new(NoopBackend);
+    /// Backend that captures submitted actions without completing them.
+    /// The test drives completion by draining `pending_senders`.
+    struct DeferredBackend {
+        /// Each `apply_actions` call pushes `(actions, sender)` here.
+        pending: Mutex<Vec<(Vec<Action>, mpsc::Sender<ActionStatus>)>>,
+    }
+
+    impl DeferredBackend {
+        fn new() -> Self {
+            Self {
+                pending: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Complete all pending batches successfully.
+        fn complete_all(&self) {
+            let batches: Vec<_> = {
+                let mut guard = self.pending.lock().unwrap();
+                std::mem::take(&mut *guard)
+            };
+            for (actions, tx) in batches {
+                for action in actions {
+                    let _ = tx.send(ActionStatus {
+                        action,
+                        result: Ok(()),
+                    });
+                }
+            }
+        }
+    }
+
+    impl MailBackend for DeferredBackend {
+        fn load_mailbox(
+            &self,
+            _mailbox: MailboxKind,
+        ) -> anyhow::Result<(MailboxSnapshot, mpsc::Receiver<BackendEvent>)> {
+            let (_tx, rx) = mpsc::channel();
+            Ok((MailboxSnapshot { total: 0, messages: vec![] }, rx))
+        }
+
+        fn load_message(&self, _message_id: MessageId) -> anyhow::Result<MessageContent> {
+            Ok(MessageContent::default())
+        }
+
+        fn apply_actions(
+            &self,
+            actions: Vec<Action>,
+        ) -> anyhow::Result<mpsc::Receiver<ActionStatus>> {
+            let (tx, rx) = mpsc::channel();
+            self.pending.lock().unwrap().push((actions, tx));
+            Ok(rx)
+        }
+
+        fn send_message(&self, _message: OutgoingMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn save_draft(&self, _message: OutgoingMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_app_with_backend(messages: Vec<Message>, backend: Arc<dyn MailBackend>) -> App {
         let (_tx, events) = mpsc::channel();
         let selected = if messages.is_empty() { None } else { Some(0) };
         let account = AccountState {
@@ -3425,6 +3503,10 @@ mod tests {
             pending_shortcut: None,
             pending_navigation: None,
         }
+    }
+
+    fn test_app(messages: Vec<Message>) -> App {
+        test_app_with_backend(messages, Arc::new(NoopBackend))
     }
 
     // -- schedule_action basics -----------------------------------------------
@@ -3679,5 +3761,96 @@ mod tests {
             app.schedule_action(ActionType::Delete, 1, MessageStatus::Deleted);
             assert!(app.scheduled_actions.is_empty());
         }
+    }
+
+    // -- Concurrent staging while committing ----------------------------------
+
+    #[test]
+    fn staging_while_committing_does_not_remove_new_staged_messages() {
+        let backend = Arc::new(DeferredBackend::new());
+        let messages: Vec<Message> = (1..=1000)
+            .map(|id| make_message(id, MessageStatus::Read))
+            .collect();
+        let mut app = test_app_with_backend(messages, Arc::clone(&backend) as Arc<dyn MailBackend>);
+
+        assert_eq!(app.mailbox.messages.len(), 1000);
+
+        // Stage 100 deletions (messages 1..=100).
+        for id in 1..=100u64 {
+            app.schedule_action(ActionType::Delete, id, MessageStatus::Read);
+            // Mark the message status locally as the real schedule_delete would.
+            if let Some(msg) = app.mailbox.messages.iter_mut().find(|m| m.id == id) {
+                msg.status = MessageStatus::Deleted;
+            }
+        }
+        assert_eq!(app.scheduled_actions.len(), 100);
+
+        // Commit ($) — sends the 100 deletions to the backend.
+        app.commit_actions().unwrap();
+        assert!(
+            app.scheduled_actions.is_empty(),
+            "scheduled_actions should be drained after commit"
+        );
+        assert_eq!(app.commit_batches.len(), 1, "one batch in flight");
+
+        // WHILE the delete batch is in flight, stage 100 archival actions
+        // (messages 101..=200).
+        for id in 101..=200u64 {
+            app.schedule_action(ActionType::Archive, id, MessageStatus::Read);
+            if let Some(msg) = app.mailbox.messages.iter_mut().find(|m| m.id == id) {
+                msg.status = MessageStatus::Archived;
+            }
+        }
+        assert_eq!(
+            app.scheduled_actions.len(),
+            100,
+            "100 archive actions staged"
+        );
+
+        // Mailbox should still show all 1000 messages (nothing finalized yet).
+        assert_eq!(app.mailbox.messages.len(), 1000);
+
+        // Now complete the delete batch in the backend.
+        backend.complete_all();
+
+        // Poll so the app sees the completions and finalizes.
+        app.poll_commit_updates();
+
+        // The 100 deleted messages should be removed.
+        assert_eq!(
+            app.mailbox.messages.len(),
+            900,
+            "900 messages remain after deletes committed"
+        );
+
+        // The 100 archive actions should still be staged (not committed).
+        assert_eq!(
+            app.scheduled_actions.len(),
+            100,
+            "archive actions still in staging"
+        );
+
+        // None of the archived messages should have been removed.
+        let archived_count = app
+            .mailbox
+            .messages
+            .iter()
+            .filter(|m| m.status == MessageStatus::Archived)
+            .count();
+        assert_eq!(
+            archived_count, 100,
+            "all 100 archived messages still present"
+        );
+
+        // Verify the deleted messages are gone.
+        let deleted_present = app
+            .mailbox
+            .messages
+            .iter()
+            .any(|m| m.id >= 1 && m.id <= 100);
+        assert!(
+            !deleted_present,
+            "deleted messages should have been removed"
+        );
     }
 }
