@@ -6,7 +6,7 @@
 
 use crate::app::{
     ActiveView, App, ComposeButton, ComposeField, ComposeFocus, ComposeState, MessageViewState,
-    ShortcutMenu,
+    ProgressMode, ShortcutMenu,
 };
 use crate::model::{MessageStatus, format_size};
 use crate::viewer;
@@ -50,18 +50,32 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 /// Draw the action bar, optionally reserving space for the commit indicator.
-fn render_action_bar(frame: &mut Frame<'_>, area: Rect, text: String, indicator: Option<String>) {
+fn render_action_bar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    text: String,
+    indicator: Option<(String, ProgressMode)>,
+) {
     if area.width == 0 {
         return;
     }
 
-    if let Some(indicator) = indicator {
+    if let Some((indicator, mode)) = indicator {
+        let indicator_style = match mode {
+            ProgressMode::Write => Style::default().fg(Color::White).bg(Color::Red),
+            ProgressMode::Read => Style::default().fg(Color::Red).bg(ACTION_BAR_BG),
+        };
+        let indicator_block_style = match mode {
+            ProgressMode::Write => Style::default().bg(Color::Red),
+            ProgressMode::Read => Style::default().bg(ACTION_BAR_BG),
+        };
+
         let indicator_width = indicator.chars().count() as u16;
 
         if indicator_width >= area.width {
             let indicator_widget = Paragraph::new(indicator)
-                .style(Style::default().fg(Color::White).bg(Color::Red))
-                .block(Block::default().style(Style::default().bg(Color::Red)));
+                .style(indicator_style)
+                .block(Block::default().style(indicator_block_style));
             frame.render_widget(indicator_widget, area);
             return;
         }
@@ -77,8 +91,8 @@ fn render_action_bar(frame: &mut Frame<'_>, area: Rect, text: String, indicator:
         frame.render_widget(action_bar, segments[0]);
 
         let indicator_widget = Paragraph::new(indicator)
-            .style(Style::default().fg(Color::White).bg(Color::Red))
-            .block(Block::default().style(Style::default().bg(Color::Red)));
+            .style(indicator_style)
+            .block(Block::default().style(indicator_block_style));
         frame.render_widget(indicator_widget, segments[1]);
     } else {
         let action_bar = Paragraph::new(text)

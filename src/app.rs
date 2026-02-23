@@ -39,6 +39,15 @@ use time::{OffsetDateTime, format_description::well_known::Rfc2822};
 
 const PAGE_JUMP: isize = 5;
 const PROGRESS_SEGMENTS: usize = 5;
+
+/// Whether the progress indicator represents a read (loading) or write (committing) operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProgressMode {
+    /// Loading data from the backend (red text on gray background).
+    Read,
+    /// Committing changes to the backend (white text on red background).
+    Write,
+}
 const ACCOUNT_SHORTCUT_KEYS: [char; 36] = [
     '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
     'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
@@ -1043,6 +1052,17 @@ impl App {
                 }
             });
 
+            let total = messages.len();
+            let loaded = loaded_message_count(&messages);
+            let initial_load_progress = if loaded < total {
+                Some(CommitProgress {
+                    total,
+                    completed: loaded,
+                })
+            } else {
+                None
+            };
+
             accounts.push(AccountState {
                 name: account_name,
                 backend,
@@ -1058,7 +1078,7 @@ impl App {
                 commit_batches: VecDeque::new(),
                 commit_progress: None,
                 mailbox_loader: None,
-                mailbox_load_progress: None,
+                mailbox_load_progress: initial_load_progress,
                 scheduled_actions: Vec::new(),
                 current_mailbox: MailboxKind::Inbox,
             });
@@ -1550,6 +1570,19 @@ impl App {
         if refresh {
             self.update_selection_after_refresh(current_id);
         }
+
+        // Update backfill read-progress: if placeholders remain, keep the
+        // indicator alive; otherwise clear it once the mailbox is fully loaded.
+        if self.mailbox_load_progress.is_some() {
+            let total = self.mailbox.messages.len();
+            let loaded = loaded_message_count(&self.mailbox.messages);
+            if loaded >= total {
+                self.mailbox_load_progress = None;
+            } else if let Some(progress) = self.mailbox_load_progress.as_mut() {
+                progress.total = total;
+                progress.completed = loaded;
+            }
+        }
     }
 
     fn poll_mailbox_loader(&mut self) {
@@ -1642,9 +1675,16 @@ impl App {
             MailboxLoadUpdate::Finished { events, status } => {
                 self.mailbox.events = events;
                 self.mailbox_loader = None;
-                self.mailbox_load_progress = None;
                 let loaded = loaded_message_count(&self.mailbox.messages);
                 let total = self.mailbox.messages.len();
+                if loaded < total {
+                    self.mailbox_load_progress = Some(CommitProgress {
+                        total,
+                        completed: loaded,
+                    });
+                } else {
+                    self.mailbox_load_progress = None;
+                }
                 self.mailbox.status_line = status.or_else(|| {
                     Some(format!(
                         "Loaded {loaded}/{total} messages in {}.",
@@ -1932,18 +1972,23 @@ impl App {
     }
 
     /// Renderable text indicator reflecting aggregate commit progress.
-    pub(crate) fn commit_indicator(&self) -> Option<String> {
-        if let Some(progress) = self
-            .mailbox_load_progress
+    ///
+    /// Write operations (committing actions) take precedence over read operations
+    /// (loading mailbox data) when both are active simultaneously.
+    pub(crate) fn commit_indicator(&self) -> Option<(String, ProgressMode)> {
+        let write = self
+            .commit_progress
             .as_ref()
-            .and_then(Self::format_progress)
-        {
-            return Some(progress);
+            .and_then(Self::format_progress);
+        if let Some(text) = write {
+            return Some((text, ProgressMode::Write));
         }
 
-        self.commit_progress
+        let read = self
+            .mailbox_load_progress
             .as_ref()
-            .and_then(Self::format_progress)
+            .and_then(Self::format_progress);
+        read.map(|text| (text, ProgressMode::Read))
     }
 
     fn format_progress(progress: &CommitProgress) -> Option<String> {
