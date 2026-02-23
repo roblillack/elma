@@ -1462,11 +1462,11 @@ impl GmailInner {
                     .await
             }
             ActionType::MarkAsImportant => {
-                self.update_flags(action.message_id, "+FLAGS.SILENT (\\Important)")
+                self.update_gmail_labels(action.message_id, "+X-GM-LABELS (\\Important)")
                     .await
             }
             ActionType::MarkAsUnimportant => {
-                self.update_flags(action.message_id, "-FLAGS.SILENT (\\Important)")
+                self.update_gmail_labels(action.message_id, "-X-GM-LABELS (\\Important)")
                     .await
             }
         }
@@ -1542,6 +1542,34 @@ impl GmailInner {
 
         if let Some(message) = updated {
             self.emit_event(BackendEvent::MessageFlagsChanged(message));
+        }
+
+        Ok(())
+    }
+
+    /// Update Gmail labels via the X-GM-LABELS extension.
+    ///
+    /// Unlike `update_flags` (which operates on standard IMAP FLAGS), this
+    /// sends a raw `UID STORE` command with an X-GM-LABELS query and
+    /// processes the label response through `handle_fetch_update`, which
+    /// updates both `message.labels` and `message.important`.
+    async fn update_gmail_labels(&self, message_id: MessageId, query: &str) -> Result<()> {
+        let uid = {
+            let state = self.state.lock().await;
+            state
+                .messages
+                .get(&message_id)
+                .map(|stored| stored.uid)
+                .ok_or_else(|| anyhow!("message {message_id} not found"))?
+        };
+
+        let command = format!("UID STORE {uid} {query}");
+        {
+            let mut guard = self.session.lock().await;
+            let session = guard
+                .as_mut()
+                .ok_or_else(|| anyhow!("IMAP session is not available"))?;
+            self.fetch_gmail_labels_command(session, &command).await?;
         }
 
         Ok(())
