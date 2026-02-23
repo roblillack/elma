@@ -1462,11 +1462,11 @@ impl GmailInner {
                     .await
             }
             ActionType::MarkAsImportant => {
-                self.update_flags(action.message_id, "+FLAGS.SILENT (\\Important)")
+                self.update_gmail_labels(action.message_id, "+X-GM-LABELS (\\Important)")
                     .await
             }
             ActionType::MarkAsUnimportant => {
-                self.update_flags(action.message_id, "-FLAGS.SILENT (\\Important)")
+                self.update_gmail_labels(action.message_id, "-X-GM-LABELS (\\Important)")
                     .await
             }
         }
@@ -1542,6 +1542,34 @@ impl GmailInner {
 
         if let Some(message) = updated {
             self.emit_event(BackendEvent::MessageFlagsChanged(message));
+        }
+
+        Ok(())
+    }
+
+    /// Update Gmail labels via the X-GM-LABELS extension.
+    ///
+    /// Unlike `update_flags` (which operates on standard IMAP FLAGS), this
+    /// sends a raw `UID STORE` command with an X-GM-LABELS query and
+    /// processes the label response through `handle_fetch_update`, which
+    /// updates both `message.labels` and `message.important`.
+    async fn update_gmail_labels(&self, message_id: MessageId, query: &str) -> Result<()> {
+        let uid = {
+            let state = self.state.lock().await;
+            state
+                .messages
+                .get(&message_id)
+                .map(|stored| stored.uid)
+                .ok_or_else(|| anyhow!("message {message_id} not found"))?
+        };
+
+        let command = format!("UID STORE {uid} {query}");
+        {
+            let mut guard = self.session.lock().await;
+            let session = guard
+                .as_mut()
+                .ok_or_else(|| anyhow!("IMAP session is not available"))?;
+            self.fetch_gmail_labels_command(session, &command).await?;
         }
 
         Ok(())
@@ -1630,23 +1658,24 @@ impl SharedState {
         starred: bool,
         answered: bool,
         forwarded: bool,
-        important: bool,
+        _important: bool,
     ) -> Option<Message> {
         let id = *self.uid_to_id.get(&uid)?;
         let stored = self.messages.get_mut(&id)?;
         let mut updated = stored.message.clone();
 
+        // Note: `important` is intentionally NOT updated here.  Gmail does not
+        // include `\Important` in standard IMAP FLAGS — it only appears in
+        // X-GM-LABELS, which is handled by `update_labels`.
         let changed = status != updated.status
             || starred != updated.starred
             || answered != updated.answered
-            || forwarded != updated.forwarded
-            || important != updated.important;
+            || forwarded != updated.forwarded;
 
         updated.status = status;
         updated.starred = starred;
         updated.answered = answered;
         updated.forwarded = forwarded;
-        updated.important = important;
 
         if changed {
             stored.message = updated.clone();
@@ -1659,10 +1688,18 @@ impl SharedState {
     fn update_labels(&mut self, uid: u32, labels: Vec<String>) -> Option<Message> {
         let id = *self.uid_to_id.get(&uid)?;
         let stored = self.messages.get_mut(&id)?;
-        if stored.message.labels == labels {
+        // Gmail may send \Important as either a flag atom (`\Important`,
+        // one backslash) or a quoted string (`"\\Important"`, which the IMAP
+        // parser keeps as two backslashes since nom's `escaped` does not
+        // unescape).  Match both representations.
+        let important = labels.iter().any(|l| {
+            l.eq_ignore_ascii_case("\\Important") || l.eq_ignore_ascii_case("\\\\Important")
+        });
+        if stored.message.labels == labels && stored.message.important == important {
             return None;
         }
         stored.message.labels = labels;
+        stored.message.important = important;
         Some(stored.message.clone())
     }
 }
