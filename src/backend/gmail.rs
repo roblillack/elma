@@ -421,15 +421,18 @@ impl MailBackend for GmailBackend {
     ) -> Result<(MailboxSnapshot, mpsc::Receiver<BackendEvent>)> {
         let (sender, receiver) = mpsc::channel();
 
-        {
-            let mut guard = self.inner.events.lock().unwrap();
-            *guard = Some(sender.clone());
-        }
-
         let snapshot = self.inner.runtime.block_on(async {
             self.inner.ensure_connected().await?;
             self.inner.stop_backfill_task().await;
             self.inner.pause_idle().await?;
+
+            // Install the new event sender only after the old backfill and idle
+            // tasks have fully stopped, so their final events go to the old
+            // (now-discarded) channel instead of this new one.
+            {
+                let mut guard = self.inner.events.lock().unwrap();
+                *guard = Some(sender);
+            }
             let exists = self.inner.select_mailbox(mailbox).await?;
             let messages = self.inner.refresh_selected_mailbox(exists).await?;
             {
@@ -451,6 +454,7 @@ impl MailBackend for GmailBackend {
     /// Download the full MIME body for `message_id`.
     fn load_message(&self, message_id: MessageId) -> Result<MessageContent> {
         self.inner.runtime.block_on(async {
+            self.inner.stop_backfill_task().await;
             self.inner.pause_idle().await?;
             let uid = {
                 let state = self.inner.state.lock().await;
@@ -487,6 +491,7 @@ impl MailBackend for GmailBackend {
                 .await?;
 
             self.inner.start_idle_loop().await?;
+            self.inner.start_backfill_if_needed().await?;
 
             content.ok_or_else(|| anyhow!("message body not returned by server"))
         })
@@ -661,19 +666,18 @@ impl GmailInner {
             }
         };
 
-        let mut to_emit = Vec::new();
+        let mut to_emit_ids = Vec::new();
         {
             let mut state = self.state.lock().await;
             for stored in stored_messages {
-                let message = stored.message.clone();
+                to_emit_ids.push(stored.message.id);
                 state.insert(stored);
-                to_emit.push(message);
             }
         }
 
-        if to_emit.is_empty() {
+        if to_emit_ids.is_empty() {
             cancel.store(true, Ordering::SeqCst);
-        } else {
+        } else if !cancel.load(Ordering::SeqCst) {
             let command = if start == end {
                 format!("FETCH {start} (UID X-GM-LABELS)")
             } else {
@@ -687,8 +691,15 @@ impl GmailInner {
         drop(session_guard);
         let restart_result = self.start_idle_loop().await;
 
-        for message in to_emit {
-            self.emit_event(BackendEvent::NewMessage(message));
+        // Re-read messages from state after labels have been applied,
+        // so NewMessage events carry up-to-date importance and label data.
+        {
+            let state = self.state.lock().await;
+            for id in to_emit_ids {
+                if let Some(stored) = state.messages.get(&id) {
+                    self.emit_event(BackendEvent::NewMessage(stored.message.clone()));
+                }
+            }
         }
 
         restart_result
@@ -740,6 +751,7 @@ impl GmailInner {
         let fetch_count = INITIAL_FETCH_LIMIT.min(exists);
         let start = end - fetch_count + 1;
 
+        let mut message_ids = Vec::new();
         {
             let mut session_guard = self.session.lock().await;
             let session = session_guard
@@ -750,13 +762,19 @@ impl GmailInner {
                 .fetch_message_range(session, start, end)
                 .await
                 .context("fetching initial mailbox slice")?;
-
             for stored in stored_messages {
-                messages.push(stored.message.clone());
+                message_ids.push(stored.message.id);
                 new_state.insert(stored);
             }
 
-            if !messages.is_empty() {
+            // Install new_state before the label fetch so handle_fetch_update
+            // finds the messages in the correct state.
+            {
+                let mut state_guard = self.state.lock().await;
+                *state_guard = new_state;
+            }
+
+            if !message_ids.is_empty() {
                 let command = if start == end {
                     format!("FETCH {start} (UID X-GM-LABELS)")
                 } else {
@@ -766,13 +784,17 @@ impl GmailInner {
             }
         }
 
-        messages.sort_by_key(|msg| msg.seq);
-
+        // Re-read messages from state after labels have been applied.
         {
-            let mut state_guard = self.state.lock().await;
-            *state_guard = new_state;
+            let state = self.state.lock().await;
+            for id in message_ids {
+                if let Some(stored) = state.messages.get(&id) {
+                    messages.push(stored.message.clone());
+                }
+            }
         }
 
+        messages.sort_by_key(|msg| msg.seq);
         Ok(messages)
     }
 
@@ -920,9 +942,6 @@ impl GmailInner {
                 Response::Done { tag: done_tag, .. } if done_tag == &tag => break,
                 Response::Expunge(seq) => {
                     self.handle_expunge(*seq).await;
-                }
-                Response::MailboxData(MailboxDatum::Exists(count)) => {
-                    let _ = self.collect_new_messages(session, *count).await?;
                 }
                 _ => {}
             }
@@ -1636,14 +1655,10 @@ impl SharedState {
     fn update_labels(&mut self, uid: u32, labels: Vec<String>) -> Option<Message> {
         let id = *self.uid_to_id.get(&uid)?;
         let stored = self.messages.get_mut(&id)?;
-        let important = labels.iter().any(|label| label_is_important(label));
-        let labels_changed = stored.message.labels != labels;
-        let important_changed = stored.message.important != important;
-        if !labels_changed && !important_changed {
+        if stored.message.labels == labels {
             return None;
         }
         stored.message.labels = labels;
-        stored.message.important = important;
         Some(stored.message.clone())
     }
 }
@@ -1914,14 +1929,6 @@ fn decode_envelope_address(
         (Some(mailbox), None) => Some(mailbox.to_string()),
         _ => None,
     }
-}
-
-fn label_is_important(label: &str) -> bool {
-    let normalized = label.trim().trim_matches('"').to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "\\\\important" | "important" | "[gmail]/important"
-    )
 }
 
 fn summarize_flags_from_names<'a, I>(flags: I) -> (MessageStatus, bool, bool, bool, bool)
