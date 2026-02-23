@@ -1492,7 +1492,19 @@ impl App {
                     if let Some(existing) =
                         mailbox.messages.iter_mut().find(|msg| msg.id == message.id)
                     {
+                        // Preserve locally-scheduled status (e.g. Deleted, Archived)
+                        // that the backend doesn't know about.
+                        let local_status = existing.status;
                         *existing = message;
+                        match local_status {
+                            MessageStatus::Deleted
+                            | MessageStatus::Archived
+                            | MessageStatus::PendingInbox
+                            | MessageStatus::Spam => {
+                                existing.status = local_status;
+                            }
+                            _ => {}
+                        }
                         mailbox.event_count += 1;
                         refresh = true;
                     }
