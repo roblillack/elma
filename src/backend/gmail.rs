@@ -451,6 +451,7 @@ impl MailBackend for GmailBackend {
     /// Download the full MIME body for `message_id`.
     fn load_message(&self, message_id: MessageId) -> Result<MessageContent> {
         self.inner.runtime.block_on(async {
+            self.inner.stop_backfill_task().await;
             self.inner.pause_idle().await?;
             let uid = {
                 let state = self.inner.state.lock().await;
@@ -487,6 +488,7 @@ impl MailBackend for GmailBackend {
                 .await?;
 
             self.inner.start_idle_loop().await?;
+            self.inner.start_backfill_if_needed().await?;
 
             content.ok_or_else(|| anyhow!("message body not returned by server"))
         })
@@ -920,9 +922,6 @@ impl GmailInner {
                 Response::Done { tag: done_tag, .. } if done_tag == &tag => break,
                 Response::Expunge(seq) => {
                     self.handle_expunge(*seq).await;
-                }
-                Response::MailboxData(MailboxDatum::Exists(count)) => {
-                    let _ = self.collect_new_messages(session, *count).await?;
                 }
                 _ => {}
             }
