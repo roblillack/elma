@@ -1726,6 +1726,9 @@ impl App {
                                 ActionType::MarkAsUnstarred => msg.starred = true,
                                 ActionType::MarkAsImportant => msg.important = false,
                                 ActionType::MarkAsUnimportant => msg.important = true,
+                                ActionType::MarkAsRead => {
+                                    msg.status = MessageStatus::New;
+                                }
                                 ActionType::MoveToInboxUnread => {
                                     msg.status = MessageStatus::Read;
                                 }
@@ -3292,6 +3295,16 @@ impl App {
         let document = raw_html
             .as_ref()
             .and_then(|html| html::parse(Cursor::new(html)).ok());
+
+        // Mark the message as read if it was unread.
+        if message.status == MessageStatus::New {
+            message.status = MessageStatus::Read;
+            if let Some(slot) = self.selected_loaded_message_mut() {
+                slot.status = MessageStatus::Read;
+            }
+            let action = Action::new(ActionType::MarkAsRead, message.id);
+            let _ = self.submit_immediate_actions(vec![action]);
+        }
 
         self.message_view = Some(MessageViewState {
             message_id: message.id,

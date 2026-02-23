@@ -1449,6 +1449,10 @@ impl GmailInner {
                 self.update_flags(action.message_id, "+FLAGS.SILENT (\\Seen)")
                     .await
             }
+            ActionType::MarkAsRead => {
+                self.update_flags(action.message_id, "+FLAGS.SILENT (\\Seen)")
+                    .await
+            }
             ActionType::MarkAsStarred => {
                 self.update_flags(action.message_id, "+FLAGS.SILENT (\\Flagged)")
                     .await
