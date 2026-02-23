@@ -170,6 +170,7 @@ pub enum ActionType {
     MarkAsStarred,
     MarkAsUnstarred,
     MarkAsImportant,
+    MarkAsRead,
     MarkAsUnimportant,
     MoveToSpam,
 }

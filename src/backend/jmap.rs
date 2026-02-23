@@ -401,6 +401,9 @@ impl JmapInner {
                     .await?;
                 self.set_keyword(action.message_id, "$seen", true).await
             }
+            ActionType::MarkAsRead => {
+                self.set_keyword(action.message_id, "$seen", true).await
+            }
             ActionType::MarkAsStarred => {
                 self.set_keyword(action.message_id, "$flagged", true).await
             }

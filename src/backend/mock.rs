@@ -384,6 +384,9 @@ impl MockBackend {
                 });
                 target_kind = MailboxKind::Inbox;
             }
+            ActionType::MarkAsRead => {
+                mock.message.status = MessageStatus::Read;
+            }
             ActionType::MarkAsStarred => {
                 mock.message.starred = true;
                 if !mock

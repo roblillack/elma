@@ -473,7 +473,7 @@ impl MailBackend for GmailBackend {
             let mut content = None;
             {
                 let mut fetches = session
-                    .uid_fetch(uid.to_string(), "(RFC822)")
+                    .uid_fetch(uid.to_string(), "(BODY.PEEK[])")
                     .await
                     .context("fetching full message")?;
 
@@ -1446,6 +1446,10 @@ impl GmailInner {
                     .await
             }
             ActionType::MoveToInboxRead => {
+                self.update_flags(action.message_id, "+FLAGS.SILENT (\\Seen)")
+                    .await
+            }
+            ActionType::MarkAsRead => {
                 self.update_flags(action.message_id, "+FLAGS.SILENT (\\Seen)")
                     .await
             }

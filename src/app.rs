@@ -26,6 +26,7 @@ use std::{
         mpsc::{Receiver, TryRecvError},
     },
     thread,
+    time::Instant,
 };
 use tdoc::{
     Document, Paragraph, Span,
@@ -299,6 +300,7 @@ pub(crate) struct MessageViewState {
     pub(crate) scroll: u16,
     pub(crate) unformatted: bool,
     pub(crate) info_line: Option<String>,
+    pub(crate) read_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1453,8 +1455,32 @@ impl App {
         true
     }
 
+    /// Fire the delayed mark-as-read action when the timer expires.
+    fn check_read_timer(&mut self) {
+        let deadline = match self.message_view.as_ref().and_then(|v| v.read_at) {
+            Some(d) => d,
+            None => return,
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+
+        let view = self.message_view.as_mut().unwrap();
+        view.read_at = None;
+        let message_id = view.message_id;
+        view.message.status = MessageStatus::Read;
+
+        if let Some(slot) = self.selected_loaded_message_mut() {
+            slot.status = MessageStatus::Read;
+        }
+
+        let action = Action::new(ActionType::MarkAsRead, message_id);
+        let _ = self.submit_immediate_actions(vec![action]);
+    }
+
     /// Drain backend event channels and merge them into local state.
     pub fn poll_backend_events(&mut self) {
+        self.check_read_timer();
         self.poll_mailbox_loader();
         self.poll_commit_updates();
 
@@ -1726,6 +1752,9 @@ impl App {
                                 ActionType::MarkAsUnstarred => msg.starred = true,
                                 ActionType::MarkAsImportant => msg.important = false,
                                 ActionType::MarkAsUnimportant => msg.important = true,
+                                ActionType::MarkAsRead => {
+                                    msg.status = MessageStatus::New;
+                                }
                                 ActionType::MoveToInboxUnread => {
                                     msg.status = MessageStatus::Read;
                                 }
@@ -3293,6 +3322,13 @@ impl App {
             .as_ref()
             .and_then(|html| html::parse(Cursor::new(html)).ok());
 
+        // Schedule mark-as-read after 3 seconds if the message is unread.
+        let read_at = if message.status == MessageStatus::New {
+            Some(Instant::now() + std::time::Duration::from_secs(3))
+        } else {
+            None
+        };
+
         self.message_view = Some(MessageViewState {
             message_id: message.id,
             message_index: idx,
@@ -3303,6 +3339,7 @@ impl App {
             scroll: 0,
             unformatted: false,
             info_line: None,
+            read_at,
         });
 
         Ok(())
