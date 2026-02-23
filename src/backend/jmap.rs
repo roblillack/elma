@@ -25,7 +25,6 @@ use lettre::{
     message::{Mailbox as LettreMailbox, MultiPart, SinglePart},
 };
 use std::{
-    cmp::Ordering,
     collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex,
@@ -260,7 +259,8 @@ impl JmapInner {
 
         for (index, data) in emails.into_iter().enumerate() {
             let (message_id, uid, is_new) = state.ensure_ids(&data.jmap_id);
-            let message = build_message(message_id, uid, index as u32 + 1, &data, &mailbox_cache)?;
+            let seq = total.saturating_sub(start_position + index).max(1) as u32;
+            let message = build_message(message_id, uid, seq, &data, &mailbox_cache)?;
 
             if is_new {
                 added_ids.push(message_id);
@@ -704,15 +704,14 @@ impl JmapInner {
 
             let prepared_entries = {
                 let mut state = self.state.lock().await;
-                let mut next_seq = state.current_sequence.len() as u32;
                 let mut entries = Vec::new();
-                for data in emails {
+                for (offset, data) in emails.into_iter().enumerate() {
                     let (message_id, uid, _) = state.ensure_ids(&data.jmap_id);
                     if state.current_sequence.contains(&message_id) {
                         continue;
                     }
-                    next_seq += 1;
-                    match build_message(message_id, uid, next_seq, &data, &mailbox_cache) {
+                    let seq = total.saturating_sub(start_position + offset).max(1) as u32;
+                    match build_message(message_id, uid, seq, &data, &mailbox_cache) {
                         Ok(message) => entries.push((
                             message_id,
                             StoredMessage {
@@ -722,7 +721,6 @@ impl JmapInner {
                         )),
                         Err(err) => {
                             eprintln!("JMAP backfill build error: {err:?}");
-                            next_seq -= 1;
                         }
                     }
                 }
@@ -839,11 +837,16 @@ impl JmapInner {
             .await
             .context("fetching mailbox messages")?;
 
-        let emails = response
+        let mut email_map: HashMap<String, FetchedEmail> = response
             .take_list()
             .into_iter()
             .filter_map(FetchedEmail::from_email)
-            .collect::<Vec<_>>();
+            .map(|e| (e.jmap_id.clone(), e))
+            .collect();
+        let emails: Vec<FetchedEmail> = ids
+            .iter()
+            .filter_map(|id| email_map.remove(id.as_str()))
+            .collect();
 
         let has_more = if let Some(total) = query_response.total() {
             position + ids.len() < total
@@ -1120,7 +1123,6 @@ impl JmapState {
         }
 
         self.current_sequence = new_sequence;
-        self.resequence();
 
         removed
     }
@@ -1135,8 +1137,6 @@ impl JmapState {
                 new_ids.push(id);
             }
         }
-        self.resequence();
-
         let mut emitted = Vec::with_capacity(new_ids.len());
         for id in new_ids {
             if let Some(stored) = self.messages.get(&id) {
@@ -1159,27 +1159,6 @@ impl JmapState {
         self.highest_received_index
     }
 
-    fn resequence(&mut self) {
-        self.current_sequence.sort_by(|a, b| {
-            let msg_a = self.messages.get(a).map(|stored| &stored.message);
-            let msg_b = self.messages.get(b).map(|stored| &stored.message);
-            match (msg_a, msg_b) {
-                (Some(ma), Some(mb)) => match ma.sent.cmp(&mb.sent) {
-                    Ordering::Equal => ma.id.cmp(&mb.id),
-                    other => other,
-                },
-                (None, None) => Ordering::Equal,
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-            }
-        });
-
-        for (idx, id) in self.current_sequence.iter().enumerate() {
-            if let Some(stored) = self.messages.get_mut(id) {
-                stored.message.seq = idx as u32 + 1;
-            }
-        }
-    }
 }
 
 struct StoredMessage {
