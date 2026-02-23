@@ -239,6 +239,12 @@ impl JmapInner {
         } = self.fetch_mailbox(mailbox).await?;
 
         let mut state = self.state.lock().await;
+        let switching = state.current_mailbox != Some(mailbox);
+        if switching {
+            state.current_sequence.clear();
+            state.highest_received_index = 0;
+            state.current_mailbox = Some(mailbox);
+        }
         let previous_highest = state.highest_received_index;
         let mut remaining_ids = state.current_sequence.clone();
         let mailbox_cache = self.mailboxes.lock().await.clone();
@@ -1056,6 +1062,7 @@ struct JmapState {
     messages: HashMap<MessageId, StoredMessage>,
     jmap_to_id: HashMap<String, MessageId>,
     current_sequence: Vec<MessageId>,
+    current_mailbox: Option<MailboxKind>,
     next_message_id: MessageId,
     next_uid: u32,
     more_available: bool,
