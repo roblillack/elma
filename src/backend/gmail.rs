@@ -473,7 +473,7 @@ impl MailBackend for GmailBackend {
             let mut content = None;
             {
                 let mut fetches = session
-                    .uid_fetch(uid.to_string(), "(RFC822)")
+                    .uid_fetch(uid.to_string(), "(BODY.PEEK[])")
                     .await
                     .context("fetching full message")?;
 
