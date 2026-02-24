@@ -1218,13 +1218,16 @@ impl GmailInner {
                             if !label_refresh.is_empty() {
                                 label_refresh.sort_unstable();
                                 label_refresh.dedup();
-                                for uid in label_refresh {
-                                    let command = format!("UID FETCH {uid} (UID X-GM-LABELS)");
-                                    if let Err(err) =
-                                        self.fetch_gmail_labels_command(&mut sess, &command).await
-                                    {
-                                        eprintln!("Gmail label refresh error: {err:?}");
-                                    }
+                                let uid_set = label_refresh
+                                    .iter()
+                                    .map(|uid| uid.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(",");
+                                let command = format!("UID FETCH {uid_set} (UID X-GM-LABELS)");
+                                if let Err(err) =
+                                    self.fetch_gmail_labels_command(&mut sess, &command).await
+                                {
+                                    eprintln!("Gmail label refresh error: {err:?}");
                                 }
                             }
                             self.reinsert_session(sess).await;
