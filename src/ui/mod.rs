@@ -557,8 +557,8 @@ fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             }
         }
 
-        if total > height && top + height > total {
-            top = total - height;
+        if top + height > total {
+            top = total.saturating_sub(height);
         }
     } else {
         top = 0;
