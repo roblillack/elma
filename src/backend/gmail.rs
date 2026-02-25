@@ -567,6 +567,13 @@ impl GmailInner {
         drop(guard);
         self.determine_special_mailboxes().await?;
 
+        // Re-select the current mailbox so the session is ready for UID
+        // commands.  Without this, a reconnected session sits in the
+        // "authenticated" state and Gmail rejects UID MOVE / UID STORE with
+        // "BAD … not allowed now".
+        let mailbox = { *self.current_mailbox.lock().await };
+        self.select_mailbox(mailbox).await?;
+
         Ok(())
     }
 
