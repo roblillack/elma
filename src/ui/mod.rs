@@ -176,7 +176,7 @@ fn render_search_panel(
 
     let label = "Find: ";
     let (before_cursor, after_cursor) = value.split_at(cursor.min(value.len()));
-    let help = " (enter search terms, Enter to activate, Escape to cancel)";
+    let help = " (input search terms; press <Enter> to activate, <Esc> to cancel)";
 
     let spans = vec![
         Span::raw(label),
@@ -221,27 +221,28 @@ fn render_search_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let y = area.y + margin_top;
     let popup_area = Rect::new(x, y, width, height);
 
-    let popup_style = Style::default().bg(Color::Black).fg(Color::White);
+    let popup_style = Style::default().bg(ACTION_BAR_BG).fg(ACTION_BAR_FG);
+    let dark_fg = Style::default().fg(Color::Black);
 
     let key_style = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
-    let sep_style = Style::default().fg(Color::Gray);
+    let sep_style = Style::default().fg(ACTION_BAR_FG);
 
     let bottom_title = Line::from(vec![
         Span::styled("/", key_style),
         Span::styled(":", sep_style),
-        Span::styled("Change", popup_style),
+        Span::styled("Change", dark_fg),
         Span::raw("  "),
         Span::styled("Esc", key_style),
         Span::styled(":", sep_style),
-        Span::styled("Clear", popup_style),
+        Span::styled("Clear", dark_fg),
     ]);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .style(popup_style)
-        .border_style(Style::default().fg(Color::Gray))
+        .border_style(Style::default().fg(ACTION_BAR_FG))
         .title_top(Line::styled(title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
         .title_bottom(bottom_title)
         .padding(Padding::horizontal(1));
@@ -251,7 +252,7 @@ fn render_search_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .add_modifier(Modifier::BOLD);
 
     let lines = vec![
-        Line::from(Span::styled(line1, Style::default().fg(Color::Gray))),
+        Line::from(Span::styled(line1, dark_fg)),
         Line::from(Span::styled(value, value_style)),
     ];
 
@@ -912,13 +913,9 @@ fn text_width(value: &str) -> usize {
 }
 
 fn render_shortcut_menu(frame: &mut Frame<'_>, menu: &ShortcutMenu) {
-    let mut lines = Vec::new();
-    let header_style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    lines.push(Line::from(vec![Span::styled(menu.title(), header_style)]));
-    lines.push(Line::raw(""));
+    let title = format!(" {} ", menu.title());
 
+    let mut lines = Vec::new();
     let key_style = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
@@ -937,7 +934,7 @@ fn render_shortcut_menu(frame: &mut Frame<'_>, menu: &ShortcutMenu) {
         .map(|line| line.width() as u16)
         .max()
         .unwrap_or(0);
-    let inner_width = content_width.max(menu.title().len() as u16);
+    let inner_width = content_width.max(title.len() as u16);
     let inner_height = lines.len() as u16;
 
     if inner_width == 0 || inner_height == 0 {
@@ -952,15 +949,21 @@ fn render_shortcut_menu(frame: &mut Frame<'_>, menu: &ShortcutMenu) {
         return;
     }
 
-    let x = frame_area.x + frame_area.width - width;
-    let y = frame_area.y + frame_area.height - height;
+    let x = frame_area.x;
+    let y = frame_area.y + frame_area.height - height - 1;
     let area = Rect::new(x, y, width, height);
 
     let popup_style = Style::default().bg(Color::Black).fg(Color::White);
     let block = Block::default()
         .borders(Borders::ALL)
         .style(popup_style)
-        .border_style(Style::default().fg(Color::Gray));
+        .border_style(Style::default().fg(Color::Gray))
+        .title_top(Line::styled(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
 
     frame.render_widget(Clear, area);
     let paragraph = Paragraph::new(lines)
