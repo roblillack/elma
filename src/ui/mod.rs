@@ -15,7 +15,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap},
 };
 use time::OffsetDateTime;
 
@@ -104,14 +104,27 @@ fn render_action_bar(
 
 /// Render the inbox list together with action and status bars.
 fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(frame.area());
+    let search_focused = app.search_state().is_some_and(|s| s.2);
+    let layout = if search_focused {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(frame.area())
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(frame.area())
+    };
 
     render_action_bar(
         frame,
@@ -120,7 +133,15 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
         app.commit_indicator(),
     );
 
-    render_message_table(frame, app, layout[1]);
+    let message_area = layout[1];
+    let info_area = layout[2];
+
+    render_message_table(frame, app, message_area);
+
+    // Render unfocused search as a popup overlay in the top-right of the message area.
+    if !search_focused {
+        render_search_popup(frame, message_area, app);
+    }
 
     let mut info_text = app.inbox_info_bar();
     if let Some(status) = app.inbox_status_line()
@@ -132,7 +153,111 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
     let info_bar = Paragraph::new(info_text)
         .style(action_bar_style())
         .block(Block::default());
-    frame.render_widget(info_bar, layout[2]);
+    frame.render_widget(info_bar, info_area);
+
+    if search_focused {
+        let cursor_pos = render_search_panel(frame, layout[3], app);
+        if let Some((x, y)) = cursor_pos {
+            frame.set_cursor_position((x, y));
+        }
+    }
+}
+
+fn render_search_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+) -> Option<(u16, u16)> {
+    let (value, cursor, _focused) = app.search_state()?;
+
+    if area.height == 0 || area.width == 0 {
+        return None;
+    }
+
+    let label = "Find: ";
+    let (before_cursor, after_cursor) = value.split_at(cursor.min(value.len()));
+    let help = " (enter search terms, Enter to activate, Escape to cancel)";
+
+    let spans = vec![
+        Span::raw(label),
+        Span::raw(before_cursor),
+        Span::raw(after_cursor),
+        Span::styled(help, Style::default().fg(Color::DarkGray)),
+    ];
+    let paragraph = Paragraph::new(Line::from(spans));
+    frame.render_widget(paragraph, area);
+
+    let label_width = label.chars().count() as u16;
+    let max_x = area.x + area.width.saturating_sub(1);
+    let cursor_x = (area.x + label_width + cursor as u16).min(max_x);
+    Some((cursor_x, area.y))
+}
+
+/// Render the search panel as a popup overlay in the top-right of `area`.
+fn render_search_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some((value, _cursor, _focused)) = app.search_state() else {
+        return;
+    };
+
+    let margin_top: u16 = 1;
+    let margin_right: u16 = 3;
+
+    let title = " Search ";
+    let line1 = "Showing results for:";
+    // 1 char padding on each side inside the border
+    let inner_width = (line1.len() as u16).max(value.len() as u16) + 2;
+
+    let bottom_label = "/:Change  Esc:Clear";
+    let inner_width = inner_width.max(bottom_label.len() as u16);
+
+    let width = inner_width + 2; // borders only; padding handled by Block
+    let height = 2 + 2; // 2 content lines + 2 border
+
+    if area.width < width + margin_right || area.height < height + margin_top {
+        return;
+    }
+
+    let x = area.x + area.width - width - margin_right;
+    let y = area.y + margin_top;
+    let popup_area = Rect::new(x, y, width, height);
+
+    let popup_style = Style::default().bg(Color::Black).fg(Color::White);
+
+    let key_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let sep_style = Style::default().fg(Color::Gray);
+
+    let bottom_title = Line::from(vec![
+        Span::styled("/", key_style),
+        Span::styled(":", sep_style),
+        Span::styled("Change", popup_style),
+        Span::raw("  "),
+        Span::styled("Esc", key_style),
+        Span::styled(":", sep_style),
+        Span::styled("Clear", popup_style),
+    ]);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(popup_style)
+        .border_style(Style::default().fg(Color::Gray))
+        .title_top(Line::styled(title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
+        .title_bottom(bottom_title)
+        .padding(Padding::horizontal(1));
+
+    let value_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+
+    let lines = vec![
+        Line::from(Span::styled(line1, Style::default().fg(Color::Gray))),
+        Line::from(Span::styled(value, value_style)),
+    ];
+
+    frame.render_widget(Clear, popup_area);
+    let paragraph = Paragraph::new(lines).style(popup_style).block(block);
+    frame.render_widget(paragraph, popup_area);
 }
 
 fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
@@ -469,7 +594,7 @@ fn render_message(frame: &mut Frame<'_>, app: &mut App) {
 
 /// Build the inbox table, handling scrolling and selection.
 fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let messages = app.inbox_messages().to_vec();
+    let messages: Vec<_> = app.visible_messages().into_iter().cloned().collect();
     let total = messages.len();
     let height = area.height as usize;
 
@@ -487,8 +612,8 @@ fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             }
         }
 
-        if total > height && top + height > total {
-            top = total - height;
+        if top + height > total {
+            top = total.saturating_sub(height);
         }
     } else {
         top = 0;
@@ -540,7 +665,11 @@ fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let table = Table::new(visible_rows, widths)
         .block(Block::default().borders(Borders::NONE))
         .column_spacing(column_spacing)
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .row_highlight_style(if app.search_state().is_some_and(|s| s.2) {
+            Style::default().fg(ACTION_BAR_FG).bg(ACTION_BAR_BG)
+        } else {
+            Style::default().add_modifier(Modifier::REVERSED)
+        })
         .highlight_symbol("");
 
     let mut state = TableState::default();

@@ -111,22 +111,6 @@ fn resequence_messages(messages: &mut [Message]) {
     }
 }
 
-fn next_loaded_index(messages: &[Message], start: usize) -> Option<usize> {
-    messages
-        .iter()
-        .enumerate()
-        .skip(start)
-        .find_map(|(idx, msg)| (!msg.is_placeholder()).then_some(idx))
-}
-
-fn previous_loaded_index(messages: &[Message], start: usize) -> Option<usize> {
-    messages
-        .iter()
-        .enumerate()
-        .take(start)
-        .rev()
-        .find_map(|(idx, msg)| (!msg.is_placeholder()).then_some(idx))
-}
 
 /// Data required to bootstrap an account within the application.
 pub struct AccountDescriptor {
@@ -217,6 +201,46 @@ struct MailboxLoaderState {
     receiver: Receiver<MailboxLoadUpdate>,
 }
 
+struct SearchState {
+    input: TextFieldState,
+    focused: bool,
+    filtered_indices: Vec<usize>,
+    pre_search_selected: Option<MessageId>,
+}
+
+fn compute_filtered_indices(messages: &[Message], query: &str) -> Vec<usize> {
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+    if terms.is_empty() {
+        return (0..messages.len()).collect();
+    }
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(_, msg)| {
+            if msg.is_placeholder() {
+                return false;
+            }
+            let sender_lower = msg.sender.to_ascii_lowercase();
+            let subject_lower = msg.subject.to_ascii_lowercase();
+            let recipients_lower: String = msg
+                .recipients
+                .iter()
+                .map(|r| r.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(" ");
+            terms.iter().all(|term| {
+                sender_lower.contains(term.as_str())
+                    || subject_lower.contains(term.as_str())
+                    || recipients_lower.contains(term.as_str())
+            })
+        })
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
 /// Per-account state tracked by the UI.
 pub struct AccountState {
     name: String,
@@ -229,6 +253,7 @@ pub struct AccountState {
     mailbox_load_progress: Option<CommitProgress>,
     scheduled_actions: Vec<Action>,
     current_mailbox: MailboxKind,
+    search: Option<SearchState>,
 }
 
 /// Which screen the UI is currently rendering.
@@ -1081,6 +1106,7 @@ impl App {
                 mailbox_load_progress: initial_load_progress,
                 scheduled_actions: Vec::new(),
                 current_mailbox: MailboxKind::Inbox,
+                search: None,
             });
         }
 
@@ -1140,6 +1166,13 @@ impl App {
         let active_view = self.active_view();
         if matches!(active_view, ActiveView::Compose) {
             return self.handle_compose_key(key);
+        }
+
+        // Route keys to the focused search input before anything else.
+        if matches!(active_view, ActiveView::Mailbox)
+            && self.search.as_ref().is_some_and(|s| s.focused)
+        {
+            return self.handle_search_key(key);
         }
 
         if self.process_pending_shortcut(key)? {
@@ -1371,6 +1404,7 @@ impl App {
                 completed: 0,
             });
             account.message_view = None;
+            account.search = None;
             account.current_mailbox = target;
             account.mailbox.messages.clear();
             account.mailbox.selected = None;
@@ -1471,6 +1505,9 @@ impl App {
             self.set_message_view(None);
         }
 
+        if self.search.is_some() {
+            self.recompute_search_filter();
+        }
         self.normalize_scroll();
         true
     }
@@ -1569,6 +1606,9 @@ impl App {
 
         if refresh {
             self.update_selection_after_refresh(current_id);
+            if self.search.is_some() {
+                self.recompute_search_filter();
+            }
         }
 
         // Update backfill read-progress: if placeholders remain, keep the
@@ -1704,6 +1744,9 @@ impl App {
                 self.mailbox_load_progress = None;
                 self.mailbox.status_line = Some(format!("Failed to load {target}: {message}"));
             }
+        }
+        if self.search.is_some() {
+            self.recompute_search_filter();
         }
     }
 
@@ -1845,16 +1888,21 @@ impl App {
             }
 
             self.sync_message_view_state();
+            if self.search.is_some() {
+                self.recompute_search_filter();
+            }
             if let Some(idx) = self.mailbox.selected
-                && idx >= self.mailbox.messages.len()
-                && !self.mailbox.messages.is_empty()
+                && idx >= self.visible_message_count()
+                && self.visible_message_count() > 0
             {
-                self.mailbox.selected = Some(self.mailbox.messages.len() - 1);
+                self.mailbox.selected = Some(self.visible_message_count() - 1);
             }
 
-            if self.mailbox.messages.is_empty() {
+            if self.visible_message_count() == 0 {
                 self.mailbox.selected = None;
-                self.message_view = None;
+                if self.search.is_none() {
+                    self.message_view = None;
+                }
             }
 
             self.normalize_scroll();
@@ -1875,19 +1923,95 @@ impl App {
         &self.mailbox.messages
     }
 
+    pub(crate) fn visible_messages(&self) -> Vec<&Message> {
+        if let Some(search) = &self.search {
+            search
+                .filtered_indices
+                .iter()
+                .filter_map(|&idx| self.mailbox.messages.get(idx))
+                .collect()
+        } else {
+            self.mailbox.messages.iter().collect()
+        }
+    }
+
+    fn visible_message_count(&self) -> usize {
+        if let Some(search) = &self.search {
+            search.filtered_indices.len()
+        } else {
+            self.mailbox.messages.len()
+        }
+    }
+
+    /// Map the visible selection index to the real index in `mailbox.messages`.
+    fn real_selected_index(&self) -> Option<usize> {
+        let selected = self.mailbox.selected?;
+        if let Some(search) = &self.search {
+            search.filtered_indices.get(selected).copied()
+        } else {
+            Some(selected)
+        }
+    }
+
     pub(crate) fn inbox_selected(&self) -> Option<usize> {
         self.mailbox.selected
     }
 
+    pub(crate) fn search_state(&self) -> Option<(&str, usize, bool)> {
+        self.search
+            .as_ref()
+            .map(|s| (s.input.value.as_str(), s.input.cursor, s.focused))
+    }
+
+    fn recompute_search_filter(&mut self) {
+        if self.search.is_none() {
+            return;
+        }
+        // Remember which real message is currently selected.
+        let previously_selected_id = self
+            .real_selected_index()
+            .and_then(|idx| self.mailbox.messages.get(idx))
+            .map(|msg| msg.id);
+        let prev_selected = self.mailbox.selected.unwrap_or(0);
+
+        let query = self.search.as_ref().unwrap().input.value.clone();
+        let new_indices = compute_filtered_indices(&self.mailbox.messages, &query);
+        let filtered_len = new_indices.len();
+
+        // Find the visible position of the previously selected message.
+        let mut restored_pos = None;
+        if let Some(id) = previously_selected_id {
+            for (vis, real_idx) in new_indices.iter().enumerate() {
+                if let Some(msg) = self.mailbox.messages.get(*real_idx)
+                    && msg.id == id
+                {
+                    restored_pos = Some(vis);
+                    break;
+                }
+            }
+        }
+
+        self.search.as_mut().unwrap().filtered_indices = new_indices;
+
+        if let Some(visible_pos) = restored_pos {
+            self.mailbox.selected = Some(visible_pos);
+        } else if filtered_len == 0 {
+            self.mailbox.selected = None;
+        } else {
+            self.mailbox.selected = Some(prev_selected.min(filtered_len - 1));
+        }
+
+        self.normalize_scroll();
+    }
+
     fn selected_loaded_message(&self) -> Option<&Message> {
-        self.mailbox
-            .selected
+        self.real_selected_index()
             .and_then(|idx| self.mailbox.messages.get(idx))
             .filter(|msg| !msg.is_placeholder())
     }
 
     fn selected_loaded_message_mut(&mut self) -> Option<&mut Message> {
-        let idx = self.mailbox.selected?;
+        let idx = self.real_selected_index()?;
         self.mailbox
             .messages
             .get_mut(idx)
@@ -1897,8 +2021,8 @@ impl App {
     pub(crate) fn inbox_action_bar(&self) -> String {
         let mut text = String::from("^Q:Quit g:GoToMailbox G:Accounts c:Compose");
 
-        if let Some(idx) = self.mailbox.selected
-            && let Some(msg) = self.mailbox.messages.get(idx)
+        if let Some(real_idx) = self.real_selected_index()
+            && let Some(msg) = self.mailbox.messages.get(real_idx)
         {
             if msg.is_placeholder() {
                 text.push_str(" Loading message...");
@@ -1968,6 +2092,12 @@ impl App {
             text.push_str(" $:Commit");
         }
 
+        if self.search.as_ref().is_some_and(|s| !s.focused) {
+            text.push_str(" /:Search Esc:ClearSearch");
+        } else if self.search.is_none() {
+            text.push_str(" /:Search");
+        }
+
         text
     }
 
@@ -2014,18 +2144,28 @@ impl App {
 
     pub(crate) fn inbox_info_bar(&self) -> String {
         let total = self.mailbox.messages.len();
+        let visible = self.visible_message_count();
         let selected = self
             .mailbox
             .selected
             .map(|idx| format!("{}", idx + 1))
             .unwrap_or_else(|| "-".to_string());
-        format!(
-            "{} • {} — message {selected}/{total}, {} scheduled actions, got {} events",
-            self.name,
-            self.current_mailbox,
-            self.scheduled_actions.len(),
-            self.mailbox.event_count
-        )
+        if self.search.is_some() {
+            format!(
+                "{} • {} — {visible} matches of {total} messages, message {selected}/{visible}, {} scheduled",
+                self.name,
+                self.current_mailbox,
+                self.scheduled_actions.len(),
+            )
+        } else {
+            format!(
+                "{} • {} — message {selected}/{total}, {} scheduled actions, got {} events",
+                self.name,
+                self.current_mailbox,
+                self.scheduled_actions.len(),
+                self.mailbox.event_count
+            )
+        }
     }
 
     pub(crate) fn inbox_status_line(&self) -> Option<&str> {
@@ -2064,6 +2204,106 @@ impl App {
         self.compose.as_ref().and_then(|state| state.status())
     }
 
+    fn open_search(&mut self) {
+        if let Some(search) = self.search.as_mut() {
+            // Re-focus existing search panel.
+            search.focused = true;
+            search.input.cursor = text_len(&search.input.value);
+            return;
+        }
+        let pre_search_selected = self
+            .real_selected_index()
+            .and_then(|idx| self.mailbox.messages.get(idx))
+            .map(|msg| msg.id);
+        let filtered_indices = (0..self.mailbox.messages.len()).collect();
+        self.search = Some(SearchState {
+            input: TextFieldState::default(),
+            focused: true,
+            filtered_indices,
+            pre_search_selected,
+        });
+    }
+
+    fn close_search(&mut self) {
+        let pre_search_id = self
+            .search
+            .as_ref()
+            .and_then(|s| s.pre_search_selected);
+        self.search = None;
+        // Restore selection to the pre-search message.
+        if let Some(id) = pre_search_id
+            && let Some((idx, _)) = self
+                .mailbox
+                .messages
+                .iter()
+                .enumerate()
+                .find(|(_, msg)| msg.id == id)
+        {
+            self.mailbox.selected = Some(idx);
+        }
+        self.normalize_scroll();
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) -> Result<()> {
+        // Allow Ctrl+Q even in search mode.
+        if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.should_quit = true;
+            return Ok(());
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.close_search();
+            }
+            KeyCode::Enter => {
+                if let Some(search) = self.search.as_mut() {
+                    search.focused = false;
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(search) = self.search.as_mut() {
+                    search.input.backspace();
+                }
+                self.recompute_search_filter();
+            }
+            KeyCode::Left => {
+                if let Some(search) = self.search.as_mut() {
+                    search.input.move_left();
+                }
+            }
+            KeyCode::Right => {
+                if let Some(search) = self.search.as_mut() {
+                    search.input.move_right();
+                }
+            }
+            KeyCode::Home => {
+                if let Some(search) = self.search.as_mut() {
+                    search.input.move_home();
+                }
+            }
+            KeyCode::End => {
+                if let Some(search) = self.search.as_mut() {
+                    search.input.move_end();
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(search) = self.search.as_mut() {
+                    search.input.value.clear();
+                    search.input.cursor = 0;
+                }
+                self.recompute_search_filter();
+            }
+            KeyCode::Char(ch) => {
+                if let Some(search) = self.search.as_mut() {
+                    search.input.insert(ch);
+                }
+                self.recompute_search_filter();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn handle_mailbox_key(&mut self, key: KeyEvent) -> Result<()> {
         if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
@@ -2087,8 +2327,8 @@ impl App {
             KeyCode::Char('a') | KeyCode::Char('A') => self.open_reply(true)?,
             KeyCode::Char('f') | KeyCode::Char('F') => self.open_forward()?,
             KeyCode::Char('!') => {
-                if let Some(idx) = self.mailbox.selected
-                    && let Some(msg) = self.mailbox.messages.get(idx)
+                if let Some(real_idx) = self.real_selected_index()
+                    && let Some(msg) = self.mailbox.messages.get(real_idx)
                 {
                     if self.current_mailbox == MailboxKind::Spam
                         || msg.status == MessageStatus::Spam
@@ -2109,6 +2349,12 @@ impl App {
             KeyCode::Char('d') | KeyCode::Char('D') => self.schedule_delete(),
             KeyCode::Char('#') => self.schedule_delete(),
             KeyCode::Backspace | KeyCode::Delete => self.schedule_delete(),
+            KeyCode::Char('/') => self.open_search(),
+            KeyCode::Esc => {
+                if self.search.is_some() {
+                    self.close_search();
+                }
+            }
             _ => {}
         }
 
@@ -2786,7 +3032,7 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let len = self.mailbox.messages.len();
+        let len = self.visible_message_count();
         if len == 0 {
             self.mailbox.selected = None;
             return;
@@ -2798,7 +3044,7 @@ impl App {
     }
 
     fn select_first(&mut self) {
-        if self.mailbox.messages.is_empty() {
+        if self.visible_message_count() == 0 {
             self.mailbox.selected = None;
         } else {
             self.mailbox.selected = Some(0);
@@ -2806,10 +3052,11 @@ impl App {
     }
 
     fn select_last(&mut self) {
-        if self.mailbox.messages.is_empty() {
+        let len = self.visible_message_count();
+        if len == 0 {
             self.mailbox.selected = None;
         } else {
-            self.mailbox.selected = Some(self.mailbox.messages.len() - 1);
+            self.mailbox.selected = Some(len - 1);
         }
     }
 
@@ -3171,19 +3418,17 @@ impl App {
     }
 
     fn advance_selection_after_action(&mut self, current_idx: usize) {
-        if self.mailbox.messages.is_empty() {
+        let len = self.visible_message_count();
+        if len == 0 {
             self.mailbox.selected = None;
             return;
         }
-        let mut next_idx = current_idx + 1;
-        if next_idx >= self.mailbox.messages.len() {
-            next_idx = self.mailbox.messages.len().saturating_sub(1);
-        }
-
-        let candidate = next_loaded_index(&self.mailbox.messages, next_idx)
-            .or_else(|| previous_loaded_index(&self.mailbox.messages, current_idx));
-
-        self.mailbox.selected = candidate.or_else(|| last_loaded_index(&self.mailbox.messages));
+        let next_idx = if current_idx + 1 >= len {
+            len.saturating_sub(1)
+        } else {
+            current_idx + 1
+        };
+        self.mailbox.selected = Some(next_idx.min(len.saturating_sub(1)));
     }
 
     /// Submit immediate actions (star, important, read/unread) to the backend
@@ -3281,9 +3526,10 @@ impl App {
             actions.iter().map(|a| a.message_id).collect();
 
         // Remember which message the cursor is on so we can restore it.
+        // Use real_selected_index() to map through filtered indices when
+        // search is active.
         let selected_id = self
-            .mailbox
-            .selected
+            .real_selected_index()
             .and_then(|idx| self.mailbox.messages.get(idx))
             .map(|msg| msg.id);
 
@@ -3325,6 +3571,12 @@ impl App {
             }
         }
 
+        // Recompute the search filter since messages were removed and
+        // resequenced — the old filtered_indices are now stale.
+        if self.search.is_some() {
+            self.recompute_search_filter();
+        }
+
         self.sync_message_view_state();
         self.normalize_scroll();
 
@@ -3332,7 +3584,11 @@ impl App {
     }
 
     fn open_selected_message(&mut self) -> Result<()> {
-        let idx = match self.mailbox.selected {
+        if self.mailbox.selected.is_none() {
+            return Ok(());
+        }
+
+        let real_idx = match self.real_selected_index() {
             Some(idx) => idx,
             None => return Ok(()),
         };
@@ -3374,9 +3630,14 @@ impl App {
             None
         };
 
+        // Defocus search when opening a message so mailbox keys work on return.
+        if let Some(search) = self.search.as_mut() {
+            search.focused = false;
+        }
+
         self.message_view = Some(MessageViewState {
             message_id: message.id,
-            message_index: idx,
+            message_index: real_idx,
             message,
             content,
             document,
@@ -3394,15 +3655,25 @@ impl App {
         let Some(current) = self.message_view.as_ref() else {
             return Ok(());
         };
-        let len = self.mailbox.messages.len() as isize;
+        let len = self.visible_message_count() as isize;
         if len == 0 {
             return Ok(());
         }
-        let next_index = current.message_index as isize + offset;
-        if next_index < 0 || next_index >= len {
+        // Find the current visible position.
+        let visible_pos = if let Some(search) = &self.search {
+            search
+                .filtered_indices
+                .iter()
+                .position(|&idx| idx == current.message_index)
+                .unwrap_or(0)
+        } else {
+            current.message_index
+        };
+        let next_visible = visible_pos as isize + offset;
+        if next_visible < 0 || next_visible >= len {
             return Ok(());
         }
-        self.mailbox.selected = Some(next_index as usize);
+        self.mailbox.selected = Some(next_visible as usize);
         self.open_selected_message()
     }
 
@@ -3520,7 +3791,7 @@ pub(crate) struct MessageRow {
 
 impl App {
     fn normalize_scroll(&mut self) {
-        let len = self.mailbox.messages.len();
+        let len = self.visible_message_count();
         if len == 0 {
             self.mailbox.scroll_top = 0;
         } else {
@@ -3730,6 +4001,7 @@ mod tests {
             mailbox_load_progress: None,
             scheduled_actions: vec![],
             current_mailbox: MailboxKind::Inbox,
+            search: None,
         };
 
         App {
@@ -3737,6 +4009,7 @@ mod tests {
             active_account: 0,
             compose: None,
             should_quit: false,
+
             pending_shortcut: None,
             pending_navigation: None,
         }
