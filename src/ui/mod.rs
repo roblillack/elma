@@ -110,8 +110,8 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
-                Constraint::Length(1),
                 Constraint::Min(0),
+                Constraint::Length(1),
                 Constraint::Length(1),
             ])
             .split(frame.area())
@@ -133,15 +133,8 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
         app.commit_indicator(),
     );
 
-    let (message_area, info_area) = if search_focused {
-        let cursor_pos = render_search_panel(frame, layout[1], app);
-        if let Some((x, y)) = cursor_pos {
-            frame.set_cursor_position((x, y));
-        }
-        (layout[2], layout[3])
-    } else {
-        (layout[1], layout[2])
-    };
+    let message_area = layout[1];
+    let info_area = layout[2];
 
     render_message_table(frame, app, message_area);
 
@@ -161,6 +154,13 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
         .style(action_bar_style())
         .block(Block::default());
     frame.render_widget(info_bar, info_area);
+
+    if search_focused {
+        let cursor_pos = render_search_panel(frame, layout[3], app);
+        if let Some((x, y)) = cursor_pos {
+            frame.set_cursor_position((x, y));
+        }
+    }
 }
 
 fn render_search_panel(
@@ -168,7 +168,7 @@ fn render_search_panel(
     area: Rect,
     app: &App,
 ) -> Option<(u16, u16)> {
-    let Some((value, cursor, focused)) = app.search_state() else {
+    let Some((value, cursor, _focused)) = app.search_state() else {
         return None;
     };
 
@@ -177,32 +177,17 @@ fn render_search_panel(
     }
 
     let label = "Find: ";
-    let label_style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    let value_style = if focused {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
-
-    let bg = if focused {
-        Color::Rgb(40, 40, 40)
-    } else {
-        Color::Rgb(30, 30, 30)
-    };
+    let (before_cursor, after_cursor) = value.split_at(cursor.min(value.len()));
+    let help = " (enter search terms, Enter to activate, Escape to cancel)";
 
     let spans = vec![
-        Span::styled(label, label_style),
-        Span::styled(value, value_style),
+        Span::raw(label),
+        Span::raw(before_cursor),
+        Span::raw(after_cursor),
+        Span::styled(help, Style::default().fg(Color::DarkGray)),
     ];
-    let paragraph = Paragraph::new(Line::from(spans))
-        .style(Style::default().bg(bg));
+    let paragraph = Paragraph::new(Line::from(spans));
     frame.render_widget(paragraph, area);
-
-    if !focused {
-        return None;
-    }
 
     let label_width = label.chars().count() as u16;
     let max_x = area.x + area.width.saturating_sub(1);
