@@ -104,14 +104,27 @@ fn render_action_bar(
 
 /// Render the inbox list together with action and status bars.
 fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(frame.area());
+    let has_search = app.search_state().is_some();
+    let layout = if has_search {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(frame.area())
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(frame.area())
+    };
 
     render_action_bar(
         frame,
@@ -120,7 +133,17 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
         app.commit_indicator(),
     );
 
-    render_message_table(frame, app, layout[1]);
+    let (message_area, info_area) = if has_search {
+        let cursor_pos = render_search_panel(frame, layout[1], app);
+        if let Some((x, y)) = cursor_pos {
+            frame.set_cursor_position((x, y));
+        }
+        (layout[2], layout[3])
+    } else {
+        (layout[1], layout[2])
+    };
+
+    render_message_table(frame, app, message_area);
 
     let mut info_text = app.inbox_info_bar();
     if let Some(status) = app.inbox_status_line()
@@ -132,7 +155,54 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
     let info_bar = Paragraph::new(info_text)
         .style(action_bar_style())
         .block(Block::default());
-    frame.render_widget(info_bar, layout[2]);
+    frame.render_widget(info_bar, info_area);
+}
+
+fn render_search_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+) -> Option<(u16, u16)> {
+    let Some((value, cursor, focused)) = app.search_state() else {
+        return None;
+    };
+
+    if area.height == 0 || area.width == 0 {
+        return None;
+    }
+
+    let label = "Find: ";
+    let label_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let value_style = if focused {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+
+    let bg = if focused {
+        Color::Rgb(40, 40, 40)
+    } else {
+        Color::Rgb(30, 30, 30)
+    };
+
+    let spans = vec![
+        Span::styled(label, label_style),
+        Span::styled(value, value_style),
+    ];
+    let paragraph = Paragraph::new(Line::from(spans))
+        .style(Style::default().bg(bg));
+    frame.render_widget(paragraph, area);
+
+    if !focused {
+        return None;
+    }
+
+    let label_width = label.chars().count() as u16;
+    let max_x = area.x + area.width.saturating_sub(1);
+    let cursor_x = (area.x + label_width + cursor as u16).min(max_x);
+    Some((cursor_x, area.y))
 }
 
 fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
@@ -469,7 +539,7 @@ fn render_message(frame: &mut Frame<'_>, app: &mut App) {
 
 /// Build the inbox table, handling scrolling and selection.
 fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let messages = app.inbox_messages().to_vec();
+    let messages: Vec<_> = app.visible_messages().into_iter().cloned().collect();
     let total = messages.len();
     let height = area.height as usize;
 
