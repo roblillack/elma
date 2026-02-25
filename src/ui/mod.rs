@@ -176,7 +176,7 @@ fn render_search_panel(
 
     let label = "Find: ";
     let (before_cursor, after_cursor) = value.split_at(cursor.min(value.len()));
-    let help = " (enter search terms, Enter to activate, Escape to cancel)";
+    let help = " (input search terms; press <Enter> to activate, <Esc> to cancel)";
 
     let spans = vec![
         Span::raw(label),

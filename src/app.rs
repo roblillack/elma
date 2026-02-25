@@ -2256,7 +2256,13 @@ impl App {
                 self.close_search();
             }
             KeyCode::Enter => {
-                if let Some(search) = self.search.as_mut() {
+                if self
+                    .search
+                    .as_ref()
+                    .is_some_and(|s| s.input.value.trim().is_empty())
+                {
+                    self.close_search();
+                } else if let Some(search) = self.search.as_mut() {
                     search.focused = false;
                 }
             }
