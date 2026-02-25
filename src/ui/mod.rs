@@ -610,7 +610,11 @@ fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let table = Table::new(visible_rows, widths)
         .block(Block::default().borders(Borders::NONE))
         .column_spacing(column_spacing)
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .row_highlight_style(if app.search_state().is_some_and(|s| s.2) {
+            Style::default().fg(ACTION_BAR_FG).bg(ACTION_BAR_BG)
+        } else {
+            Style::default().add_modifier(Modifier::REVERSED)
+        })
         .highlight_symbol("");
 
     let mut state = TableState::default();
