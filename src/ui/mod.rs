@@ -15,7 +15,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap},
 };
 use time::OffsetDateTime;
 
@@ -104,8 +104,8 @@ fn render_action_bar(
 
 /// Render the inbox list together with action and status bars.
 fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
-    let has_search = app.search_state().is_some();
-    let layout = if has_search {
+    let search_focused = app.search_state().is_some_and(|s| s.2);
+    let layout = if search_focused {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -133,7 +133,7 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
         app.commit_indicator(),
     );
 
-    let (message_area, info_area) = if has_search {
+    let (message_area, info_area) = if search_focused {
         let cursor_pos = render_search_panel(frame, layout[1], app);
         if let Some((x, y)) = cursor_pos {
             frame.set_cursor_position((x, y));
@@ -144,6 +144,11 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
     };
 
     render_message_table(frame, app, message_area);
+
+    // Render unfocused search as a popup overlay in the top-right of the message area.
+    if !search_focused {
+        render_search_popup(frame, message_area, app);
+    }
 
     let mut info_text = app.inbox_info_bar();
     if let Some(status) = app.inbox_status_line()
@@ -203,6 +208,73 @@ fn render_search_panel(
     let max_x = area.x + area.width.saturating_sub(1);
     let cursor_x = (area.x + label_width + cursor as u16).min(max_x);
     Some((cursor_x, area.y))
+}
+
+/// Render the search panel as a popup overlay in the top-right of `area`.
+fn render_search_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some((value, _cursor, _focused)) = app.search_state() else {
+        return;
+    };
+
+    let margin_top: u16 = 1;
+    let margin_right: u16 = 3;
+
+    let title = " Search ";
+    let line1 = "Showing results for:";
+    // 1 char padding on each side inside the border
+    let inner_width = (line1.len() as u16).max(value.len() as u16) + 2;
+
+    let bottom_label = "/:Change  Esc:Clear";
+    let inner_width = inner_width.max(bottom_label.len() as u16);
+
+    let width = inner_width + 2; // borders only; padding handled by Block
+    let height = 2 + 2; // 2 content lines + 2 border
+
+    if area.width < width + margin_right || area.height < height + margin_top {
+        return;
+    }
+
+    let x = area.x + area.width - width - margin_right;
+    let y = area.y + margin_top;
+    let popup_area = Rect::new(x, y, width, height);
+
+    let popup_style = Style::default().bg(Color::Black).fg(Color::White);
+
+    let key_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let sep_style = Style::default().fg(Color::Gray);
+
+    let bottom_title = Line::from(vec![
+        Span::styled("/", key_style),
+        Span::styled(":", sep_style),
+        Span::styled("Change", popup_style),
+        Span::raw("  "),
+        Span::styled("Esc", key_style),
+        Span::styled(":", sep_style),
+        Span::styled("Clear", popup_style),
+    ]);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(popup_style)
+        .border_style(Style::default().fg(Color::Gray))
+        .title_top(Line::styled(title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
+        .title_bottom(bottom_title)
+        .padding(Padding::horizontal(1));
+
+    let value_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+
+    let lines = vec![
+        Line::from(Span::styled(line1, Style::default().fg(Color::Gray))),
+        Line::from(Span::styled(value, value_style)),
+    ];
+
+    frame.render_widget(Clear, popup_area);
+    let paragraph = Paragraph::new(lines).style(popup_style).block(block);
+    frame.render_widget(paragraph, popup_area);
 }
 
 fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
