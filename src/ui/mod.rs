@@ -168,9 +168,7 @@ fn render_search_panel(
     area: Rect,
     app: &App,
 ) -> Option<(u16, u16)> {
-    let Some((value, cursor, _focused)) = app.search_state() else {
-        return None;
-    };
+    let (value, cursor, _focused) = app.search_state()?;
 
     if area.height == 0 || area.width == 0 {
         return None;

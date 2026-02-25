@@ -1982,11 +1982,11 @@ impl App {
         let mut restored_pos = None;
         if let Some(id) = previously_selected_id {
             for (vis, real_idx) in new_indices.iter().enumerate() {
-                if let Some(msg) = self.mailbox.messages.get(*real_idx) {
-                    if msg.id == id {
-                        restored_pos = Some(vis);
-                        break;
-                    }
+                if let Some(msg) = self.mailbox.messages.get(*real_idx)
+                    && msg.id == id
+                {
+                    restored_pos = Some(vis);
+                    break;
                 }
             }
         }
@@ -2231,16 +2231,15 @@ impl App {
             .and_then(|s| s.pre_search_selected);
         self.search = None;
         // Restore selection to the pre-search message.
-        if let Some(id) = pre_search_id {
-            if let Some((idx, _)) = self
+        if let Some(id) = pre_search_id
+            && let Some((idx, _)) = self
                 .mailbox
                 .messages
                 .iter()
                 .enumerate()
                 .find(|(_, msg)| msg.id == id)
-            {
-                self.mailbox.selected = Some(idx);
-            }
+        {
+            self.mailbox.selected = Some(idx);
         }
         self.normalize_scroll();
     }
