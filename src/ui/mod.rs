@@ -163,11 +163,7 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
-fn render_search_panel(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &App,
-) -> Option<(u16, u16)> {
+fn render_search_panel(frame: &mut Frame<'_>, area: Rect, app: &App) -> Option<(u16, u16)> {
     let (value, cursor, _focused) = app.search_state()?;
 
     if area.height == 0 || area.width == 0 {
@@ -224,9 +220,7 @@ fn render_search_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let popup_style = Style::default().bg(ACTION_BAR_BG).fg(ACTION_BAR_FG);
     let dark_fg = Style::default().fg(Color::Black);
 
-    let key_style = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
+    let key_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
     let sep_style = Style::default().fg(ACTION_BAR_FG);
 
     let bottom_title = Line::from(vec![
@@ -243,12 +237,17 @@ fn render_search_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .style(popup_style)
         .border_style(Style::default().fg(ACTION_BAR_FG))
-        .title_top(Line::styled(title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
+        .title_top(Line::styled(
+            title,
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        ))
         .title_bottom(bottom_title)
         .padding(Padding::horizontal(1));
 
     let value_style = Style::default()
-        .fg(Color::Yellow)
+        .fg(Color::Black)
         .add_modifier(Modifier::BOLD);
 
     let lines = vec![
@@ -666,11 +665,13 @@ fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let table = Table::new(visible_rows, widths)
         .block(Block::default().borders(Borders::NONE))
         .column_spacing(column_spacing)
-        .row_highlight_style(if app.search_state().is_some_and(|s| s.2) {
-            Style::default().fg(ACTION_BAR_FG).bg(ACTION_BAR_BG)
-        } else {
-            Style::default().add_modifier(Modifier::REVERSED)
-        })
+        .row_highlight_style(
+            if app.search_state().is_some_and(|s| s.2) || app.shortcut_menu().is_some() {
+                Style::default().fg(ACTION_BAR_FG).bg(ACTION_BAR_BG)
+            } else {
+                Style::default().add_modifier(Modifier::REVERSED)
+            },
+        )
         .highlight_symbol("");
 
     let mut state = TableState::default();

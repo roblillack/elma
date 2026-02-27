@@ -111,7 +111,6 @@ fn resequence_messages(messages: &mut [Message]) {
     }
 }
 
-
 /// Data required to bootstrap an account within the application.
 pub struct AccountDescriptor {
     pub name: String,
@@ -2092,9 +2091,7 @@ impl App {
             text.push_str(" $:Commit");
         }
 
-        if self.search.as_ref().is_some_and(|s| !s.focused) {
-            text.push_str(" /:Search Esc:ClearSearch");
-        } else if self.search.is_none() {
+        if self.search.is_none() {
             text.push_str(" /:Search");
         }
 
@@ -2225,10 +2222,7 @@ impl App {
     }
 
     fn close_search(&mut self) {
-        let pre_search_id = self
-            .search
-            .as_ref()
-            .and_then(|s| s.pre_search_selected);
+        let pre_search_id = self.search.as_ref().and_then(|s| s.pre_search_selected);
         self.search = None;
         // Restore selection to the pre-search message.
         if let Some(id) = pre_search_id
