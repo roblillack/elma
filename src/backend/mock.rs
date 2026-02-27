@@ -243,10 +243,7 @@ impl MockBackend {
         });
     }
 
-    fn spawn_action_worker(
-        &self,
-        work_queue: Arc<(Mutex<VecDeque<WorkItem>>, Condvar)>,
-    ) {
+    fn spawn_action_worker(&self, work_queue: Arc<(Mutex<VecDeque<WorkItem>>, Condvar)>) {
         let mailboxes = Arc::clone(&self.mailboxes);
         let contents = Arc::clone(&self.contents);
 
@@ -606,10 +603,13 @@ impl MailBackend for MockBackend {
         let (lock, cvar) = &*self.work_queue;
         let mut queue = lock.lock().expect("work queue mutex poisoned");
         for (i, action) in actions.into_iter().enumerate() {
-            queue.insert(i, WorkItem {
-                action,
-                result_tx: tx.clone(),
-            });
+            queue.insert(
+                i,
+                WorkItem {
+                    action,
+                    result_tx: tx.clone(),
+                },
+            );
         }
         cvar.notify_one();
         Ok(rx)

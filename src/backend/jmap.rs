@@ -401,9 +401,7 @@ impl JmapInner {
                     .await?;
                 self.set_keyword(action.message_id, "$seen", true).await
             }
-            ActionType::MarkAsRead => {
-                self.set_keyword(action.message_id, "$seen", true).await
-            }
+            ActionType::MarkAsRead => self.set_keyword(action.message_id, "$seen", true).await,
             ActionType::MarkAsStarred => {
                 self.set_keyword(action.message_id, "$flagged", true).await
             }
@@ -1161,7 +1159,6 @@ impl JmapState {
     fn next_cursor_index(&self) -> usize {
         self.highest_received_index
     }
-
 }
 
 struct StoredMessage {
