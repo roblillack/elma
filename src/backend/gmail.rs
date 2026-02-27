@@ -1097,7 +1097,12 @@ impl GmailInner {
     }
 
     /// Tear down the IDLE loop so another task can operate on the IMAP session.
+    ///
+    /// Locks `idle_handle` first, then `idle_stop` — matching the order used by
+    /// [`start_idle_loop`] — so that a concurrent start cannot insert a new
+    /// (stop_tx, handle) pair between our two reads.
     async fn pause_idle(&self) -> Result<()> {
+        let mut handle_guard = self.idle_handle.lock().await;
         let stop = {
             let mut guard = self.idle_stop.lock().await;
             guard.take()
@@ -1105,8 +1110,7 @@ impl GmailInner {
         if let Some(stop_tx) = stop {
             let _ = stop_tx.send(());
         }
-
-        if let Some(handle) = self.idle_handle.lock().await.take() {
+        if let Some(handle) = handle_guard.take() {
             let _ = handle.await;
         }
 
