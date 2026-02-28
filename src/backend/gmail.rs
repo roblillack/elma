@@ -490,6 +490,7 @@ impl MailBackend for GmailBackend {
                 .fetch_gmail_labels_command(session, &format!("UID FETCH {uid} (UID X-GM-LABELS)"))
                 .await?;
 
+            drop(session_guard);
             self.inner.start_idle_loop().await?;
             self.inner.start_backfill_if_needed().await?;
 
