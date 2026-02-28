@@ -2218,7 +2218,7 @@ mod tests {
 
         assert_eq!(state.messages.len(), 7);
         for id in &ids_to_archive {
-            assert!(state.messages.get(id).is_none());
+            assert!(!state.messages.contains_key(id));
         }
 
         // All remaining messages should have contiguous seqs 1..=7.
@@ -2312,9 +2312,9 @@ mod tests {
         state.remove_by_seq(2).expect("remove msg 2");
 
         // By message id.
-        assert!(state.messages.get(&2).is_none());
+        assert!(!state.messages.contains_key(&2));
         // By uid.
-        assert!(state.uid_to_id.get(&2).is_none());
+        assert!(!state.uid_to_id.contains_key(&2));
     }
 
     // ---------------------------------------------------------------
