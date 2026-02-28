@@ -958,6 +958,10 @@ impl GmailInner {
                 Response::Expunge(seq) => {
                     self.handle_expunge(*seq).await;
                 }
+                Response::MailboxData(MailboxDatum::Exists(count)) => {
+                    let mut state = self.state.lock().await;
+                    state.set_expected_exists(*count);
+                }
                 _ => {}
             }
         }
@@ -1519,7 +1523,7 @@ impl GmailInner {
 
         {
             let mut state = self.state.lock().await;
-            state.remove_by_seq(seq);
+            state.expunge(seq);
         }
 
         self.emit_event(BackendEvent::MessageDeleted(message_id));
