@@ -337,6 +337,12 @@ struct GmailInner {
     idle_handle: AsyncMutex<Option<JoinHandle<()>>>,
     backfill_handle: AsyncMutex<Option<JoinHandle<()>>>,
     backfill_cancel: AsyncMutex<Option<Arc<AtomicBool>>>,
+    /// Serialises action processing so that only one [`process_action`] call
+    /// runs at a time.  Without this, concurrent batches (e.g. an immediate
+    /// flag-change batch and a regular move batch) can race: one task's
+    /// [`start_idle_loop`] may re-take the IMAP session before the other
+    /// task's [`apply_action_internal`] can use it.
+    action_lock: AsyncMutex<()>,
 }
 
 /// Cached view of the Gmail mailbox.
@@ -408,6 +414,7 @@ impl GmailBackend {
                 idle_handle: AsyncMutex::new(None),
                 backfill_handle: AsyncMutex::new(None),
                 backfill_cancel: AsyncMutex::new(None),
+                action_lock: AsyncMutex::new(()),
             }),
         })
     }
@@ -1120,6 +1127,7 @@ impl GmailInner {
 
     /// Pause the IDLE worker, apply `action`, then restart listening for updates.
     async fn process_action(self: Arc<Self>, action: Action) -> Result<()> {
+        let _guard = self.action_lock.lock().await;
         self.pause_idle().await?;
         let result = self
             .apply_action_internal(&action)
