@@ -2095,6 +2095,41 @@ mod tests {
         }
     }
 
+    fn make_message_with_uid(id: u64, seq: u32, uid: u32) -> StoredMessage {
+        let message = Message {
+            id,
+            sent: OffsetDateTime::UNIX_EPOCH,
+            sender: format!("sender{id}"),
+            recipients: Vec::new(),
+            subject: format!("subject{id}"),
+            size: 0,
+            starred: false,
+            important: false,
+            answered: false,
+            forwarded: false,
+            status: MessageStatus::New,
+            labels: Vec::new(),
+            uid,
+            seq,
+            has_attachments: false,
+        };
+
+        StoredMessage { message, seq, uid }
+    }
+
+    fn populate_state(count: u32) -> SharedState {
+        let mut state = SharedState::default();
+        for seq in 1..=count {
+            state.insert(make_message(seq as u64, seq));
+        }
+        state.set_expected_exists(count);
+        state
+    }
+
+    // ---------------------------------------------------------------
+    //  remove_by_seq
+    // ---------------------------------------------------------------
+
     #[test]
     fn remove_by_seq_handles_repeated_sequence_numbers() {
         let mut state = SharedState::default();
@@ -2119,5 +2154,362 @@ mod tests {
         assert_eq!(state.messages.len(), 2);
         assert!(state.seq_to_id.contains_key(&1));
         assert!(state.seq_to_id.contains_key(&2));
+    }
+
+    #[test]
+    fn remove_lowest_seq_shifts_everything_down() {
+        let mut state = populate_state(4);
+
+        state.remove_by_seq(1).expect("remove seq 1");
+        assert_eq!(state.messages.len(), 3);
+
+        // Original seqs 2,3,4 should now be 1,2,3.
+        for (expected_seq, expected_id) in [(1, 2), (2, 3), (3, 4)] {
+            let stored = state.messages.get(&expected_id).unwrap();
+            assert_eq!(stored.seq, expected_seq);
+            assert_eq!(*state.seq_to_id.get(&expected_seq).unwrap(), expected_id);
+        }
+    }
+
+    #[test]
+    fn remove_highest_seq_leaves_others_unchanged() {
+        let mut state = populate_state(4);
+
+        state.remove_by_seq(4).expect("remove seq 4");
+        assert_eq!(state.messages.len(), 3);
+
+        for seq in 1..=3 {
+            let stored = state.messages.get(&(seq as u64)).unwrap();
+            assert_eq!(stored.seq, seq);
+        }
+    }
+
+    #[test]
+    fn remove_nonexistent_seq_returns_none() {
+        let mut state = populate_state(3);
+        assert!(state.remove_by_seq(99).is_none());
+        assert_eq!(state.messages.len(), 3);
+    }
+
+    // ---------------------------------------------------------------
+    //  Batch archive: simulate sequential move_message calls
+    // ---------------------------------------------------------------
+
+    /// Simulate the state mutations a batch of `move_message` calls performs:
+    /// each one reads (uid, seq) from state, then calls remove_by_seq.
+    /// After every removal the remaining seq numbers shift down.
+    #[test]
+    fn batch_archive_sequential_removes() {
+        let mut state = populate_state(10);
+
+        // Archive messages 3, 5, 7 (by id).  Their initial seqs are 3, 5, 7.
+        // After removing seq 3, message 5 shifts to seq 4, message 7 to seq 6.
+        // After removing seq 4 (was msg 5), message 7 shifts to seq 5.
+        // After removing seq 5 (was msg 7), done.
+        let ids_to_archive: Vec<u64> = vec![3, 5, 7];
+        for id in &ids_to_archive {
+            let seq = state.messages.get(id).expect("message exists").seq;
+            state.remove_by_seq(seq).expect("removal succeeds");
+        }
+
+        assert_eq!(state.messages.len(), 7);
+        for id in &ids_to_archive {
+            assert!(state.messages.get(id).is_none());
+        }
+
+        // All remaining messages should have contiguous seqs 1..=7.
+        let mut seqs: Vec<u32> = state.seq_to_id.keys().copied().collect();
+        seqs.sort();
+        assert_eq!(seqs, (1..=7).collect::<Vec<_>>());
+    }
+
+    /// A large batch archive that removes every other message, simulating a
+    /// user selecting many messages and committing all at once.
+    #[test]
+    fn batch_archive_every_other_message() {
+        let mut state = populate_state(20);
+        let ids_to_archive: Vec<u64> = (1..=20).filter(|id| id % 2 == 0).collect();
+
+        for id in &ids_to_archive {
+            let seq = state.messages.get(id).expect("message exists").seq;
+            state.remove_by_seq(seq).expect("removal succeeds");
+        }
+
+        assert_eq!(state.messages.len(), 10);
+        let mut seqs: Vec<u32> = state.seq_to_id.keys().copied().collect();
+        seqs.sort();
+        assert_eq!(seqs, (1..=10).collect::<Vec<_>>());
+    }
+
+    // ---------------------------------------------------------------
+    //  Flag updates interleaved with moves (the bug scenario)
+    // ---------------------------------------------------------------
+
+    /// Simulate the state-level effect of interleaved flag changes and
+    /// moves: an immediate batch marks messages as read, while a regular
+    /// batch archives other messages.  After both complete, only the
+    /// flag-changed messages should remain.
+    #[test]
+    fn interleaved_flag_change_and_move() {
+        let mut state = populate_state(5);
+
+        // Immediate batch: mark message 2 as read (flag change, stays in state).
+        let uid = state.messages.get(&2).unwrap().uid;
+        state.apply_flag_values(uid, MessageStatus::Read, false, false, false, false);
+        let msg2 = &state.messages.get(&2).unwrap().message;
+        assert_eq!(msg2.status, MessageStatus::Read);
+
+        // Regular batch: archive messages 1, 3, 4, 5.
+        for id in [1, 3, 4, 5] {
+            let seq = state.messages.get(&id).expect("exists").seq;
+            state.remove_by_seq(seq).expect("removal succeeds");
+        }
+
+        // Only message 2 should remain, at seq 1.
+        assert_eq!(state.messages.len(), 1);
+        let stored = state.messages.get(&2).unwrap();
+        assert_eq!(stored.seq, 1);
+        assert_eq!(stored.message.status, MessageStatus::Read);
+    }
+
+    /// Flag change followed by move of the SAME message (e.g. mark-as-read
+    /// then archive): the flag change is a no-op on state structure, then
+    /// the move removes it.
+    #[test]
+    fn flag_then_move_same_message() {
+        let mut state = populate_state(3);
+
+        // Flag change on message 2.
+        let uid = state.messages.get(&2).unwrap().uid;
+        state.apply_flag_values(uid, MessageStatus::Read, true, false, false, false);
+        assert!(state.messages.contains_key(&2));
+
+        // Now move (archive) message 2.
+        let seq = state.messages.get(&2).unwrap().seq;
+        state.remove_by_seq(seq).expect("remove msg 2");
+
+        assert_eq!(state.messages.len(), 2);
+        assert!(!state.messages.contains_key(&2));
+
+        // Messages 1 and 3 remain with contiguous seqs.
+        let mut seqs: Vec<u32> = state.seq_to_id.keys().copied().collect();
+        seqs.sort();
+        assert_eq!(seqs, vec![1, 2]);
+    }
+
+    // ---------------------------------------------------------------
+    //  Lookup after removal (the "message not found" error path)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn lookup_removed_message_returns_none() {
+        let mut state = populate_state(3);
+
+        state.remove_by_seq(2).expect("remove msg 2");
+
+        // By message id.
+        assert!(state.messages.get(&2).is_none());
+        // By uid.
+        assert!(state.uid_to_id.get(&2).is_none());
+    }
+
+    // ---------------------------------------------------------------
+    //  expunge
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn expunge_decrements_expected_exists() {
+        let mut state = populate_state(5);
+        assert_eq!(state.expected_exists(), 5);
+
+        state.expunge(3);
+        assert_eq!(state.expected_exists(), 4);
+        assert_eq!(state.messages.len(), 4);
+
+        state.expunge(1);
+        assert_eq!(state.expected_exists(), 3);
+        assert_eq!(state.messages.len(), 3);
+    }
+
+    #[test]
+    fn expunge_unknown_seq_decrements_exists_but_returns_none() {
+        let mut state = populate_state(5);
+        let result = state.expunge(99);
+        assert!(result.is_none());
+        assert_eq!(state.expected_exists(), 4);
+        assert_eq!(state.messages.len(), 5);
+    }
+
+    // ---------------------------------------------------------------
+    //  insert
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn insert_updates_all_indices() {
+        let mut state = SharedState::default();
+        state.insert(make_message_with_uid(42, 10, 500));
+
+        assert!(state.messages.contains_key(&42));
+        assert_eq!(*state.seq_to_id.get(&10).unwrap(), 42);
+        assert_eq!(*state.uid_to_id.get(&500).unwrap(), 42);
+    }
+
+    #[test]
+    fn insert_overwrites_existing_message_id() {
+        let mut state = SharedState::default();
+        state.insert(make_message(1, 1));
+
+        // Re-insert the same id with a different seq.
+        let mut replacement = make_message(1, 5);
+        replacement.message.subject = "updated".to_string();
+        state.insert(replacement);
+
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages.get(&1).unwrap().seq, 5);
+        assert_eq!(state.messages.get(&1).unwrap().message.subject, "updated");
+    }
+
+    // ---------------------------------------------------------------
+    //  apply_flag_values
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn apply_flag_values_returns_none_when_unchanged() {
+        let mut state = populate_state(1);
+        // Message defaults: status=New, starred=false, answered=false, forwarded=false
+        let result = state.apply_flag_values(1, MessageStatus::New, false, false, false, false);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn apply_flag_values_updates_and_returns_message() {
+        let mut state = populate_state(1);
+        let result = state.apply_flag_values(1, MessageStatus::Read, true, false, false, false);
+        let updated = result.expect("should return updated message");
+        assert_eq!(updated.status, MessageStatus::Read);
+        assert!(updated.starred);
+
+        // State should reflect the change.
+        let stored = &state.messages.get(&1).unwrap().message;
+        assert_eq!(stored.status, MessageStatus::Read);
+        assert!(stored.starred);
+    }
+
+    #[test]
+    fn apply_flag_values_unknown_uid_returns_none() {
+        let mut state = populate_state(1);
+        let result = state.apply_flag_values(999, MessageStatus::Read, false, false, false, false);
+        assert!(result.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    //  update_labels
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn update_labels_sets_important_flag() {
+        let mut state = populate_state(1);
+
+        let result = state.update_labels(1, vec!["\\Important".to_string()]);
+        let updated = result.expect("labels changed");
+        assert!(updated.important);
+        assert_eq!(updated.labels, vec!["\\Important"]);
+    }
+
+    #[test]
+    fn update_labels_handles_escaped_important() {
+        let mut state = populate_state(1);
+
+        // Gmail sometimes sends \\Important (double backslash from IMAP parser).
+        let result = state.update_labels(1, vec!["\\\\Important".to_string()]);
+        let updated = result.expect("labels changed");
+        assert!(updated.important);
+    }
+
+    #[test]
+    fn update_labels_returns_none_when_unchanged() {
+        let mut state = populate_state(1);
+        state.update_labels(1, vec!["Foo".to_string()]);
+
+        let result = state.update_labels(1, vec!["Foo".to_string()]);
+        assert!(result.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    //  Seq renumbering consistency under various removal patterns
+    // ---------------------------------------------------------------
+
+    /// Verify the three index maps stay consistent after a complex
+    /// sequence of inserts and removals.
+    #[test]
+    fn indices_stay_consistent_after_mixed_operations() {
+        let mut state = populate_state(8);
+
+        // Remove from the middle, then both ends.
+        state.remove_by_seq(4);
+        state.remove_by_seq(1);
+        state.remove_by_seq(6); // shifted seq of original msg 8
+
+        assert_eq!(state.messages.len(), 5);
+        assert_eq!(state.seq_to_id.len(), 5);
+        assert_eq!(state.uid_to_id.len(), 5);
+
+        // Every seq_to_id entry must point to a message whose stored seq
+        // matches the key, and whose uid is in uid_to_id.
+        for (&seq, &id) in &state.seq_to_id {
+            let stored = state.messages.get(&id).unwrap();
+            assert_eq!(stored.seq, seq, "seq mismatch for message {id}");
+            assert_eq!(
+                *state.uid_to_id.get(&stored.uid).unwrap(),
+                id,
+                "uid_to_id mismatch for message {id}"
+            );
+        }
+    }
+
+    /// Removing all messages one-by-one from the front should leave
+    /// an empty, consistent state.
+    #[test]
+    fn remove_all_from_front() {
+        let mut state = populate_state(5);
+        for _ in 0..5 {
+            state.remove_by_seq(1).expect("still messages left");
+        }
+        assert!(state.messages.is_empty());
+        assert!(state.seq_to_id.is_empty());
+        assert!(state.uid_to_id.is_empty());
+    }
+
+    /// Removing all messages one-by-one from the back should leave
+    /// an empty, consistent state.
+    #[test]
+    fn remove_all_from_back() {
+        let mut state = populate_state(5);
+        for seq in (1..=5).rev() {
+            state.remove_by_seq(seq).expect("still messages left");
+        }
+        assert!(state.messages.is_empty());
+        assert!(state.seq_to_id.is_empty());
+        assert!(state.uid_to_id.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    //  Backfill range
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn next_backfill_range_returns_none_when_at_seq_1() {
+        let mut state = SharedState::default();
+        state.insert(make_message(1, 1));
+        assert!(state.next_backfill_range(100).is_none());
+    }
+
+    #[test]
+    fn next_backfill_range_returns_chunk_below_lowest() {
+        let mut state = SharedState::default();
+        state.insert(make_message(100, 50));
+        let (start, end) = state.next_backfill_range(10).unwrap();
+        assert_eq!(end, 49);
+        assert_eq!(start, 40);
     }
 }
