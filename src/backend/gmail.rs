@@ -140,13 +140,66 @@ mod debug_logging {
             let text = String::from_utf8_lossy(data);
             for segment in text.split_inclusive('\n') {
                 let trimmed = segment.trim_end_matches(['\r', '\n']);
+                let redacted = Self::redact_credentials(trimmed);
+                let line = redacted.as_deref().unwrap_or(trimmed);
                 if segment.ends_with('\n') {
-                    let mut owned = trimmed.to_owned();
+                    let mut owned = line.to_owned();
                     owned.push_str(" <CRLF>");
                     self.log_event(connection_id, direction, &owned);
                 } else {
-                    self.log_event(connection_id, direction, trimmed);
+                    self.log_event(connection_id, direction, line);
                 }
+            }
+        }
+
+        /// Redact passwords from IMAP LOGIN commands.
+        pub(crate) fn redact_credentials(line: &str) -> Option<String> {
+            // IMAP LOGIN format: <tag> LOGIN <username> <password>
+            // The password is the last token — either a quoted string or a literal.
+            let upper = line.to_ascii_uppercase();
+            // Find "LOGIN " after the tag (first whitespace-delimited token).
+            let after_tag = upper.find(' ').map(|i| &upper[i + 1..])?;
+            if !after_tag.starts_with("LOGIN ") {
+                return None;
+            }
+            // Find the start of the LOGIN arguments in the original line.
+            let tag_end = line.find(' ')? + 1;
+            let args_start = tag_end + "LOGIN ".len();
+            let args = line.get(args_start..)?;
+            // Skip past the username (quoted or unquoted) to find the password.
+            let password_start = Self::skip_imap_token(args)?;
+            let prefix = &line[..args_start + password_start];
+            Some(format!("{prefix}\"***\""))
+        }
+
+        /// Skip one IMAP token (quoted string or atom) and trailing whitespace.
+        /// Returns the byte offset where the next token begins.
+        fn skip_imap_token(s: &str) -> Option<usize> {
+            let trimmed = s.trim_start();
+            let leading = s.len() - trimmed.len();
+            if let Some(inner) = trimmed.strip_prefix('"') {
+                // Quoted string: find the closing quote (skipping escaped chars).
+                let mut chars = inner.char_indices();
+                loop {
+                    match chars.next() {
+                        Some((_, '\\')) => {
+                            chars.next();
+                        }
+                        Some((i, '"')) => {
+                            let token_end = 1 + i + 1;
+                            let trailing = trimmed[token_end..].len()
+                                - trimmed[token_end..].trim_start().len();
+                            return Some(leading + token_end + trailing);
+                        }
+                        Some(_) => {}
+                        None => return None,
+                    }
+                }
+            } else {
+                // Atom: run until whitespace.
+                let end = trimmed.find(' ')?;
+                let trailing = trimmed[end..].len() - trimmed[end..].trim_start().len();
+                Some(leading + end + trailing)
             }
         }
     }
@@ -2515,5 +2568,51 @@ mod tests {
         let (start, end) = state.next_backfill_range(10).unwrap();
         assert_eq!(end, 49);
         assert_eq!(start, 40);
+    }
+
+    // ---------------------------------------------------------------
+    //  Credential redaction in debug logger
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn redact_login_quoted() {
+        use debug_logging::GmailImapLogger;
+        let line = r#"A001 LOGIN "user@example.com" "s3cret""#;
+        let redacted = GmailImapLogger::redact_credentials(line).unwrap();
+        assert_eq!(redacted, r#"A001 LOGIN "user@example.com" "***""#);
+        assert!(!redacted.contains("s3cret"));
+    }
+
+    #[test]
+    fn redact_login_unquoted() {
+        use debug_logging::GmailImapLogger;
+        let line = "A001 LOGIN user@example.com mypassword";
+        let redacted = GmailImapLogger::redact_credentials(line).unwrap();
+        assert_eq!(redacted, r#"A001 LOGIN user@example.com "***""#);
+        assert!(!redacted.contains("mypassword"));
+    }
+
+    #[test]
+    fn redact_login_case_insensitive() {
+        use debug_logging::GmailImapLogger;
+        let line = r#"tag login "USER" "PASS""#;
+        let redacted = GmailImapLogger::redact_credentials(line).unwrap();
+        assert_eq!(redacted, r#"tag login "USER" "***""#);
+    }
+
+    #[test]
+    fn redact_ignores_non_login() {
+        use debug_logging::GmailImapLogger;
+        let line = "A001 SELECT INBOX";
+        assert!(GmailImapLogger::redact_credentials(line).is_none());
+    }
+
+    #[test]
+    fn redact_login_with_escaped_quotes_in_username() {
+        use debug_logging::GmailImapLogger;
+        let line = r#"A001 LOGIN "user\"name" "pass""#;
+        let redacted = GmailImapLogger::redact_credentials(line).unwrap();
+        assert!(redacted.contains(r#""***""#));
+        assert!(!redacted.contains(r#""pass""#));
     }
 }
