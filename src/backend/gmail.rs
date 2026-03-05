@@ -17,7 +17,7 @@ use async_imap::{
     extensions::idle::IdleResponse,
     types::{Fetch, Flag},
 };
-use async_native_tls::connect as tls_connect;
+use tokio_rustls::TlsConnector;
 use futures::TryStreamExt;
 use imap_proto::types::{
     AttributeValue, BodyContentCommon, BodyParams, BodyStructure, MailboxDatum, NameAttribute,
@@ -62,8 +62,8 @@ mod debug_logging {
     };
 
     use anyhow::{Context as AnyhowContext, Result};
-    use async_native_tls::TlsStream;
     use chrono::{Local, Utc};
+    use tokio_rustls::client::TlsStream;
     use tokio::io::ReadBuf;
     use tokio::net::TcpStream;
 
@@ -334,8 +334,8 @@ mod debug_logging {
 
 #[cfg(not(debug_assertions))]
 mod debug_logging {
-    use async_native_tls::TlsStream;
     use tokio::net::TcpStream;
+    use tokio_rustls::client::TlsStream;
 
     pub type LoggedTlsStream = TlsStream<TcpStream>;
 
@@ -363,6 +363,12 @@ const MAX_PART_DEPTH: usize = 5;
 const INITIAL_FETCH_LIMIT: u32 = 100;
 const BACKFILL_BATCH_SIZE: u32 = 100;
 const FETCH_MESSAGE_QUERY: &str = "(FLAGS INTERNALDATE RFC822.SIZE ENVELOPE UID BODYSTRUCTURE)";
+
+fn root_store() -> rustls::RootCertStore {
+    let mut store = rustls::RootCertStore::empty();
+    store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    store
+}
 
 /// Production backend that communicates with Gmail over IMAP.
 ///
@@ -607,7 +613,15 @@ impl GmailInner {
         let tcp = TcpStream::connect((GMAIL_HOST, GMAIL_PORT))
             .await
             .context("connecting to Gmail IMAP server")?;
-        let tls_stream = tls_connect(GMAIL_HOST, tcp)
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store())
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(config));
+        let server_name = rustls::pki_types::ServerName::try_from(GMAIL_HOST)
+            .context("invalid TLS server name")?
+            .to_owned();
+        let tls_stream = connector
+            .connect(server_name, tcp)
             .await
             .context("starting TLS handshake with Gmail")?;
         let tls_stream = wrap_stream(tls_stream).context("enabling Gmail IMAP debug logging")?;
