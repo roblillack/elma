@@ -326,6 +326,13 @@ pub(crate) struct SaveAttachmentDialog {
     selected: usize,
     focus: SaveAttachmentFocus,
     status: Option<String>,
+    operation: Option<SaveAttachmentOperation>,
+}
+
+struct SaveAttachmentOperation {
+    receiver: Receiver<Result<PathBuf, String>>,
+    started: Instant,
+    filename: String,
 }
 
 impl SaveAttachmentDialog {
@@ -338,6 +345,7 @@ impl SaveAttachmentDialog {
             selected: 0,
             focus: SaveAttachmentFocus::List,
             status: None,
+            operation: None,
         }
     }
 
@@ -355,6 +363,16 @@ impl SaveAttachmentDialog {
 
     pub(crate) fn status(&self) -> Option<&str> {
         self.status.as_deref()
+    }
+
+    pub(crate) fn active_operation(&self) -> Option<(&str, std::time::Duration)> {
+        self.operation
+            .as_ref()
+            .map(|op| (op.filename.as_str(), op.started.elapsed()))
+    }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        self.operation.is_some()
     }
 
     fn toggle_focus(&mut self) {
@@ -1716,6 +1734,7 @@ impl App {
         self.check_read_timer();
         self.poll_mailbox_loader();
         self.poll_commit_updates();
+        self.poll_save_attachment_operation();
 
         let mut refresh = false;
         let current_id = self
@@ -2726,6 +2745,13 @@ impl App {
             return Ok(());
         };
 
+        if dialog.is_busy() {
+            if matches!(key.code, KeyCode::Esc) {
+                self.close_save_attachment_dialog();
+            }
+            return Ok(());
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.close_save_attachment_dialog();
@@ -2819,6 +2845,14 @@ impl App {
     }
 
     fn commit_save_attachment(&mut self) -> Result<()> {
+        if self
+            .save_attachment
+            .as_ref()
+            .is_some_and(|dialog| dialog.is_busy())
+        {
+            return Ok(());
+        }
+
         let (folder_text, selected) = match self.save_attachment.as_ref() {
             Some(dialog) => (dialog.folder.value.clone(), dialog.selected),
             None => return Ok(()),
@@ -2838,59 +2872,78 @@ impl App {
         let idx = selected.min(attachments.len() - 1);
         let attachment = attachments[idx].clone();
 
-        let data = match attachment.data {
-            Some(bytes) => bytes,
-            None => match attachment.blob_id.as_deref() {
-                Some(blob_id) => match self.backend.fetch_attachment_blob(blob_id) {
-                    Ok(bytes) => bytes,
-                    Err(err) => {
-                        if let Some(dialog) = self.save_attachment.as_mut() {
-                            dialog.set_status(format!("Failed to download attachment: {err}"));
-                        }
-                        return Ok(());
-                    }
-                },
-                None => {
-                    if let Some(dialog) = self.save_attachment.as_mut() {
-                        dialog.set_status("Attachment content is not available.");
-                    }
-                    return Ok(());
-                }
-            },
-        };
-
         let folder = expand_user_path(&folder_text);
-        if let Err(err) = fs::create_dir_all(&folder) {
-            if let Some(dialog) = self.save_attachment.as_mut() {
-                dialog.set_status(format!(
-                    "Cannot create folder '{}': {err}",
-                    folder.display()
-                ));
-            }
-            return Ok(());
-        }
-
         let base_name = attachment
             .filename
             .as_deref()
             .map(sanitize_filename)
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| format!("attachment-{}.bin", idx + 1));
-        let target = unique_path_in(&folder, &base_name);
 
-        if let Err(err) = fs::write(&target, &data) {
-            if let Some(dialog) = self.save_attachment.as_mut() {
-                dialog.set_status(format!("Failed to write '{}': {err}", target.display()));
-            }
-            return Ok(());
+        let backend = Arc::clone(&self.backend);
+        let (tx, rx) = std::sync::mpsc::channel::<Result<PathBuf, String>>();
+
+        let filename_for_op = base_name.clone();
+        thread::spawn(move || {
+            let result = (|| -> Result<PathBuf, String> {
+                let bytes = match attachment.data {
+                    Some(bytes) => bytes,
+                    None => match attachment.blob_id.as_deref() {
+                        Some(blob_id) => backend
+                            .fetch_attachment_blob(blob_id)
+                            .map_err(|err| format!("Failed to download attachment: {err}"))?,
+                        None => {
+                            return Err("Attachment content is not available.".to_string());
+                        }
+                    },
+                };
+
+                fs::create_dir_all(&folder)
+                    .map_err(|err| format!("Cannot create folder '{}': {err}", folder.display()))?;
+
+                let target = unique_path_in(&folder, &base_name);
+                fs::write(&target, &bytes)
+                    .map_err(|err| format!("Failed to write '{}': {err}", target.display()))?;
+                Ok(target)
+            })();
+            let _ = tx.send(result);
+        });
+
+        if let Some(dialog) = self.save_attachment.as_mut() {
+            dialog.clear_status();
+            dialog.operation = Some(SaveAttachmentOperation {
+                receiver: rx,
+                started: Instant::now(),
+                filename: filename_for_op,
+            });
         }
 
-        let saved_msg = format!("Saved to {}", target.display());
-        self.close_save_attachment_dialog();
-        if let Some(view) = self.message_view.as_mut() {
-            view.info_line = Some(saved_msg);
-        }
         Ok(())
+    }
+
+    fn poll_save_attachment_operation(&mut self) {
+        let Some(dialog) = self.save_attachment.as_mut() else {
+            return;
+        };
+        let Some(op) = dialog.operation.as_ref() else {
+            return;
+        };
+
+        match op.receiver.try_recv() {
+            Ok(Ok(path)) => {
+                dialog.operation = None;
+                dialog.set_status(format!("Saved to {}", path.display()));
+            }
+            Ok(Err(err)) => {
+                dialog.operation = None;
+                dialog.set_status(err);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                dialog.operation = None;
+                dialog.set_status("Download worker exited unexpectedly.");
+            }
+        }
     }
 
     fn document_for_message(&mut self, message: &Message) -> Result<Document> {

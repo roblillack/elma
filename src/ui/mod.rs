@@ -1352,19 +1352,34 @@ fn render_save_attachment_dialog(
         }
     }
 
-    let status_text = dialog.status().map(|s| s.to_string()).unwrap_or_else(|| {
-        "Tab to change focus, Up/Down to pick an attachment, Enter to save.".to_string()
-    });
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
+    let status_line = if let Some((filename, elapsed)) = dialog.active_operation() {
+        const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let idx = (elapsed.as_millis() / 80) as usize % SPINNER.len();
+        Line::from(vec![
+            Span::styled(
+                SPINNER[idx].to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("Saving '{filename}' ({:.1}s)...", elapsed.as_secs_f32()),
+                Style::default().fg(Color::Yellow),
+            ),
+        ])
+    } else {
+        let status_text = dialog.status().map(|s| s.to_string()).unwrap_or_else(|| {
+            "Tab to change focus, Up/Down to pick an attachment, Enter to save.".to_string()
+        });
+        Line::from(Span::styled(
             status_text,
             Style::default().fg(Color::DarkGray),
-        )))
-        .style(popup_style),
-        layout[5],
-    );
+        ))
+    };
+    frame.render_widget(Paragraph::new(status_line).style(popup_style), layout[5]);
 
-    if folder_focused {
+    if folder_focused && !dialog.is_busy() {
         let label_prefix = 1u16; // the leading space
         let before_cursor_chars: u16 = folder_value
             .chars()
