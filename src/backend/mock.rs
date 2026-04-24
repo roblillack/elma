@@ -457,6 +457,7 @@ impl MockBackend {
             subject,
             text_body,
             html_body,
+            attachments,
         } = outgoing;
 
         let mut recipients = Vec::new();
@@ -464,7 +465,9 @@ impl MockBackend {
         recipients.extend(cc);
         recipients.extend(bcc);
 
-        let size = text_body.len() + html_body.len() + subject.len();
+        let attachments_total: usize = attachments.iter().map(|att| att.size()).sum();
+        let size = text_body.len() + html_body.len() + subject.len() + attachments_total;
+        let has_attachments = !attachments.is_empty();
 
         let mut message = Message {
             id,
@@ -481,7 +484,7 @@ impl MockBackend {
             labels: Vec::new(),
             uid: id as u32,
             seq: 0,
-            has_attachments: false,
+            has_attachments,
         };
 
         if !label.is_empty() {
@@ -500,6 +503,17 @@ impl MockBackend {
             content_type: "text/html".to_string(),
             content: html_body.into_bytes(),
         });
+        for attachment in &attachments {
+            content_state.attachments.push(MessageAttachment {
+                filename: Some(attachment.filename.clone()),
+                mime_type: attachment.mime_type.clone(),
+                size: attachment.size(),
+            });
+            content_state.parts.push(MessageContentPart {
+                content_type: attachment.mime_type.clone(),
+                content: attachment.data.clone(),
+            });
+        }
 
         let mut mailboxes = self.mailboxes.lock().expect("mailboxes mutex poisoned");
         let mut contents = self.contents.lock().expect("contents mutex poisoned");

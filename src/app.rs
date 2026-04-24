@@ -5,7 +5,9 @@
 //! The type is intentionally synchronous from the TUI's perspective yet internally
 //! manages asynchronous commit results via channels so the UI thread never blocks.
 
-use crate::backend::{ActionStatus, BackendEvent, MailBackend, OutgoingMessage};
+use crate::backend::{
+    ActionStatus, BackendEvent, MailBackend, OutgoingAttachment, OutgoingMessage,
+};
 use crate::model::{
     Action, ActionType, MailboxKind, Message, MessageContent, MessageContentPart, MessageId,
     MessageStatus, format_size, padded_sender,
@@ -346,6 +348,7 @@ pub(crate) enum ComposeField {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ComposeButton {
+    Attach,
     Cancel,
     Edit,
     Draft,
@@ -355,6 +358,7 @@ pub(crate) enum ComposeButton {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ComposeFocus {
     Field(ComposeField),
+    Attachments,
     Body,
     Button(ComposeButton),
 }
@@ -370,6 +374,9 @@ pub(crate) struct ComposeState {
     cc: TextFieldState,
     bcc: TextFieldState,
     subject: TextFieldState,
+    attachments: Vec<OutgoingAttachment>,
+    attachment_selected: usize,
+    attachment_prompt: Option<TextFieldState>,
     body: Document,
     draft_id: Option<MessageId>,
     focus: ComposeFocus,
@@ -385,6 +392,9 @@ impl Default for ComposeState {
             cc: TextFieldState::default(),
             bcc: TextFieldState::default(),
             subject: TextFieldState::default(),
+            attachments: Vec::new(),
+            attachment_selected: 0,
+            attachment_prompt: None,
             body: Document::new(),
             draft_id: None,
             focus: ComposeFocus::Field(ComposeField::To),
@@ -395,23 +405,12 @@ impl Default for ComposeState {
     }
 }
 
-const COMPOSE_BUTTON_SEQUENCE: [ComposeButton; 4] = [
+const COMPOSE_BUTTON_SEQUENCE: [ComposeButton; 5] = [
+    ComposeButton::Attach,
     ComposeButton::Cancel,
     ComposeButton::Edit,
     ComposeButton::Draft,
     ComposeButton::Send,
-];
-
-const COMPOSE_FOCUS_SEQUENCE: [ComposeFocus; 9] = [
-    ComposeFocus::Field(ComposeField::To),
-    ComposeFocus::Field(ComposeField::Cc),
-    ComposeFocus::Field(ComposeField::Bcc),
-    ComposeFocus::Field(ComposeField::Subject),
-    ComposeFocus::Body,
-    ComposeFocus::Button(ComposeButton::Cancel),
-    ComposeFocus::Button(ComposeButton::Edit),
-    ComposeFocus::Button(ComposeButton::Draft),
-    ComposeFocus::Button(ComposeButton::Send),
 ];
 
 impl ComposeState {
@@ -454,26 +453,45 @@ impl ComposeState {
         self.focus = focus;
     }
 
+    fn focus_sequence(&self) -> Vec<ComposeFocus> {
+        let mut sequence = vec![
+            ComposeFocus::Field(ComposeField::To),
+            ComposeFocus::Field(ComposeField::Cc),
+            ComposeFocus::Field(ComposeField::Bcc),
+            ComposeFocus::Field(ComposeField::Subject),
+        ];
+        if !self.attachments.is_empty() {
+            sequence.push(ComposeFocus::Attachments);
+        }
+        sequence.push(ComposeFocus::Body);
+        for button in COMPOSE_BUTTON_SEQUENCE {
+            sequence.push(ComposeFocus::Button(button));
+        }
+        sequence
+    }
+
     fn focus_next(&mut self) {
-        let current_idx = COMPOSE_FOCUS_SEQUENCE
+        let sequence = self.focus_sequence();
+        let current_idx = sequence
             .iter()
             .position(|focus| *focus == self.focus)
             .unwrap_or(0);
-        let next = (current_idx + 1) % COMPOSE_FOCUS_SEQUENCE.len();
-        self.focus = COMPOSE_FOCUS_SEQUENCE[next];
+        let next = (current_idx + 1) % sequence.len();
+        self.focus = sequence[next];
     }
 
     fn focus_prev(&mut self) {
-        let current_idx = COMPOSE_FOCUS_SEQUENCE
+        let sequence = self.focus_sequence();
+        let current_idx = sequence
             .iter()
             .position(|focus| *focus == self.focus)
             .unwrap_or(0);
         let prev = if current_idx == 0 {
-            COMPOSE_FOCUS_SEQUENCE.len() - 1
+            sequence.len() - 1
         } else {
             current_idx - 1
         };
-        self.focus = COMPOSE_FOCUS_SEQUENCE[prev];
+        self.focus = sequence[prev];
     }
 
     fn focus_button_next(&mut self) {
@@ -584,7 +602,102 @@ impl ComposeState {
             subject: self.subject.value.clone(),
             text_body,
             html_body,
+            attachments: self.attachments.clone(),
         })
+    }
+
+    pub(crate) fn attachments(&self) -> &[OutgoingAttachment] {
+        &self.attachments
+    }
+
+    pub(crate) fn is_attachments_focused(&self) -> bool {
+        matches!(self.focus, ComposeFocus::Attachments)
+    }
+
+    pub(crate) fn attachment_selected(&self) -> Option<usize> {
+        if self.attachments.is_empty() {
+            None
+        } else {
+            Some(self.attachment_selected.min(self.attachments.len() - 1))
+        }
+    }
+
+    pub(crate) fn attachment_prompt(&self) -> Option<(&str, usize)> {
+        self.attachment_prompt
+            .as_ref()
+            .map(|state| (state.value.as_str(), state.cursor))
+    }
+
+    pub(crate) fn is_attachment_prompt_active(&self) -> bool {
+        self.attachment_prompt.is_some()
+    }
+
+    fn attachment_prompt_mut(&mut self) -> Option<&mut TextFieldState> {
+        self.attachment_prompt.as_mut()
+    }
+
+    fn open_attachment_prompt(&mut self) {
+        self.attachment_prompt = Some(TextFieldState::default());
+    }
+
+    fn close_attachment_prompt(&mut self) {
+        self.attachment_prompt = None;
+    }
+
+    fn add_attachment(&mut self, attachment: OutgoingAttachment) {
+        self.attachments.push(attachment);
+        self.attachment_selected = self.attachments.len() - 1;
+    }
+
+    fn remove_selected_attachment(&mut self) -> Option<OutgoingAttachment> {
+        if self.attachments.is_empty() {
+            return None;
+        }
+        let idx = self.attachment_selected.min(self.attachments.len() - 1);
+        let removed = self.attachments.remove(idx);
+        if self.attachments.is_empty() {
+            self.attachment_selected = 0;
+            if matches!(self.focus, ComposeFocus::Attachments) {
+                self.focus = ComposeFocus::Body;
+            }
+        } else if self.attachment_selected >= self.attachments.len() {
+            self.attachment_selected = self.attachments.len() - 1;
+        }
+        Some(removed)
+    }
+
+    fn select_attachment_next(&mut self) -> bool {
+        if self.attachments.is_empty() {
+            return false;
+        }
+        if self.attachment_selected + 1 < self.attachments.len() {
+            self.attachment_selected += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn select_attachment_prev(&mut self) -> bool {
+        if self.attachments.is_empty() {
+            return false;
+        }
+        if self.attachment_selected > 0 {
+            self.attachment_selected -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn select_attachment_first(&mut self) {
+        self.attachment_selected = 0;
+    }
+
+    fn select_attachment_last(&mut self) {
+        if !self.attachments.is_empty() {
+            self.attachment_selected = self.attachments.len() - 1;
+        }
     }
 
     pub(crate) fn body(&self) -> &Document {
@@ -2628,6 +2741,10 @@ impl App {
             return Ok(());
         };
 
+        if compose.is_attachment_prompt_active() {
+            return self.handle_attachment_prompt_key(key);
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.cancel_compose();
@@ -2704,6 +2821,35 @@ impl App {
                 }
                 _ => {}
             },
+            ComposeFocus::Attachments => match key.code {
+                KeyCode::Up => {
+                    if !compose.select_attachment_prev() {
+                        compose.focus_prev();
+                    }
+                    return Ok(());
+                }
+                KeyCode::Down => {
+                    if !compose.select_attachment_next() {
+                        compose.focus_next();
+                    }
+                    return Ok(());
+                }
+                KeyCode::Home => {
+                    compose.select_attachment_first();
+                    return Ok(());
+                }
+                KeyCode::End => {
+                    compose.select_attachment_last();
+                    return Ok(());
+                }
+                KeyCode::Delete | KeyCode::Backspace => {
+                    if let Some(removed) = compose.remove_selected_attachment() {
+                        compose.set_status(format!("Removed attachment '{}'.", removed.filename));
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            },
             ComposeFocus::Body => match key.code {
                 KeyCode::Up => {
                     compose.focus_prev();
@@ -2750,6 +2896,7 @@ impl App {
                 }
                 KeyCode::Char(ch) => {
                     let target = match ch {
+                        'a' | 'A' => Some(ComposeButton::Attach),
                         'c' | 'C' => Some(ComposeButton::Cancel),
                         'e' | 'E' => Some(ComposeButton::Edit),
                         'd' | 'D' => Some(ComposeButton::Draft),
@@ -2769,6 +2916,10 @@ impl App {
 
     fn activate_compose_button(&mut self, button: ComposeButton) -> Result<()> {
         match button {
+            ComposeButton::Attach => {
+                self.open_attach_prompt();
+                Ok(())
+            }
             ComposeButton::Cancel => {
                 self.cancel_compose();
                 Ok(())
@@ -2777,6 +2928,149 @@ impl App {
             ComposeButton::Draft => self.save_current_draft(),
             ComposeButton::Send => self.send_current_compose(),
         }
+    }
+
+    fn open_attach_prompt(&mut self) {
+        if let Some(compose) = self.compose.as_mut() {
+            compose.clear_status();
+            compose.open_attachment_prompt();
+        }
+    }
+
+    fn handle_attachment_prompt_key(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(compose) = self.compose.as_mut() else {
+            return Ok(());
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                compose.close_attachment_prompt();
+                return Ok(());
+            }
+            KeyCode::Enter => {
+                let path_text = compose
+                    .attachment_prompt()
+                    .map(|(value, _)| value.trim().to_string())
+                    .unwrap_or_default();
+                if path_text.is_empty() {
+                    compose.close_attachment_prompt();
+                    return Ok(());
+                }
+                compose.close_attachment_prompt();
+                return self.attach_file_from_path(&path_text);
+            }
+            KeyCode::Left => {
+                if let Some(state) = compose.attachment_prompt_mut() {
+                    state.move_left();
+                }
+                return Ok(());
+            }
+            KeyCode::Right => {
+                if let Some(state) = compose.attachment_prompt_mut() {
+                    state.move_right();
+                }
+                return Ok(());
+            }
+            KeyCode::Home => {
+                if let Some(state) = compose.attachment_prompt_mut() {
+                    state.move_home();
+                }
+                return Ok(());
+            }
+            KeyCode::End => {
+                if let Some(state) = compose.attachment_prompt_mut() {
+                    state.move_end();
+                }
+                return Ok(());
+            }
+            KeyCode::Backspace => {
+                if let Some(state) = compose.attachment_prompt_mut() {
+                    state.backspace();
+                }
+                return Ok(());
+            }
+            KeyCode::Delete => {
+                if let Some(state) = compose.attachment_prompt_mut() {
+                    state.delete();
+                }
+                return Ok(());
+            }
+            KeyCode::Char(ch) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::ALT)
+                {
+                    return Ok(());
+                }
+                if let Some(state) = compose.attachment_prompt_mut() {
+                    state.insert(ch);
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn attach_file_from_path(&mut self, path_text: &str) -> Result<()> {
+        let Some(compose) = self.compose.as_mut() else {
+            return Ok(());
+        };
+
+        let path = expand_user_path(path_text);
+        let data = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                compose.set_status(format!("Failed to attach '{}': {err}", path.display()));
+                return Ok(());
+            }
+        };
+
+        let filename = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let mime_type = guess_mime_type(&path);
+        let size = data.len();
+
+        let attachment = OutgoingAttachment {
+            filename: filename.clone(),
+            mime_type,
+            data,
+        };
+        compose.add_attachment(attachment);
+        compose.set_status(format!("Attached '{filename}' ({}).", format_size(size)));
+        Ok(())
+    }
+
+    pub(crate) fn handle_paste_text(&mut self, text: &str) -> Result<()> {
+        if self.compose.is_none() {
+            return Ok(());
+        }
+
+        let mut attached_any = false;
+        for candidate in parse_paste_paths(text) {
+            let expanded = expand_user_path(&candidate);
+            if expanded.is_file() {
+                self.attach_file_from_path(&candidate)?;
+                attached_any = true;
+            }
+        }
+
+        if !attached_any
+            && let Some(compose) = self.compose.as_mut()
+            && compose.is_attachment_prompt_active()
+            && let Some(state) = compose.attachment_prompt_mut()
+        {
+            for ch in text.chars() {
+                if ch == '\r' || ch == '\n' {
+                    continue;
+                }
+                state.insert(ch);
+            }
+        }
+
+        Ok(())
     }
 
     fn edit_compose_body(&mut self) -> Result<()> {
@@ -3801,6 +4095,132 @@ impl App {
             }
         }
     }
+}
+
+fn expand_user_path(raw: &str) -> PathBuf {
+    let trimmed = raw.trim();
+    let unquoted = if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+
+    let without_file_url = unquoted.strip_prefix("file://").unwrap_or(unquoted);
+
+    if let Some(rest) = without_file_url.strip_prefix("~/")
+        && let Some(home) = env::var_os("HOME")
+    {
+        let mut buf = PathBuf::from(home);
+        buf.push(rest);
+        return buf;
+    }
+
+    if without_file_url == "~"
+        && let Some(home) = env::var_os("HOME")
+    {
+        return PathBuf::from(home);
+    }
+
+    // Terminal drag-and-drop often escapes spaces with backslashes. Strip them.
+    let unescaped: String = {
+        let mut out = String::with_capacity(without_file_url.len());
+        let mut chars = without_file_url.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\\'
+                && let Some(next) = chars.peek()
+                && matches!(next, ' ' | '\t' | '\\' | '\'' | '"' | '(' | ')')
+            {
+                out.push(*next);
+                chars.next();
+                continue;
+            }
+            out.push(ch);
+        }
+        out
+    };
+
+    PathBuf::from(unescaped)
+}
+
+fn guess_mime_type(path: &std::path::Path) -> String {
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    match ext.as_str() {
+        "txt" | "log" | "md" | "markdown" => "text/plain".to_string(),
+        "html" | "htm" => "text/html".to_string(),
+        "css" => "text/css".to_string(),
+        "csv" => "text/csv".to_string(),
+        "json" => "application/json".to_string(),
+        "xml" => "application/xml".to_string(),
+        "pdf" => "application/pdf".to_string(),
+        "zip" => "application/zip".to_string(),
+        "gz" | "tgz" => "application/gzip".to_string(),
+        "tar" => "application/x-tar".to_string(),
+        "doc" => "application/msword".to_string(),
+        "docx" => {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document".to_string()
+        }
+        "xls" => "application/vnd.ms-excel".to_string(),
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string(),
+        "ppt" => "application/vnd.ms-powerpoint".to_string(),
+        "pptx" => {
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation".to_string()
+        }
+        "png" => "image/png".to_string(),
+        "jpg" | "jpeg" => "image/jpeg".to_string(),
+        "gif" => "image/gif".to_string(),
+        "webp" => "image/webp".to_string(),
+        "svg" => "image/svg+xml".to_string(),
+        "bmp" => "image/bmp".to_string(),
+        "tiff" | "tif" => "image/tiff".to_string(),
+        "mp3" => "audio/mpeg".to_string(),
+        "wav" => "audio/wav".to_string(),
+        "ogg" => "audio/ogg".to_string(),
+        "mp4" => "video/mp4".to_string(),
+        "mov" => "video/quicktime".to_string(),
+        "webm" => "video/webm".to_string(),
+        _ => "application/octet-stream".to_string(),
+    }
+}
+
+/// Split pasted text into candidate file paths.
+///
+/// Terminals that translate drag-and-drop into a paste may deliver one or
+/// multiple paths separated by whitespace, quoted to protect embedded spaces,
+/// or with literal backslash escapes. This helper returns candidates that
+/// [`expand_user_path`] can subsequently normalise.
+fn parse_paste_paths(text: &str) -> Vec<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    // Fast path: multiple paths separated by newlines.
+    let lines: Vec<&str> = trimmed
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    if lines.len() > 1 {
+        return lines.into_iter().map(str::to_string).collect();
+    }
+
+    // Single-line: try shell-split first, fall back to treating the whole line
+    // as one path (handles cases with unbalanced quotes from drag-and-drop).
+    if let Ok(parts) = shell_split(trimmed)
+        && !parts.is_empty()
+    {
+        return parts;
+    }
+
+    vec![trimmed.to_string()]
 }
 
 impl Deref for App {

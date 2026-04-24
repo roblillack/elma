@@ -55,6 +55,21 @@ pub struct OutgoingMessage {
     pub subject: String,
     pub text_body: String,
     pub html_body: String,
+    pub attachments: Vec<OutgoingAttachment>,
+}
+
+/// A file attached to an outgoing message.
+#[derive(Clone, Debug)]
+pub struct OutgoingAttachment {
+    pub filename: String,
+    pub mime_type: String,
+    pub data: Vec<u8>,
+}
+
+impl OutgoingAttachment {
+    pub fn size(&self) -> usize {
+        self.data.len()
+    }
 }
 
 /// Abstraction over a mail provider implementation.

@@ -5,7 +5,10 @@
 //! so the terminal UI never blocks while Gmail applies flag and mailbox updates.
 
 use crate::{
-    backend::{ActionStatus, BackendEvent, MailBackend, MailboxSnapshot, OutgoingMessage},
+    backend::{
+        ActionStatus, BackendEvent, MailBackend, MailboxSnapshot, OutgoingAttachment,
+        OutgoingMessage,
+    },
     model::{
         Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
         MessageContentPart, MessageId, MessageStatus,
@@ -25,7 +28,10 @@ use imap_proto::types::{
 };
 use lettre::{
     Message as LettreEmail, SmtpTransport, Transport,
-    message::{Mailbox as LettreMailbox, MultiPart, SinglePart},
+    message::{
+        Attachment as LettreAttachment, Mailbox as LettreMailbox, MultiPart, SinglePart,
+        header::ContentType as LettreContentType,
+    },
     transport::smtp::authentication::Credentials,
 };
 use mailparse::{self, DispositionType, MailHeaderMap, ParsedMail};
@@ -1070,6 +1076,7 @@ impl GmailInner {
             subject,
             text_body,
             html_body,
+            attachments,
         } = outgoing;
 
         if to.is_empty() && cc.is_empty() && bcc.is_empty() {
@@ -1106,12 +1113,10 @@ impl GmailInner {
 
         builder = builder.subject(subject);
 
-        let multipart = MultiPart::alternative()
-            .singlepart(SinglePart::plain(text_body))
-            .singlepart(SinglePart::html(html_body));
+        let body = build_compose_body(text_body, html_body, attachments)?;
 
         builder
-            .multipart(multipart)
+            .multipart(body)
             .context("serialising compose body for SMTP")
     }
 
@@ -2120,6 +2125,31 @@ where
     };
 
     (status, starred, answered, forwarded, important)
+}
+
+fn build_compose_body(
+    text_body: String,
+    html_body: String,
+    attachments: Vec<OutgoingAttachment>,
+) -> Result<MultiPart> {
+    let alternative = MultiPart::alternative()
+        .singlepart(SinglePart::plain(text_body))
+        .singlepart(SinglePart::html(html_body));
+
+    if attachments.is_empty() {
+        return Ok(alternative);
+    }
+
+    let mut mixed = MultiPart::mixed().multipart(alternative);
+    for attachment in attachments {
+        let content_type: LettreContentType = attachment
+            .mime_type
+            .parse()
+            .unwrap_or_else(|_| LettreContentType::parse("application/octet-stream").unwrap());
+        let part = LettreAttachment::new(attachment.filename).body(attachment.data, content_type);
+        mixed = mixed.singlepart(part);
+    }
+    Ok(mixed)
 }
 
 #[cfg(test)]

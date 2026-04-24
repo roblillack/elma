@@ -308,11 +308,22 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
         return;
     }
 
+    let attachment_count = app
+        .compose_state()
+        .map(|state| state.attachments().len())
+        .unwrap_or(0);
+    let attachments_height = if attachment_count == 0 {
+        0
+    } else {
+        (attachment_count as u16).saturating_add(1).min(6)
+    };
+
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Length(4),
+            Constraint::Length(attachments_height),
             Constraint::Min(4),
             Constraint::Length(2),
             Constraint::Length(1),
@@ -352,25 +363,218 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
         }
     }
 
-    render_compose_body(frame, layout[2], app);
+    if attachments_height > 0 {
+        let state = app.compose_state().expect("compose state should exist");
+        render_compose_attachments(frame, layout[2], state);
+    }
+
+    render_compose_body(frame, layout[3], app);
 
     {
         let state = app.compose_state().expect("compose state should exist");
-        render_compose_buttons(frame, layout[3], state);
+        render_compose_buttons(frame, layout[4], state);
     }
 
     let status_text = app
         .compose_status_line()
         .map(|text| text.to_string())
-        .unwrap_or_else(|| "Tab to move between fields; Enter activates a button.".to_string());
+        .unwrap_or_else(|| {
+            "Tab to move between fields; Enter activates a button. Drop a file on the terminal to attach it."
+                .to_string()
+        });
     let status = Paragraph::new(status_text)
         .style(popup_style)
         .alignment(Alignment::Center);
-    frame.render_widget(status, layout[4]);
+    frame.render_widget(status, layout[5]);
+
+    if let Some(prompt) = app
+        .compose_state()
+        .and_then(|state| state.attachment_prompt().map(|(v, c)| (v.to_string(), c)))
+    {
+        let prompt_cursor = render_attachment_prompt(frame, modal_area, &prompt.0, prompt.1);
+        if let Some(pos) = prompt_cursor {
+            cursor_pos = Some(pos);
+        }
+    }
 
     if let Some((x, y)) = cursor_pos {
         frame.set_cursor_position((x, y));
     }
+}
+
+fn render_compose_attachments(frame: &mut Frame<'_>, area: Rect, state: &ComposeState) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let focused = state.is_attachments_focused();
+    let attachments = state.attachments();
+    let selected = state.attachment_selected();
+
+    let label_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(Color::DarkGray);
+
+    let header_text = format!(
+        "Attachments ({}):  [Del/Backspace to remove]",
+        attachments.len()
+    );
+    let header = Paragraph::new(Line::from(vec![Span::styled(header_text, label_style)]))
+        .style(popup_compose_style());
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    frame.render_widget(header, rows[0]);
+
+    let list_area = rows[1];
+    if list_area.height == 0 {
+        return;
+    }
+
+    let visible = list_area.height as usize;
+    let total = attachments.len();
+    let sel = selected.unwrap_or(0);
+    let start = if total > visible {
+        sel.saturating_sub(visible - 1)
+    } else {
+        0
+    };
+
+    let entry_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(vec![Constraint::Length(1); visible.min(total.max(1))])
+        .split(list_area);
+
+    for (row_idx, attachment_idx) in (start..total.min(start + visible)).enumerate() {
+        let Some(area) = entry_rows.get(row_idx) else {
+            break;
+        };
+        let attachment = &attachments[attachment_idx];
+        let is_selected = Some(attachment_idx) == selected;
+        let row_style = if focused && is_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else if is_selected {
+            Style::default().bg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+        let marker = if is_selected { "▶ " } else { "  " };
+        let text = format!(
+            "{marker}{name}  ({mime}, {size})",
+            name = attachment.filename,
+            mime = attachment.mime_type,
+            size = format_size(attachment.size()).trim()
+        );
+        let line = Line::from(Span::styled(text, row_style));
+        let paragraph = Paragraph::new(line).style(popup_compose_style());
+        frame.render_widget(paragraph, *area);
+    }
+
+    if total == 0 {
+        let placeholder =
+            Paragraph::new(Line::from(Span::styled("(none)", muted))).style(popup_compose_style());
+        if let Some(area) = entry_rows.first() {
+            frame.render_widget(placeholder, *area);
+        }
+    }
+}
+
+fn popup_compose_style() -> Style {
+    Style::default().bg(Color::Black).fg(Color::White)
+}
+
+fn render_attachment_prompt(
+    frame: &mut Frame<'_>,
+    modal_area: Rect,
+    value: &str,
+    cursor: usize,
+) -> Option<(u16, u16)> {
+    let min_width: u16 = 50;
+    let width = modal_area
+        .width
+        .saturating_sub(4)
+        .min(80)
+        .max(min_width.min(modal_area.width));
+    if width < 10 {
+        return None;
+    }
+    let height: u16 = 4;
+    if modal_area.height < height + 2 {
+        return None;
+    }
+
+    let x = modal_area.x + modal_area.width.saturating_sub(width) / 2;
+    let y = modal_area.y + modal_area.height.saturating_sub(height) / 2;
+    let area = Rect::new(x, y, width, height);
+
+    let block_style = Style::default().bg(Color::Black).fg(Color::White);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title_top(Line::styled(
+            " Attach file ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(vec![
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw(": attach  "),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::raw(": cancel"),
+        ]));
+    let inner = block.inner(area);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+
+    let label = "Path: ";
+    let split = cursor.min(value.chars().count());
+    let (before, _after) = split_at_char_boundary(value, split);
+
+    let line = Line::from(vec![
+        Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            value.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let paragraph = Paragraph::new(line).style(block_style);
+    frame.render_widget(paragraph, inner);
+
+    let label_width = label.chars().count() as u16;
+    let before_width = before.chars().count() as u16;
+    let max_x = inner.x + inner.width.saturating_sub(1);
+    let cursor_x = (inner.x + label_width + before_width).min(max_x);
+    Some((cursor_x, inner.y))
+}
+
+fn split_at_char_boundary(value: &str, chars_before: usize) -> (&str, &str) {
+    let mut idx = 0;
+    for (count, (byte_idx, _)) in value.char_indices().enumerate() {
+        if count == chars_before {
+            idx = byte_idx;
+            return value.split_at(idx);
+        }
+        idx = byte_idx + value[byte_idx..].chars().next().map_or(0, |c| c.len_utf8());
+    }
+    value.split_at(idx)
 }
 
 fn render_compose_field(
@@ -529,6 +733,7 @@ fn render_compose_buttons(frame: &mut Frame<'_>, area: Rect, state: &ComposeStat
     }
 
     let buttons = [
+        (ComposeButton::Attach, "Attach file..."),
         (ComposeButton::Cancel, "Cancel"),
         (ComposeButton::Edit, "Edit message"),
         (ComposeButton::Draft, "Draft"),
