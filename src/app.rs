@@ -2536,20 +2536,14 @@ impl App {
                 }
             }
             KeyCode::Char('$') => self.commit_actions()?,
-            KeyCode::Enter => {
-                if !self.try_open_selected_draft()? {
-                    self.open_selected_message()?;
-                }
-            }
+            KeyCode::Enter => self.open_selected_entry()?,
             KeyCode::Right => self.open_selected_message()?,
             KeyCode::Char('d') | KeyCode::Char('D') => self.schedule_delete(),
             KeyCode::Char('#') => self.schedule_delete(),
             KeyCode::Backspace | KeyCode::Delete => self.schedule_delete(),
             KeyCode::Char('/') => self.open_search(),
-            KeyCode::Esc => {
-                if self.search.is_some() {
-                    self.close_search();
-                }
+            KeyCode::Esc if self.search.is_some() => {
+                self.close_search();
             }
             _ => {}
         }
@@ -2781,16 +2775,14 @@ impl App {
                 KeyCode::End => {
                     dialog.folder.move_end();
                 }
-                KeyCode::Backspace => {
-                    if dialog.folder.backspace() {
-                        dialog.clear_status();
-                    }
+                KeyCode::Backspace if dialog.folder.backspace() => {
+                    dialog.clear_status();
                 }
-                KeyCode::Delete => {
-                    if dialog.folder.delete() {
-                        dialog.clear_status();
-                    }
+                KeyCode::Backspace => {}
+                KeyCode::Delete if dialog.folder.delete() => {
+                    dialog.clear_status();
                 }
+                KeyCode::Delete => {}
                 KeyCode::Up => {
                     dialog.focus = SaveAttachmentFocus::List;
                 }
@@ -2824,11 +2816,9 @@ impl App {
                             dialog.focus = SaveAttachmentFocus::Folder;
                         }
                     }
-                    KeyCode::Down => {
-                        if dialog.selected + 1 < total {
-                            dialog.selected += 1;
-                            dialog.clear_status();
-                        }
+                    KeyCode::Down if dialog.selected + 1 < total => {
+                        dialog.selected += 1;
+                        dialog.clear_status();
                     }
                     KeyCode::Home => {
                         dialog.selected = 0;
@@ -3600,6 +3590,13 @@ impl App {
                     compose.set_status(format!("Failed to save draft: {err}"));
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn open_selected_entry(&mut self) -> Result<()> {
+        if !self.try_open_selected_draft()? {
+            self.open_selected_message()?;
         }
         Ok(())
     }
