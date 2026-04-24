@@ -153,6 +153,14 @@ pub struct MessageAttachment {
     pub filename: Option<String>,
     pub mime_type: String,
     pub size: usize,
+    /// Raw bytes of the attachment, if already fetched.
+    ///
+    /// Backends that deliver the full MIME payload up-front populate this.
+    /// JMAP leaves it empty and exposes `blob_id` instead so callers can
+    /// download the body on demand.
+    pub data: Option<Vec<u8>>,
+    /// Opaque backend identifier for fetching the attachment body later.
+    pub blob_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]

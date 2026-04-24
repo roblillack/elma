@@ -137,4 +137,15 @@ pub trait MailBackend: Send + Sync {
     fn send_message(&self, message: OutgoingMessage) -> Result<()>;
     /// Store a draft message.
     fn save_draft(&self, message: OutgoingMessage) -> Result<()>;
+    /// Download the raw bytes for an attachment identified by its backend blob id.
+    ///
+    /// Backends that deliver the full message payload up-front populate
+    /// [`MessageAttachment::data`](crate::model::MessageAttachment::data) directly
+    /// and can leave this method unimplemented.  Backends that only return a
+    /// pointer (for example JMAP) must override this to issue the blob download.
+    fn fetch_attachment_blob(&self, _blob_id: &str) -> Result<Vec<u8>> {
+        Err(anyhow::anyhow!(
+            "this backend does not support on-demand attachment download"
+        ))
+    }
 }

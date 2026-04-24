@@ -508,6 +508,8 @@ impl MockBackend {
                 filename: Some(attachment.filename.clone()),
                 mime_type: attachment.mime_type.clone(),
                 size: attachment.size(),
+                data: Some(attachment.data.clone()),
+                blob_id: None,
             });
             content_state.parts.push(MessageContentPart {
                 content_type: attachment.mime_type.clone(),
@@ -646,10 +648,16 @@ fn generate_mock_attachments(rng: &mut SimpleRng) -> Vec<MessageAttachment> {
             let (filename, mime_type) =
                 ATTACHMENT_TEMPLATES[rng.gen_range_usize(0..ATTACHMENT_TEMPLATES.len())];
             let size = mock_attachment_size(rng, mime_type);
+            let data = format!(
+                "This is a placeholder payload for the mock attachment '{filename}' ({mime_type}, {size} bytes).\n"
+            )
+            .into_bytes();
             attachments.push(MessageAttachment {
                 filename: Some(filename.to_string()),
                 mime_type: mime_type.to_string(),
                 size,
+                data: Some(data),
+                blob_id: None,
             });
         }
         attachments

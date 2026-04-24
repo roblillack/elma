@@ -176,6 +176,18 @@ impl MailBackend for JmapBackend {
         let inner = Arc::clone(&self.inner);
         runtime.block_on(async move { inner.save_draft(message).await })
     }
+
+    fn fetch_attachment_blob(&self, blob_id: &str) -> Result<Vec<u8>> {
+        let runtime = Arc::clone(&self.inner.runtime);
+        let client = Arc::clone(&self.inner.client);
+        let blob_id = blob_id.to_string();
+        runtime.block_on(async move {
+            client
+                .download(&blob_id)
+                .await
+                .with_context(|| format!("downloading JMAP blob {blob_id}"))
+        })
+    }
 }
 
 struct JmapInner {
@@ -1417,6 +1429,8 @@ fn build_message_content(email: &JmapEmail) -> Result<MessageContent> {
                 .unwrap_or("application/octet-stream")
                 .to_string(),
             size: part.size(),
+            data: None,
+            blob_id: part.blob_id().map(|id| id.to_string()),
         })
         .collect();
 

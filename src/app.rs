@@ -9,8 +9,8 @@ use crate::backend::{
     ActionStatus, BackendEvent, MailBackend, OutgoingAttachment, OutgoingMessage,
 };
 use crate::model::{
-    Action, ActionType, MailboxKind, Message, MessageContent, MessageContentPart, MessageId,
-    MessageStatus, format_size, padded_sender,
+    Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
+    MessageContentPart, MessageId, MessageStatus, format_size, padded_sender,
 };
 use anyhow::{Context, Result, anyhow};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -312,6 +312,65 @@ pub struct App {
     should_quit: bool,
     pending_shortcut: Option<ShortcutMenuState>,
     pending_navigation: Option<PendingNavigation>,
+    save_attachment: Option<SaveAttachmentDialog>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SaveAttachmentFocus {
+    Folder,
+    List,
+}
+
+pub(crate) struct SaveAttachmentDialog {
+    folder: TextFieldState,
+    selected: usize,
+    focus: SaveAttachmentFocus,
+    status: Option<String>,
+}
+
+impl SaveAttachmentDialog {
+    fn new(folder: String) -> Self {
+        let mut field = TextFieldState::default();
+        field.value = folder;
+        field.cursor = text_len(&field.value);
+        Self {
+            folder: field,
+            selected: 0,
+            focus: SaveAttachmentFocus::List,
+            status: None,
+        }
+    }
+
+    pub(crate) fn folder_parts(&self) -> (&str, usize) {
+        (&self.folder.value[..], self.folder.cursor)
+    }
+
+    pub(crate) fn selected(&self) -> usize {
+        self.selected
+    }
+
+    pub(crate) fn focus(&self) -> SaveAttachmentFocus {
+        self.focus
+    }
+
+    pub(crate) fn status(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+
+    fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            SaveAttachmentFocus::Folder => SaveAttachmentFocus::List,
+            SaveAttachmentFocus::List => SaveAttachmentFocus::Folder,
+        };
+    }
+
+    fn set_status<S: Into<String>>(&mut self, status: S) {
+        self.status = Some(status.into());
+    }
+
+    fn clear_status(&mut self) {
+        self.status = None;
+    }
 }
 
 /// Cached inbox view derived from backend events.
@@ -1229,6 +1288,7 @@ impl App {
             should_quit: false,
             pending_shortcut: None,
             pending_navigation: None,
+            save_attachment: None,
         })
     }
 
@@ -1273,6 +1333,10 @@ impl App {
 
         if self.process_pending_navigation(key)? {
             return Ok(());
+        }
+
+        if self.save_attachment.is_some() {
+            return self.handle_save_attachment_key(key);
         }
 
         let active_view = self.active_view();
@@ -2504,7 +2568,7 @@ impl App {
             return Ok(());
         }
 
-        if matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
+        if matches!(key.code, KeyCode::Char('s')) {
             let current_id = self.message_view.as_ref().map(|view| view.message_id);
             self.toggle_star();
             if let Some(id) = current_id {
@@ -2522,6 +2586,11 @@ impl App {
                     view.message.starred = starred;
                 }
             }
+            return Ok(());
+        }
+
+        if matches!(key.code, KeyCode::Char('S')) {
+            self.open_save_attachment_dialog();
             return Ok(());
         }
 
@@ -2618,6 +2687,210 @@ impl App {
         self.compose = Some(ComposeState::new());
         self.message_view = None;
         self.mailbox.status_line = Some("Compose mode active.".to_string());
+    }
+
+    pub(crate) fn save_attachment_dialog(&self) -> Option<&SaveAttachmentDialog> {
+        self.save_attachment.as_ref()
+    }
+
+    pub(crate) fn save_attachment_attachments(&self) -> &[MessageAttachment] {
+        self.message_view
+            .as_ref()
+            .map(|view| view.content.attachments.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn open_save_attachment_dialog(&mut self) {
+        let attachments_empty = self
+            .message_view
+            .as_ref()
+            .is_none_or(|view| view.content.attachments.is_empty());
+        if attachments_empty {
+            if let Some(view) = self.message_view.as_mut() {
+                view.info_line = Some("This message has no attachments.".to_string());
+            }
+            return;
+        }
+
+        let folder = default_download_dir().to_string_lossy().into_owned();
+        self.save_attachment = Some(SaveAttachmentDialog::new(folder));
+    }
+
+    fn close_save_attachment_dialog(&mut self) {
+        self.save_attachment = None;
+    }
+
+    fn handle_save_attachment_key(&mut self, key: KeyEvent) -> Result<()> {
+        let total = self.save_attachment_attachments().len();
+        let Some(dialog) = self.save_attachment.as_mut() else {
+            return Ok(());
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.close_save_attachment_dialog();
+                return Ok(());
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                dialog.toggle_focus();
+                return Ok(());
+            }
+            KeyCode::Enter => {
+                return self.commit_save_attachment();
+            }
+            _ => {}
+        }
+
+        match dialog.focus {
+            SaveAttachmentFocus::Folder => match key.code {
+                KeyCode::Left => {
+                    dialog.folder.move_left();
+                }
+                KeyCode::Right => {
+                    dialog.folder.move_right();
+                }
+                KeyCode::Home => {
+                    dialog.folder.move_home();
+                }
+                KeyCode::End => {
+                    dialog.folder.move_end();
+                }
+                KeyCode::Backspace => {
+                    if dialog.folder.backspace() {
+                        dialog.clear_status();
+                    }
+                }
+                KeyCode::Delete => {
+                    if dialog.folder.delete() {
+                        dialog.clear_status();
+                    }
+                }
+                KeyCode::Up => {
+                    dialog.focus = SaveAttachmentFocus::List;
+                }
+                KeyCode::Down => {
+                    dialog.focus = SaveAttachmentFocus::List;
+                }
+                KeyCode::Char(ch) => {
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        || key.modifiers.contains(KeyModifiers::ALT)
+                    {
+                        return Ok(());
+                    }
+                    if dialog.folder.insert(ch) {
+                        dialog.clear_status();
+                    }
+                }
+                _ => {}
+            },
+            SaveAttachmentFocus::List => {
+                if total == 0 {
+                    let _ = dialog;
+                    self.close_save_attachment_dialog();
+                    return Ok(());
+                }
+                match key.code {
+                    KeyCode::Up => {
+                        if dialog.selected > 0 {
+                            dialog.selected -= 1;
+                            dialog.clear_status();
+                        } else {
+                            dialog.focus = SaveAttachmentFocus::Folder;
+                        }
+                    }
+                    KeyCode::Down => {
+                        if dialog.selected + 1 < total {
+                            dialog.selected += 1;
+                            dialog.clear_status();
+                        }
+                    }
+                    KeyCode::Home => {
+                        dialog.selected = 0;
+                    }
+                    KeyCode::End => {
+                        dialog.selected = total - 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn commit_save_attachment(&mut self) -> Result<()> {
+        let (folder_text, selected) = match self.save_attachment.as_ref() {
+            Some(dialog) => (dialog.folder.value.clone(), dialog.selected),
+            None => return Ok(()),
+        };
+
+        let attachments = self
+            .message_view
+            .as_ref()
+            .map(|view| view.content.attachments.clone())
+            .unwrap_or_default();
+
+        if attachments.is_empty() {
+            self.close_save_attachment_dialog();
+            return Ok(());
+        }
+
+        let idx = selected.min(attachments.len() - 1);
+        let attachment = attachments[idx].clone();
+
+        let data = match attachment.data {
+            Some(bytes) => bytes,
+            None => match attachment.blob_id.as_deref() {
+                Some(blob_id) => match self.backend.fetch_attachment_blob(blob_id) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        if let Some(dialog) = self.save_attachment.as_mut() {
+                            dialog.set_status(format!("Failed to download attachment: {err}"));
+                        }
+                        return Ok(());
+                    }
+                },
+                None => {
+                    if let Some(dialog) = self.save_attachment.as_mut() {
+                        dialog.set_status("Attachment content is not available.");
+                    }
+                    return Ok(());
+                }
+            },
+        };
+
+        let folder = expand_user_path(&folder_text);
+        if let Err(err) = fs::create_dir_all(&folder) {
+            if let Some(dialog) = self.save_attachment.as_mut() {
+                dialog.set_status(format!(
+                    "Cannot create folder '{}': {err}",
+                    folder.display()
+                ));
+            }
+            return Ok(());
+        }
+
+        let base_name = attachment
+            .filename
+            .as_deref()
+            .map(sanitize_filename)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| format!("attachment-{}.bin", idx + 1));
+        let target = unique_path_in(&folder, &base_name);
+
+        if let Err(err) = fs::write(&target, &data) {
+            if let Some(dialog) = self.save_attachment.as_mut() {
+                dialog.set_status(format!("Failed to write '{}': {err}", target.display()));
+            }
+            return Ok(());
+        }
+
+        let saved_msg = format!("Saved to {}", target.display());
+        self.close_save_attachment_dialog();
+        if let Some(view) = self.message_view.as_mut() {
+            view.info_line = Some(saved_msg);
+        }
+        Ok(())
     }
 
     fn document_for_message(&mut self, message: &Message) -> Result<Document> {
@@ -4097,6 +4370,61 @@ impl App {
     }
 }
 
+fn default_download_dir() -> PathBuf {
+    if let Some(value) = env::var_os("XDG_DOWNLOAD_DIR") {
+        let path = PathBuf::from(&value);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
+    if let Some(home) = env::var_os("HOME") {
+        let mut path = PathBuf::from(home);
+        path.push("Downloads");
+        return path;
+    }
+    PathBuf::from("Downloads")
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let trimmed = name.trim().trim_matches(['/', '\\']);
+    let cleaned: String = trimmed
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | '\0' => '_',
+            _ => ch,
+        })
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        String::new()
+    } else {
+        cleaned
+    }
+}
+
+fn unique_path_in(folder: &std::path::Path, name: &str) -> PathBuf {
+    let candidate = folder.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), Some(ext.to_string())),
+        _ => (name.to_string(), None),
+    };
+
+    for counter in 1..=1_000_000 {
+        let candidate_name = match ext.as_deref() {
+            Some(ext) => format!("{stem} ({counter}).{ext}"),
+            None => format!("{stem} ({counter})"),
+        };
+        let candidate = folder.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    folder.join(name)
+}
+
 fn expand_user_path(raw: &str) -> PathBuf {
     let trimmed = raw.trim();
     let unquoted = if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
@@ -4432,6 +4760,7 @@ mod tests {
 
             pending_shortcut: None,
             pending_navigation: None,
+            save_attachment: None,
         }
     }
 

@@ -1958,6 +1958,8 @@ fn collect_parts(
                 filename,
                 mime_type: content_type.clone(),
                 size: data.len(),
+                data: Some(data.clone()),
+                blob_id: None,
             });
         }
         parts.push(MessageContentPart {
