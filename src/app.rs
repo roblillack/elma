@@ -25,6 +25,7 @@ use std::{
     process::Command,
     sync::{
         Arc,
+        atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, TryRecvError},
     },
     thread,
@@ -333,6 +334,9 @@ struct SaveAttachmentOperation {
     receiver: Receiver<Result<PathBuf, String>>,
     started: Instant,
     filename: String,
+    /// Set when the user dismisses the dialog so the worker stops before it
+    /// writes anything to disk.
+    cancel: Arc<AtomicBool>,
 }
 
 impl SaveAttachmentDialog {
@@ -388,6 +392,17 @@ impl SaveAttachmentDialog {
 
     fn clear_status(&mut self) {
         self.status = None;
+    }
+
+    /// Ask the running save operation to stop before it touches the disk.
+    ///
+    /// The download itself cannot be interrupted, but the worker checks this
+    /// flag before writing, so dismissing the dialog leaves no partial file
+    /// behind.
+    fn cancel_operation(&mut self) {
+        if let Some(op) = self.operation.as_ref() {
+            op.cancel.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -726,6 +741,13 @@ impl ComposeState {
         self.attachment_selected = self.attachments.len() - 1;
     }
 
+    /// Replace the attachment list, used when seeding compose from an existing
+    /// message (reopening a draft, forwarding).
+    fn set_attachments(&mut self, attachments: Vec<OutgoingAttachment>) {
+        self.attachments = attachments;
+        self.attachment_selected = 0;
+    }
+
     fn remove_selected_attachment(&mut self) -> Option<OutgoingAttachment> {
         if self.attachments.is_empty() {
             return None;
@@ -845,6 +867,38 @@ impl TextFieldState {
         }
         insert_char_at(&mut self.value, &mut self.cursor, ch);
         true
+    }
+
+    /// Insert pasted text at the cursor.
+    ///
+    /// These are single-line fields, so newlines become spaces (pasting a
+    /// two-line address block should not glue the lines together) and other
+    /// control characters are dropped. Enclosing line breaks are stripped --
+    /// terminals routinely append one to a paste -- but spaces are kept, since
+    /// a trailing space in a pasted `"addr, "` is deliberate.
+    fn insert_str(&mut self, text: &str) -> bool {
+        let mut inserted = false;
+        let mut pending_space = false;
+        for ch in text.trim_matches(['\r', '\n']).chars() {
+            let ch = if ch == '\n' || ch == '\r' || ch == '\t' {
+                // Collapse runs of line breaks into a single space.
+                if pending_space {
+                    continue;
+                }
+                pending_space = true;
+                ' '
+            } else if ch.is_control() {
+                continue;
+            } else {
+                pending_space = false;
+                ch
+            };
+
+            if self.insert(ch) {
+                inserted = true;
+            }
+        }
+        inserted
     }
 
     fn backspace(&mut self) -> bool {
@@ -2741,6 +2795,7 @@ impl App {
 
         if dialog.is_busy() {
             if matches!(key.code, KeyCode::Esc) {
+                dialog.cancel_operation();
                 self.close_save_attachment_dialog();
             }
             return Ok(());
@@ -2816,9 +2871,13 @@ impl App {
                             dialog.focus = SaveAttachmentFocus::Folder;
                         }
                     }
-                    KeyCode::Down if dialog.selected + 1 < total => {
-                        dialog.selected += 1;
-                        dialog.clear_status();
+                    KeyCode::Down => {
+                        if dialog.selected + 1 < total {
+                            dialog.selected += 1;
+                            dialog.clear_status();
+                        } else {
+                            dialog.focus = SaveAttachmentFocus::Folder;
+                        }
                     }
                     KeyCode::Home => {
                         dialog.selected = 0;
@@ -2848,19 +2907,18 @@ impl App {
             None => return Ok(()),
         };
 
-        let attachments = self
-            .message_view
-            .as_ref()
-            .map(|view| view.content.attachments.clone())
-            .unwrap_or_default();
+        // Clone only the attachment we are about to write; cloning the whole
+        // vector would copy every other attachment's bytes as well.
+        let selected_attachment = self.message_view.as_ref().and_then(|view| {
+            let attachments = &view.content.attachments;
+            let idx = selected.min(attachments.len().saturating_sub(1));
+            attachments.get(idx).map(|att| (idx, att.clone()))
+        });
 
-        if attachments.is_empty() {
+        let Some((idx, attachment)) = selected_attachment else {
             self.close_save_attachment_dialog();
             return Ok(());
-        }
-
-        let idx = selected.min(attachments.len() - 1);
-        let attachment = attachments[idx].clone();
+        };
 
         let folder = expand_user_path(&folder_text);
         let base_name = attachment
@@ -2868,12 +2926,14 @@ impl App {
             .as_deref()
             .map(sanitize_filename)
             .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| format!("attachment-{}.bin", idx + 1));
+            .unwrap_or_else(|| fallback_attachment_name(idx, &attachment.mime_type));
 
         let backend = Arc::clone(&self.backend);
         let (tx, rx) = std::sync::mpsc::channel::<Result<PathBuf, String>>();
+        let cancel = Arc::new(AtomicBool::new(false));
 
         let filename_for_op = base_name.clone();
+        let worker_cancel = Arc::clone(&cancel);
         thread::spawn(move || {
             let result = (|| -> Result<PathBuf, String> {
                 let bytes = match attachment.data {
@@ -2887,6 +2947,12 @@ impl App {
                         }
                     },
                 };
+
+                // Last chance to bail out: the download may have taken a while
+                // and the user may have dismissed the dialog meanwhile.
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return Err("Save cancelled.".to_string());
+                }
 
                 fs::create_dir_all(&folder)
                     .map_err(|err| format!("Cannot create folder '{}': {err}", folder.display()))?;
@@ -2905,6 +2971,7 @@ impl App {
                 receiver: rx,
                 started: Instant::now(),
                 filename: filename_for_op,
+                cancel,
             });
         }
 
@@ -3027,23 +3094,43 @@ impl App {
             }
         };
 
-        let document = match self.document_for_message(&message) {
-            Ok(doc) => doc,
-            Err(err) => {
-                self.mailbox.status_line = Some(format!("Failed to load message body: {err}"));
-                return Ok(());
-            }
+        // Forwarding has to carry the original attachments, so the content is
+        // needed here and not just the rendered document. Take both from the
+        // open viewer when it holds this message -- loading again would re-fetch
+        // every attachment byte.
+        let cached = self
+            .message_view
+            .as_ref()
+            .filter(|view| view.message_id == message.id)
+            .map(|view| (view.content.clone(), view.document.clone()));
+
+        let (content, cached_document) = match cached {
+            Some((content, document)) => (content, document),
+            None => match self.backend.load_message(message.id) {
+                Ok(content) => (content, None),
+                Err(err) => {
+                    self.mailbox.status_line = Some(format!("Failed to load message body: {err}"));
+                    return Ok(());
+                }
+            },
         };
+
+        let document = cached_document.unwrap_or_else(|| document_from_message_content(&content));
+        let (attachments, unavailable) = self.restore_compose_attachments(&content);
 
         let mut compose = ComposeState::new();
         let subject = prefix_subject(&message.subject, "Fwd:");
         compose.set_field_text(ComposeField::Subject, subject);
         compose.set_body(build_forward_document(&document, &message));
+        compose.set_attachments(attachments);
         compose.set_focus(ComposeFocus::Body);
 
         self.compose = Some(compose);
         self.message_view = None;
-        self.mailbox.status_line = Some(format!("Forwarding '{}'.", message.subject));
+        self.mailbox.status_line = Some(draft_status_line(
+            &format!("Forwarding '{}'.", message.subject),
+            unavailable,
+        ));
         Ok(())
     }
 
@@ -3273,7 +3360,8 @@ impl App {
                     return Ok(());
                 }
                 compose.close_attachment_prompt();
-                return self.attach_file_from_path(&path_text);
+                self.attach_file_from_path(&path_text)?;
+                return Ok(());
             }
             KeyCode::Left => {
                 if let Some(state) = compose.attachment_prompt_mut() {
@@ -3328,9 +3416,13 @@ impl App {
         Ok(())
     }
 
-    fn attach_file_from_path(&mut self, path_text: &str) -> Result<()> {
+    /// Read `path_text` and add it to the compose attachment list.
+    ///
+    /// Returns whether an attachment was added; failures are reported in the
+    /// compose status line.
+    fn attach_file_from_path(&mut self, path_text: &str) -> Result<bool> {
         let Some(compose) = self.compose.as_mut() else {
-            return Ok(());
+            return Ok(false);
         };
 
         let path = expand_user_path(path_text);
@@ -3338,7 +3430,7 @@ impl App {
             Ok(bytes) => bytes,
             Err(err) => {
                 compose.set_status(format!("Failed to attach '{}': {err}", path.display()));
-                return Ok(());
+                return Ok(false);
             }
         };
 
@@ -3356,34 +3448,92 @@ impl App {
         };
         compose.add_attachment(attachment);
         compose.set_status(format!("Attached '{filename}' ({}).", format_size(size)));
-        Ok(())
+        Ok(true)
     }
 
+    /// Handle a bracketed-paste payload.
+    ///
+    /// A paste that is really a drag-and-drop of files becomes attachments;
+    /// anything else is typed into whichever text input currently has focus.
+    /// Bracketed paste is enabled terminal-wide, so this is the *only* path by
+    /// which pasted text reaches any field -- dropping it here means the paste
+    /// silently disappears.
     pub(crate) fn handle_paste_text(&mut self, text: &str) -> Result<()> {
-        if self.compose.is_none() {
+        if self.compose.is_some()
+            && self.save_attachment.is_none()
+            && let Some(paths) = dropped_file_paths(text)
+        {
+            return self.attach_dropped_files(&paths);
+        }
+
+        if let Some(dialog) = self.save_attachment.as_mut() {
+            if !dialog.is_busy()
+                && matches!(dialog.focus, SaveAttachmentFocus::Folder)
+                && dialog.folder.insert_str(text)
+            {
+                dialog.clear_status();
+            }
             return Ok(());
         }
 
-        let mut attached_any = false;
-        for candidate in parse_paste_paths(text) {
-            let expanded = expand_user_path(&candidate);
-            if expanded.is_file() {
-                self.attach_file_from_path(&candidate)?;
-                attached_any = true;
+        if let Some(compose) = self.compose.as_mut() {
+            if let Some(prompt) = compose.attachment_prompt_mut() {
+                prompt.insert_str(text);
+                return Ok(());
+            }
+
+            match compose.focus() {
+                ComposeFocus::Field(field) => {
+                    if compose.field_state_mut(field).insert_str(text) {
+                        compose.clear_status();
+                    }
+                }
+                _ => {
+                    compose.set_status(
+                        "Pasted text goes into the header fields; press Enter on the body to edit it in $EDITOR."
+                            .to_string(),
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        if self.search.as_ref().is_some_and(|search| search.focused) {
+            if let Some(search) = self.search.as_mut() {
+                search.input.insert_str(text);
+            }
+            self.recompute_search_filter();
+        }
+
+        Ok(())
+    }
+
+    /// Attach every path from a terminal drop, summarising multi-file drops.
+    fn attach_dropped_files(&mut self, paths: &[String]) -> Result<()> {
+        // Dropping onto the open prompt answers the question it was asking.
+        if let Some(compose) = self.compose.as_mut() {
+            compose.close_attachment_prompt();
+        }
+
+        let mut attached = 0usize;
+        let mut total = 0usize;
+        for path in paths {
+            if self.attach_file_from_path(path)? {
+                attached += 1;
+                if let Some(compose) = self.compose.as_ref() {
+                    total += compose.attachments().last().map_or(0, |att| att.size());
+                }
             }
         }
 
-        if !attached_any
+        // A single file already reported itself with its own name and size.
+        if attached > 1
             && let Some(compose) = self.compose.as_mut()
-            && compose.is_attachment_prompt_active()
-            && let Some(state) = compose.attachment_prompt_mut()
         {
-            for ch in text.chars() {
-                if ch == '\r' || ch == '\n' {
-                    continue;
-                }
-                state.insert(ch);
-            }
+            compose.set_status(format!(
+                "Attached {attached} files ({}).",
+                format_size(total).trim()
+            ));
         }
 
         Ok(())
@@ -3622,7 +3772,7 @@ impl App {
 
         let body = document_from_message_content(&content);
 
-        let compose = ComposeState::from_draft(
+        let mut compose = ComposeState::from_draft(
             message.id,
             message.recipients.join(", "),
             String::new(),
@@ -3631,10 +3781,54 @@ impl App {
             body,
         );
 
+        // Without this the attachments are dropped on the floor and re-saving
+        // the draft silently discards them.
+        let (attachments, unavailable) = self.restore_compose_attachments(&content);
+        compose.set_attachments(attachments);
+
         self.compose = Some(compose);
         self.message_view = None;
-        self.mailbox.status_line = Some("Editing draft.".to_string());
+        self.mailbox.status_line = Some(draft_status_line("Editing draft.", unavailable));
         Ok(true)
+    }
+
+    /// Rebuild compose attachments from a stored message's MIME parts.
+    ///
+    /// Returns the attachments plus the number that could not be recovered.
+    /// Backends that hand out blob pointers instead of bytes (JMAP) are
+    /// downloaded here, synchronously -- same as the `load_message` call this
+    /// always follows.
+    fn restore_compose_attachments(
+        &self,
+        content: &MessageContent,
+    ) -> (Vec<OutgoingAttachment>, usize) {
+        let mut restored = Vec::new();
+        let mut unavailable = 0usize;
+
+        for (idx, attachment) in content.attachments.iter().enumerate() {
+            let data = match attachment.data.clone() {
+                Some(data) => Some(data),
+                None => match attachment.blob_id.as_deref() {
+                    Some(blob_id) => self.backend.fetch_attachment_blob(blob_id).ok(),
+                    None => None,
+                },
+            };
+
+            match data {
+                Some(data) => restored.push(OutgoingAttachment {
+                    filename: attachment
+                        .filename
+                        .clone()
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or_else(|| fallback_attachment_name(idx, &attachment.mime_type)),
+                    mime_type: attachment.mime_type.clone(),
+                    data,
+                }),
+                None => unavailable += 1,
+            }
+        }
+
+        (restored, unavailable)
     }
 
     fn is_draft_message(&self, message: &Message) -> bool {
@@ -4451,6 +4645,82 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
+/// Append a warning to `base` when attachments could not be carried over.
+///
+/// Losing an attachment has to be visible: silently dropping it is how a draft
+/// gets sent without the file it was about.
+fn draft_status_line(base: &str, unavailable: usize) -> String {
+    match unavailable {
+        0 => base.to_string(),
+        1 => format!("{base} 1 attachment could not be loaded and will not be sent."),
+        n => format!("{base} {n} attachments could not be loaded and will not be sent."),
+    }
+}
+
+/// Name to save an attachment under when the MIME part carries no filename.
+///
+/// Inline parts of `multipart/related` messages (embedded images, mostly) have
+/// no filename, so the extension has to come from the content type instead --
+/// saving them all as `.bin` would hide what they actually are.
+fn fallback_attachment_name(index: usize, mime_type: &str) -> String {
+    format!(
+        "attachment-{}.{}",
+        index + 1,
+        extension_for_mime_type(mime_type)
+    )
+}
+
+/// Best-effort file extension for a MIME type, mirroring [`guess_mime_type`].
+fn extension_for_mime_type(mime_type: &str) -> String {
+    let essence = mime_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    let mapped = match essence.as_str() {
+        "text/plain" => Some("txt"),
+        "text/html" => Some("html"),
+        "text/calendar" => Some("ics"),
+        "application/json" => Some("json"),
+        "application/xml" | "text/xml" => Some("xml"),
+        "application/pdf" => Some("pdf"),
+        "application/zip" => Some("zip"),
+        "application/gzip" => Some("gz"),
+        "application/x-tar" => Some("tar"),
+        "application/msword" => Some("doc"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => Some("docx"),
+        "application/vnd.ms-excel" => Some("xls"),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => Some("xlsx"),
+        "application/vnd.ms-powerpoint" => Some("ppt"),
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => Some("pptx"),
+        "image/jpeg" => Some("jpg"),
+        "image/svg+xml" => Some("svg"),
+        "image/tiff" => Some("tiff"),
+        "audio/mpeg" => Some("mp3"),
+        "video/quicktime" => Some("mov"),
+        "message/rfc822" => Some("eml"),
+        _ => None,
+    };
+
+    if let Some(ext) = mapped {
+        return ext.to_string();
+    }
+
+    // Fall back to the subtype when it reads like an extension already
+    // (image/png, audio/flac, image/webp, ...).
+    let subtype = essence.split('/').nth(1).unwrap_or_default();
+    if !subtype.is_empty()
+        && subtype.len() <= 5
+        && subtype.chars().all(|ch| ch.is_ascii_alphanumeric())
+    {
+        return subtype.to_string();
+    }
+
+    "bin".to_string()
+}
+
 fn unique_path_in(folder: &std::path::Path, name: &str) -> PathBuf {
     let candidate = folder.join(name);
     if !candidate.exists() {
@@ -4475,6 +4745,12 @@ fn unique_path_in(folder: &std::path::Path, name: &str) -> PathBuf {
     folder.join(name)
 }
 
+/// Normalise a path as typed by the user or delivered by a terminal drop.
+///
+/// Handles surrounding quotes, `file://` URLs (percent-encoded), backslash
+/// escapes, and `~`. Unescaping happens *before* tilde expansion so that
+/// `~/My\ File.pdf` resolves -- doing it the other way round leaves the
+/// backslash in the file name.
 fn expand_user_path(raw: &str) -> PathBuf {
     let trimmed = raw.trim();
     let unquoted = if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
@@ -4485,9 +4761,18 @@ fn expand_user_path(raw: &str) -> PathBuf {
         trimmed
     };
 
-    let without_file_url = unquoted.strip_prefix("file://").unwrap_or(unquoted);
+    // A `file://` URL is percent-encoded; a plain path is not and must be left
+    // alone, or a file literally named "100%20" would break.
+    let normalised = match unquoted.strip_prefix("file://") {
+        Some(rest) => {
+            // An empty or `localhost` authority both mean the local machine.
+            let path = rest.strip_prefix("localhost").unwrap_or(rest);
+            percent_decode(path)
+        }
+        None => unescape_path_chars(unquoted),
+    };
 
-    if let Some(rest) = without_file_url.strip_prefix("~/")
+    if let Some(rest) = normalised.strip_prefix("~/")
         && let Some(home) = env::var_os("HOME")
     {
         let mut buf = PathBuf::from(home);
@@ -4495,31 +4780,56 @@ fn expand_user_path(raw: &str) -> PathBuf {
         return buf;
     }
 
-    if without_file_url == "~"
+    if normalised == "~"
         && let Some(home) = env::var_os("HOME")
     {
         return PathBuf::from(home);
     }
 
-    // Terminal drag-and-drop often escapes spaces with backslashes. Strip them.
-    let unescaped: String = {
-        let mut out = String::with_capacity(without_file_url.len());
-        let mut chars = without_file_url.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch == '\\'
-                && let Some(next) = chars.peek()
-                && matches!(next, ' ' | '\t' | '\\' | '\'' | '"' | '(' | ')')
-            {
-                out.push(*next);
-                chars.next();
+    PathBuf::from(normalised)
+}
+
+/// Strip the backslash escapes terminals add when a dropped path contains
+/// characters the shell would otherwise split on.
+fn unescape_path_chars(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\'
+            && let Some(next) = chars.peek()
+            && matches!(next, ' ' | '\t' | '\\' | '\'' | '"' | '(' | ')')
+        {
+            out.push(*next);
+            chars.next();
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Decode `%XX` escapes in a `file://` URL path.
+///
+/// Invalid escapes are passed through verbatim rather than dropped, so a
+/// malformed URL still produces a path the user can recognise in the error
+/// message.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' && idx + 2 < bytes.len() {
+            let hex = &text[idx + 1..idx + 3];
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                idx += 3;
                 continue;
             }
-            out.push(ch);
         }
-        out
-    };
-
-    PathBuf::from(unescaped)
+        out.push(bytes[idx]);
+        idx += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn guess_mime_type(path: &std::path::Path) -> String {
@@ -4567,6 +4877,27 @@ fn guess_mime_type(path: &std::path::Path) -> String {
     }
 }
 
+/// Recognise a paste that is really a drag-and-drop of files.
+///
+/// Terminals deliver dropped files as absolute paths, optionally as `file://`
+/// URLs, quoted, or backslash-escaped. Requiring *every* candidate to be an
+/// absolute path that exists keeps ordinary text pastes out of the attachment
+/// path -- including a paste that happens to name a file in the current
+/// directory, which is why relative paths are rejected here.
+fn dropped_file_paths(text: &str) -> Option<Vec<String>> {
+    let candidates = parse_paste_paths(text);
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let all_files = candidates.iter().all(|candidate| {
+        let path = expand_user_path(candidate);
+        path.is_absolute() && path.is_file()
+    });
+
+    if all_files { Some(candidates) } else { None }
+}
+
 /// Split pasted text into candidate file paths.
 ///
 /// Terminals that translate drag-and-drop into a paste may deliver one or
@@ -4590,15 +4921,15 @@ fn parse_paste_paths(text: &str) -> Vec<String> {
         return lines.into_iter().map(str::to_string).collect();
     }
 
-    // Single-line: try shell-split first, fall back to treating the whole line
-    // as one path (handles cases with unbalanced quotes from drag-and-drop).
-    if let Ok(parts) = shell_split(trimmed)
-        && !parts.is_empty()
-    {
-        return parts;
+    // Single-line: shell-split to find the token boundaries of a multi-file
+    // drop. A single token is returned raw so that [`expand_user_path`] stays
+    // the only place that unescapes -- otherwise a path typed as
+    // `/tmp/a\ b.txt` would be unescaped twice, and a path typed with literal
+    // spaces would be split into pieces.
+    match shell_split(trimmed) {
+        Ok(parts) if parts.len() > 1 => parts,
+        _ => vec![trimmed.to_string()],
     }
-
-    vec![trimmed.to_string()]
 }
 
 impl Deref for App {
@@ -5229,5 +5560,404 @@ mod tests {
             app.scheduled_actions.iter().map(|a| a.message_id).collect();
         assert!(requeued_ids.contains(&2));
         assert!(requeued_ids.contains(&4));
+    }
+
+    // -- Attachment paths -----------------------------------------------------
+
+    #[test]
+    fn expand_user_path_unescapes_before_expanding_tilde() {
+        let Some(home) = env::var_os("HOME") else {
+            return;
+        };
+        // Escapes have to be stripped first, or the file name keeps the
+        // backslash and the read fails.
+        assert_eq!(
+            expand_user_path("~/My\\ File.pdf"),
+            PathBuf::from(home).join("My File.pdf")
+        );
+    }
+
+    #[test]
+    fn expand_user_path_decodes_file_urls() {
+        assert_eq!(
+            expand_user_path("file:///tmp/My%20File.pdf"),
+            PathBuf::from("/tmp/My File.pdf")
+        );
+        assert_eq!(
+            expand_user_path("file://localhost/tmp/report.pdf"),
+            PathBuf::from("/tmp/report.pdf")
+        );
+    }
+
+    #[test]
+    fn expand_user_path_leaves_plain_paths_percent_encoded() {
+        // Only `file://` URLs are percent-encoded; a real file may be named
+        // "100%20done".
+        assert_eq!(
+            expand_user_path("/tmp/100%20done.txt"),
+            PathBuf::from("/tmp/100%20done.txt")
+        );
+    }
+
+    #[test]
+    fn expand_user_path_strips_quotes() {
+        assert_eq!(
+            expand_user_path("\"/tmp/my file.txt\""),
+            PathBuf::from("/tmp/my file.txt")
+        );
+        assert_eq!(
+            expand_user_path("'/tmp/my file.txt'"),
+            PathBuf::from("/tmp/my file.txt")
+        );
+    }
+
+    #[test]
+    fn parse_paste_paths_keeps_single_path_raw() {
+        // A single token stays escaped so expand_user_path is the only place
+        // that unescapes -- otherwise the value is unescaped twice.
+        assert_eq!(
+            parse_paste_paths("/tmp/a\\ b.txt"),
+            vec!["/tmp/a\\ b.txt".to_string()]
+        );
+        assert_eq!(
+            expand_user_path(&parse_paste_paths("/tmp/a\\ b.txt")[0]),
+            PathBuf::from("/tmp/a b.txt")
+        );
+    }
+
+    #[test]
+    fn unescaped_spaces_in_a_pasted_path_are_not_a_drop() {
+        // Terminals escape or quote spaces when they deliver a drop, so an
+        // unescaped space means this is text: it splits into tokens that are
+        // not all files, and therefore gets typed instead of attached.
+        // (A path typed into the attach prompt never comes through here -- the
+        // prompt hands its raw value straight to attach_file_from_path.)
+        assert!(parse_paste_paths("/tmp/my file.txt").len() > 1);
+        assert_eq!(dropped_file_paths("/tmp/my file.txt"), None);
+    }
+
+    #[test]
+    fn parse_paste_paths_splits_multi_file_drops() {
+        assert_eq!(
+            parse_paste_paths("/tmp/a.txt\n/tmp/b.txt"),
+            vec!["/tmp/a.txt".to_string(), "/tmp/b.txt".to_string()]
+        );
+        assert_eq!(
+            parse_paste_paths("'/tmp/a b.txt' '/tmp/c.txt'"),
+            vec!["/tmp/a b.txt".to_string(), "/tmp/c.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn dropped_file_paths_accepts_existing_absolute_paths() {
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        let path = file.path().to_string_lossy().into_owned();
+        assert_eq!(dropped_file_paths(&path), Some(vec![path.clone()]));
+    }
+
+    #[test]
+    fn dropped_file_paths_rejects_ordinary_text() {
+        assert_eq!(dropped_file_paths("Hello there, please review"), None);
+        assert_eq!(dropped_file_paths(""), None);
+        // Relative paths are rejected even when they exist, so pasting a word
+        // that happens to name a file in the cwd still types as text.
+        assert_eq!(dropped_file_paths("Cargo.toml"), None);
+    }
+
+    #[test]
+    fn dropped_file_paths_requires_every_candidate_to_exist() {
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        let existing = file.path().to_string_lossy().into_owned();
+        let text = format!("{existing}\n/tmp/definitely-not-here-9d3f1a.txt");
+        assert_eq!(dropped_file_paths(&text), None);
+    }
+
+    #[test]
+    fn fallback_attachment_name_uses_mime_extension() {
+        assert_eq!(fallback_attachment_name(0, "image/png"), "attachment-1.png");
+        assert_eq!(
+            fallback_attachment_name(2, "application/pdf"),
+            "attachment-3.pdf"
+        );
+        assert_eq!(
+            fallback_attachment_name(0, "image/jpeg; name=x"),
+            "attachment-1.jpg"
+        );
+        assert_eq!(
+            fallback_attachment_name(0, "application/octet-stream"),
+            "attachment-1.bin"
+        );
+        assert_eq!(
+            fallback_attachment_name(0, "text/plain"),
+            "attachment-1.txt"
+        );
+    }
+
+    #[test]
+    fn text_field_insert_str_flattens_pasted_text() {
+        let mut field = TextFieldState::default();
+        // Enclosing line breaks (the terminal's) go away; the inner one becomes
+        // a separator rather than gluing the addresses together.
+        assert!(field.insert_str("first@example.com\nsecond@example.com\n"));
+        assert_eq!(field.value, "first@example.com second@example.com");
+        assert_eq!(field.cursor, text_len(&field.value));
+
+        // Inserts at the cursor rather than appending, and keeps a deliberate
+        // trailing space.
+        field.move_home();
+        field.insert_str("zero@example.com, ");
+        assert_eq!(
+            field.value,
+            "zero@example.com, first@example.com second@example.com"
+        );
+        assert_eq!(field.cursor, text_len("zero@example.com, "));
+    }
+
+    #[test]
+    fn draft_status_line_reports_lost_attachments() {
+        assert_eq!(draft_status_line("Editing draft.", 0), "Editing draft.");
+        assert!(draft_status_line("Editing draft.", 1).contains("1 attachment"));
+        assert!(draft_status_line("Editing draft.", 3).contains("3 attachments"));
+    }
+
+    // -- Paste routing --------------------------------------------------------
+
+    #[test]
+    fn pasted_text_reaches_the_focused_compose_field() {
+        let mut app = test_app(vec![]);
+        app.open_compose();
+
+        app.handle_paste_text("someone@example.com").expect("paste");
+
+        let compose = app.compose.as_ref().expect("compose open");
+        assert_eq!(
+            compose.field_data(ComposeField::To).0,
+            "someone@example.com",
+            "bracketed paste is the only route into the field; dropping it loses the paste"
+        );
+        assert!(compose.attachments().is_empty());
+    }
+
+    #[test]
+    fn pasted_text_reaches_the_search_input() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        app.open_search();
+
+        app.handle_paste_text("invoice").expect("paste");
+
+        assert_eq!(
+            app.search.as_ref().expect("search open").input.value,
+            "invoice"
+        );
+    }
+
+    #[test]
+    fn pasted_text_reaches_the_save_attachment_folder_field() {
+        let message = make_message(1, MessageStatus::Read);
+        let mut app = test_app(vec![message.clone()]);
+        app.save_attachment = Some(SaveAttachmentDialog::new(String::new()));
+        if let Some(dialog) = app.save_attachment.as_mut() {
+            dialog.focus = SaveAttachmentFocus::Folder;
+        }
+
+        app.handle_paste_text("/tmp/target-dir").expect("paste");
+
+        let dialog = app.save_attachment.as_ref().expect("dialog open");
+        assert_eq!(dialog.folder_parts().0, "/tmp/target-dir");
+    }
+
+    #[test]
+    fn dropping_a_file_while_composing_attaches_it() {
+        use std::io::Write as _;
+
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(b"payload").expect("write");
+        let path = file.path().to_string_lossy().into_owned();
+
+        let mut app = test_app(vec![]);
+        app.open_compose();
+
+        app.handle_paste_text(&path).expect("paste");
+
+        let compose = app.compose.as_ref().expect("compose open");
+        assert_eq!(compose.attachments().len(), 1);
+        assert_eq!(compose.attachments()[0].data, b"payload");
+        assert_eq!(
+            compose.field_data(ComposeField::To).0,
+            "",
+            "a drop must not also type the path into the focused field"
+        );
+    }
+
+    // -- Carrying attachments into compose ------------------------------------
+
+    /// Backend that serves blob downloads, like JMAP does.
+    struct BlobBackend;
+
+    impl MailBackend for BlobBackend {
+        fn load_mailbox(
+            &self,
+            _mailbox: MailboxKind,
+        ) -> anyhow::Result<(MailboxSnapshot, mpsc::Receiver<BackendEvent>)> {
+            let (_tx, rx) = mpsc::channel();
+            Ok((
+                MailboxSnapshot {
+                    total: 0,
+                    messages: vec![],
+                },
+                rx,
+            ))
+        }
+
+        fn load_message(&self, _message_id: MessageId) -> anyhow::Result<MessageContent> {
+            Ok(MessageContent::default())
+        }
+
+        fn apply_actions(
+            &self,
+            _actions: Vec<Action>,
+        ) -> anyhow::Result<mpsc::Receiver<ActionStatus>> {
+            let (_tx, rx) = mpsc::channel();
+            Ok(rx)
+        }
+
+        fn send_message(&self, _message: OutgoingMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn save_draft(&self, _message: OutgoingMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn fetch_attachment_blob(&self, blob_id: &str) -> anyhow::Result<Vec<u8>> {
+            if blob_id == "missing" {
+                anyhow::bail!("no such blob");
+            }
+            Ok(format!("blob:{blob_id}").into_bytes())
+        }
+    }
+
+    fn attachment(
+        filename: Option<&str>,
+        mime_type: &str,
+        data: Option<&[u8]>,
+        blob_id: Option<&str>,
+    ) -> MessageAttachment {
+        MessageAttachment {
+            filename: filename.map(str::to_string),
+            mime_type: mime_type.to_string(),
+            size: data.map_or(0, |d| d.len()),
+            data: data.map(<[u8]>::to_vec),
+            blob_id: blob_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn restore_compose_attachments_keeps_inline_bytes() {
+        let app = test_app(vec![]);
+        let content = MessageContent {
+            mailer: String::new(),
+            parts: vec![],
+            attachments: vec![attachment(
+                Some("report.pdf"),
+                "application/pdf",
+                Some(b"%PDF-1.7"),
+                None,
+            )],
+        };
+
+        let (restored, unavailable) = app.restore_compose_attachments(&content);
+        assert_eq!(unavailable, 0);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].filename, "report.pdf");
+        assert_eq!(restored[0].mime_type, "application/pdf");
+        assert_eq!(restored[0].data, b"%PDF-1.7");
+    }
+
+    #[test]
+    fn restore_compose_attachments_downloads_blobs() {
+        let app = test_app_with_backend(vec![], Arc::new(BlobBackend));
+        let content = MessageContent {
+            mailer: String::new(),
+            parts: vec![],
+            attachments: vec![
+                attachment(Some("sheet.xlsx"), "application/pdf", None, Some("b1")),
+                // No filename: the name has to come from the content type.
+                attachment(None, "image/png", None, Some("b2")),
+            ],
+        };
+
+        let (restored, unavailable) = app.restore_compose_attachments(&content);
+        assert_eq!(unavailable, 0);
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].data, b"blob:b1");
+        assert_eq!(restored[1].filename, "attachment-2.png");
+        assert_eq!(restored[1].data, b"blob:b2");
+    }
+
+    #[test]
+    fn restore_compose_attachments_counts_unavailable() {
+        let app = test_app_with_backend(vec![], Arc::new(BlobBackend));
+        let content = MessageContent {
+            mailer: String::new(),
+            parts: vec![],
+            attachments: vec![
+                attachment(Some("ok.txt"), "text/plain", Some(b"hi"), None),
+                // Download fails.
+                attachment(Some("bad.txt"), "text/plain", None, Some("missing")),
+                // Neither bytes nor a blob to fetch.
+                attachment(Some("gone.txt"), "text/plain", None, None),
+            ],
+        };
+
+        let (restored, unavailable) = app.restore_compose_attachments(&content);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].filename, "ok.txt");
+        assert_eq!(
+            unavailable, 2,
+            "attachments that cannot be recovered must be counted, not dropped silently"
+        );
+    }
+
+    #[test]
+    fn forwarding_carries_the_original_attachments() {
+        let message = make_message(1, MessageStatus::Read);
+        let mut app = test_app_with_backend(vec![message.clone()], Arc::new(BlobBackend));
+
+        app.message_view = Some(MessageViewState {
+            message_id: message.id,
+            message_index: 0,
+            message: message.clone(),
+            content: MessageContent {
+                mailer: String::new(),
+                parts: vec![MessageContentPart {
+                    content_type: "text/plain".to_string(),
+                    content: b"original body".to_vec(),
+                }],
+                attachments: vec![attachment(
+                    Some("invoice.pdf"),
+                    "application/pdf",
+                    Some(b"%PDF-1.7"),
+                    None,
+                )],
+            },
+            document: None,
+            raw_html: None,
+            scroll: 0,
+            unformatted: false,
+            info_line: None,
+            read_at: None,
+        });
+
+        app.open_forward().expect("forward should open compose");
+
+        let compose = app.compose.as_ref().expect("compose should be open");
+        assert_eq!(
+            compose.attachments().len(),
+            1,
+            "forwarding must not drop the original attachment"
+        );
+        assert_eq!(compose.attachments()[0].filename, "invoice.pdf");
+        assert_eq!(compose.attachments()[0].data, b"%PDF-1.7");
     }
 }
