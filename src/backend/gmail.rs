@@ -6,8 +6,8 @@
 
 use crate::{
     backend::{
-        ActionStatus, BackendEvent, MailBackend, MailboxSnapshot, OutgoingAttachment,
-        OutgoingMessage,
+        ActionStatus, BackendEvent, MailBackend, MailboxSnapshot, OutgoingMessage,
+        build_compose_body,
     },
     model::{
         Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
@@ -27,11 +27,7 @@ use imap_proto::types::{
     Response,
 };
 use lettre::{
-    Message as LettreEmail, SmtpTransport, Transport,
-    message::{
-        Attachment as LettreAttachment, Mailbox as LettreMailbox, MultiPart, SinglePart,
-        header::ContentType as LettreContentType,
-    },
+    Message as LettreEmail, SmtpTransport, Transport, message::Mailbox as LettreMailbox,
     transport::smtp::authentication::Credentials,
 };
 use mailparse::{self, DispositionType, MailHeaderMap, ParsedMail};
@@ -2127,31 +2123,6 @@ where
     };
 
     (status, starred, answered, forwarded, important)
-}
-
-fn build_compose_body(
-    text_body: String,
-    html_body: String,
-    attachments: Vec<OutgoingAttachment>,
-) -> Result<MultiPart> {
-    let alternative = MultiPart::alternative()
-        .singlepart(SinglePart::plain(text_body))
-        .singlepart(SinglePart::html(html_body));
-
-    if attachments.is_empty() {
-        return Ok(alternative);
-    }
-
-    let mut mixed = MultiPart::mixed().multipart(alternative);
-    for attachment in attachments {
-        let content_type: LettreContentType = attachment
-            .mime_type
-            .parse()
-            .unwrap_or_else(|_| LettreContentType::parse("application/octet-stream").unwrap());
-        let part = LettreAttachment::new(attachment.filename).body(attachment.data, content_type);
-        mixed = mixed.singlepart(part);
-    }
-    Ok(mixed)
 }
 
 #[cfg(test)]

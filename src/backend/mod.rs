@@ -8,6 +8,9 @@
 
 use crate::model::{Action, MailboxKind, Message, MessageContent, MessageId};
 use anyhow::Result;
+use lettre::message::{
+    Attachment as LettreAttachment, MultiPart, SinglePart, header::ContentType as LettreContentType,
+};
 use std::sync::mpsc::Receiver;
 
 pub mod gmail;
@@ -70,6 +73,36 @@ impl OutgoingAttachment {
     pub fn size(&self) -> usize {
         self.data.len()
     }
+}
+
+/// Assemble the MIME body of an outgoing message.
+///
+/// The two bodies always go into a `multipart/alternative`; attachments wrap
+/// that in a `multipart/mixed`.  Every SMTP-based backend builds the same
+/// structure, so the code lives here rather than being copied per backend.
+pub(crate) fn build_compose_body(
+    text_body: String,
+    html_body: String,
+    attachments: Vec<OutgoingAttachment>,
+) -> Result<MultiPart> {
+    let alternative = MultiPart::alternative()
+        .singlepart(SinglePart::plain(text_body))
+        .singlepart(SinglePart::html(html_body));
+
+    if attachments.is_empty() {
+        return Ok(alternative);
+    }
+
+    let mut mixed = MultiPart::mixed().multipart(alternative);
+    for attachment in attachments {
+        let content_type: LettreContentType = attachment
+            .mime_type
+            .parse()
+            .unwrap_or_else(|_| LettreContentType::parse("application/octet-stream").unwrap());
+        let part = LettreAttachment::new(attachment.filename).body(attachment.data, content_type);
+        mixed = mixed.singlepart(part);
+    }
+    Ok(mixed)
 }
 
 /// Abstraction over a mail provider implementation.

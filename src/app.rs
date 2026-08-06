@@ -428,7 +428,9 @@ impl SaveAttachmentDialog {
         }
     }
 
-    pub(crate) fn folder_parts(&self) -> (&str, usize) {
+    /// Folder value and cursor position, shaped like
+    /// [`ComposeState::field_data`] so both feed the same field renderer.
+    pub(crate) fn folder_data(&self) -> (&str, usize) {
         (&self.folder.value[..], self.folder.cursor)
     }
 
@@ -724,12 +726,6 @@ impl ComposeState {
 
     pub(crate) fn is_field_focused(&self, field: ComposeField) -> bool {
         matches!(self.focus, ComposeFocus::Field(active) if active == field)
-    }
-
-    pub(crate) fn field_parts(&self, field: ComposeField) -> (&str, &str) {
-        let (value, cursor) = self.field_data(field);
-        let idx = byte_index_for(value, cursor);
-        value.split_at(idx)
     }
 
     fn field_state_mut(&mut self, field: ComposeField) -> &mut TextFieldState {
@@ -1156,7 +1152,7 @@ fn text_len(text: &str) -> usize {
     text.chars().count()
 }
 
-fn byte_index_for(text: &str, char_index: usize) -> usize {
+pub(crate) fn byte_index_for(text: &str, char_index: usize) -> usize {
     if char_index == 0 {
         return 0;
     }
@@ -2969,38 +2965,31 @@ impl App {
                 }
                 _ => {}
             },
-            SaveAttachmentFocus::List => {
-                if total == 0 {
-                    let _ = dialog;
-                    self.close_save_attachment_dialog();
-                    return Ok(());
+            SaveAttachmentFocus::List => match key.code {
+                KeyCode::Up => {
+                    if dialog.selected > 0 {
+                        dialog.selected -= 1;
+                        dialog.clear_status();
+                    } else {
+                        dialog.focus = SaveAttachmentFocus::Folder;
+                    }
                 }
-                match key.code {
-                    KeyCode::Up => {
-                        if dialog.selected > 0 {
-                            dialog.selected -= 1;
-                            dialog.clear_status();
-                        } else {
-                            dialog.focus = SaveAttachmentFocus::Folder;
-                        }
+                KeyCode::Down => {
+                    if dialog.selected + 1 < total {
+                        dialog.selected += 1;
+                        dialog.clear_status();
+                    } else {
+                        dialog.focus = SaveAttachmentFocus::Folder;
                     }
-                    KeyCode::Down => {
-                        if dialog.selected + 1 < total {
-                            dialog.selected += 1;
-                            dialog.clear_status();
-                        } else {
-                            dialog.focus = SaveAttachmentFocus::Folder;
-                        }
-                    }
-                    KeyCode::Home => {
-                        dialog.selected = 0;
-                    }
-                    KeyCode::End => {
-                        dialog.selected = total - 1;
-                    }
-                    _ => {}
                 }
-            }
+                KeyCode::Home => {
+                    dialog.selected = 0;
+                }
+                KeyCode::End => {
+                    dialog.selected = total.saturating_sub(1);
+                }
+                _ => {}
+            },
         }
 
         Ok(())
@@ -4986,6 +4975,12 @@ fn fallback_attachment_name(index: usize, mime_type: &str) -> String {
 }
 
 /// Best-effort file extension for a MIME type, mirroring [`guess_mime_type`].
+///
+/// Deliberately not `mime_guess`'s reverse mapping: that returns every
+/// extension registered for a type in alphabetical order, so the first entry is
+/// arbitrary (`application/octet-stream` starts at `aaf`, `video/x-matroska` at
+/// `mk3d`).  A short table of the types that actually turn up, plus the subtype
+/// when it already reads like an extension, does better.
 fn extension_for_mime_type(mime_type: &str) -> String {
     let essence = mime_type
         .split(';')
@@ -5004,6 +4999,10 @@ fn extension_for_mime_type(mime_type: &str) -> String {
         "application/zip" => Some("zip"),
         "application/gzip" => Some("gz"),
         "application/x-tar" => Some("tar"),
+        "application/x-7z-compressed" => Some("7z"),
+        "application/x-xz" => Some("xz"),
+        "application/x-rar-compressed" | "application/vnd.rar" => Some("rar"),
+        "application/rtf" => Some("rtf"),
         "application/msword" => Some("doc"),
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => Some("docx"),
         "application/vnd.ms-excel" => Some("xls"),
@@ -5014,7 +5013,9 @@ fn extension_for_mime_type(mime_type: &str) -> String {
         "image/svg+xml" => Some("svg"),
         "image/tiff" => Some("tiff"),
         "audio/mpeg" => Some("mp3"),
+        "audio/m4a" | "audio/mp4" => Some("m4a"),
         "video/quicktime" => Some("mov"),
+        "video/x-matroska" => Some("mkv"),
         "message/rfc822" => Some("eml"),
         _ => None,
     };
@@ -5147,48 +5148,21 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Content type to send an attached file as, derived from its extension.
+///
+/// `mime_guess` carries the full extension table -- a hand-written one always
+/// misses whatever the user actually attaches (`.rs`, `.toml`, `.heic`, ...).
+/// Unknown extensions become `application/octet-stream`.  Text types get an
+/// explicit `charset=utf-8`, without which recipients are free to render the
+/// part as Latin-1.
 fn guess_mime_type(path: &std::path::Path) -> String {
-    let ext = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase())
-        .unwrap_or_default();
-
-    match ext.as_str() {
-        "txt" | "log" | "md" | "markdown" => "text/plain".to_string(),
-        "html" | "htm" => "text/html".to_string(),
-        "css" => "text/css".to_string(),
-        "csv" => "text/csv".to_string(),
-        "json" => "application/json".to_string(),
-        "xml" => "application/xml".to_string(),
-        "pdf" => "application/pdf".to_string(),
-        "zip" => "application/zip".to_string(),
-        "gz" | "tgz" => "application/gzip".to_string(),
-        "tar" => "application/x-tar".to_string(),
-        "doc" => "application/msword".to_string(),
-        "docx" => {
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document".to_string()
-        }
-        "xls" => "application/vnd.ms-excel".to_string(),
-        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string(),
-        "ppt" => "application/vnd.ms-powerpoint".to_string(),
-        "pptx" => {
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation".to_string()
-        }
-        "png" => "image/png".to_string(),
-        "jpg" | "jpeg" => "image/jpeg".to_string(),
-        "gif" => "image/gif".to_string(),
-        "webp" => "image/webp".to_string(),
-        "svg" => "image/svg+xml".to_string(),
-        "bmp" => "image/bmp".to_string(),
-        "tiff" | "tif" => "image/tiff".to_string(),
-        "mp3" => "audio/mpeg".to_string(),
-        "wav" => "audio/wav".to_string(),
-        "ogg" => "audio/ogg".to_string(),
-        "mp4" => "video/mp4".to_string(),
-        "mov" => "video/quicktime".to_string(),
-        "webm" => "video/webm".to_string(),
-        _ => "application/octet-stream".to_string(),
+    let guess = mime_guess::from_path(path).first_or_octet_stream();
+    if guess.type_() == mime_guess::mime::TEXT
+        && guess.get_param(mime_guess::mime::CHARSET).is_none()
+    {
+        format!("{}; charset=utf-8", guess.essence_str())
+    } else {
+        guess.essence_str().to_string()
     }
 }
 
@@ -6011,6 +5985,49 @@ mod tests {
     }
 
     #[test]
+    fn guess_mime_type_covers_common_extensions() {
+        let guess = |name: &str| guess_mime_type(std::path::Path::new(name));
+
+        assert_eq!(guess("/tmp/report.pdf"), "application/pdf");
+        assert_eq!(guess("/tmp/photo.HEIC"), "image/heic");
+        assert_eq!(guess("/tmp/clip.mkv"), "video/x-matroska");
+        assert_eq!(guess("/tmp/archive.7z"), "application/x-7z-compressed");
+        assert_eq!(guess("/tmp/song.flac"), "audio/flac");
+        assert_eq!(guess("/tmp/no-extension"), "application/octet-stream");
+        assert_eq!(guess("/tmp/unknown.qqq"), "application/octet-stream");
+    }
+
+    #[test]
+    fn guess_mime_type_marks_text_as_utf8() {
+        let guess = |name: &str| guess_mime_type(std::path::Path::new(name));
+
+        // Without the charset a recipient may decode these as Latin-1.
+        assert_eq!(guess("/tmp/notes.txt"), "text/plain; charset=utf-8");
+        assert_eq!(guess("/tmp/main.rs"), "text/x-rust; charset=utf-8");
+        assert_eq!(guess("/tmp/config.toml"), "text/x-toml; charset=utf-8");
+        assert_eq!(guess("/tmp/data.csv"), "text/csv; charset=utf-8");
+        // Binary types are left alone.
+        assert_eq!(guess("/tmp/logo.png"), "image/png");
+    }
+
+    #[test]
+    fn extension_for_mime_type_prefers_the_explicit_table() {
+        // Ambiguous types come from the table.
+        assert_eq!(extension_for_mime_type("text/plain"), "txt");
+        assert_eq!(extension_for_mime_type("text/plain; charset=utf-8"), "txt");
+        assert_eq!(extension_for_mime_type("image/jpeg"), "jpg");
+        // Prefixed subtypes have no usable subtype, so they are listed too.
+        assert_eq!(extension_for_mime_type("video/x-matroska"), "mkv");
+        assert_eq!(extension_for_mime_type("application/x-7z-compressed"), "7z");
+        // Subtypes that already read like an extension need no entry.
+        assert_eq!(extension_for_mime_type("image/heic"), "heic");
+        assert_eq!(extension_for_mime_type("audio/flac"), "flac");
+        // Unknown types stay generic rather than guessing.
+        assert_eq!(extension_for_mime_type("application/x-made-up"), "bin");
+        assert_eq!(extension_for_mime_type("application/octet-stream"), "bin");
+    }
+
+    #[test]
     fn text_field_insert_str_flattens_pasted_text() {
         let mut field = TextFieldState::default();
         // Enclosing line breaks (the terminal's) go away; the inner one becomes
@@ -6080,7 +6097,7 @@ mod tests {
         app.handle_paste_text("/tmp/target-dir").expect("paste");
 
         let dialog = app.save_attachment.as_ref().expect("dialog open");
-        assert_eq!(dialog.folder_parts().0, "/tmp/target-dir");
+        assert_eq!(dialog.folder_data().0, "/tmp/target-dir");
     }
 
     #[test]

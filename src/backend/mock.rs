@@ -647,15 +647,14 @@ fn generate_mock_attachments(rng: &mut SimpleRng) -> Vec<MessageAttachment> {
         for _ in 0..count {
             let (filename, mime_type) =
                 ATTACHMENT_TEMPLATES[rng.gen_range_usize(0..ATTACHMENT_TEMPLATES.len())];
-            let size = mock_attachment_size(rng, mime_type);
-            let data = format!(
-                "This is a placeholder payload for the mock attachment '{filename}' ({mime_type}, {size} bytes).\n"
-            )
-            .into_bytes();
+            let data = mock_attachment_payload(filename, mime_type, mock_attachment_size(rng));
             attachments.push(MessageAttachment {
                 filename: Some(filename.to_string()),
                 mime_type: mime_type.to_string(),
-                size,
+                // Always the real byte count: a listed size the save dialog
+                // then contradicts by writing a 90-byte file is worse demo
+                // data than a small attachment.
+                size: data.len(),
                 data: Some(data),
                 blob_id: None,
             });
@@ -666,20 +665,29 @@ fn generate_mock_attachments(rng: &mut SimpleRng) -> Vec<MessageAttachment> {
     }
 }
 
-fn mock_attachment_size(rng: &mut SimpleRng, mime_type: &str) -> usize {
-    match mime_type {
-        "application/pdf" => rng.gen_range_usize(150_000..3_000_000),
-        "image/png" => rng.gen_range_usize(90_000..1_500_000),
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => {
-            rng.gen_range_usize(120_000..2_400_000)
-        }
-        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => {
-            rng.gen_range_usize(400_000..4_800_000)
-        }
-        "application/zip" => rng.gen_range_usize(240_000..4_500_000),
-        "text/plain" => rng.gen_range_usize(4_000..40_000),
-        _ => rng.gen_range_usize(60_000..750_000),
+/// Sizes are deliberately modest -- every generated message is held in memory,
+/// so the multi-megabyte figures the templates suggest would cost hundreds of
+/// megabytes for a demo mailbox.
+fn mock_attachment_size(rng: &mut SimpleRng) -> usize {
+    rng.gen_range_usize(2_000..120_000)
+}
+
+/// Filler bytes of exactly `size` length, so what the UI lists is what a save
+/// actually writes.
+fn mock_attachment_payload(filename: &str, mime_type: &str, size: usize) -> Vec<u8> {
+    const FILLER: &[u8] = b"elma mock attachment payload -- not a real file. ";
+
+    let mut data = format!(
+        "This is a placeholder payload for the mock attachment '{filename}' ({mime_type}, {size} bytes).\n"
+    )
+    .into_bytes();
+    while data.len() < size {
+        let take = (size - data.len()).min(FILLER.len());
+        data.extend_from_slice(&FILLER[..take]);
     }
+    // ASCII throughout, so truncating a long header cannot split a character.
+    data.truncate(size);
+    data
 }
 
 fn new_random_message(
@@ -706,7 +714,8 @@ fn new_random_message(
 
     let attachments = generate_mock_attachments(rng);
     let attachments_bytes = attachments.iter().map(|att| att.size).sum::<usize>();
-    content.attachments = attachments.clone();
+    let has_attachments = !attachments.is_empty();
+    content.attachments = attachments;
 
     let size = rng.gen_range_usize(0..7_203_680) + 200 + attachments_bytes;
 
@@ -731,7 +740,7 @@ fn new_random_message(
         labels,
         uid: id as u32,
         seq: 0,
-        has_attachments: !attachments.is_empty(),
+        has_attachments,
     };
 
     update_mailer(&mut content, message.status);
@@ -947,5 +956,35 @@ mod html2text {
             col += len;
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mock_attachments_advertise_the_bytes_they_carry() {
+        let mut rng = SimpleRng::new(7);
+        let mut seen = 0;
+        for _ in 0..200 {
+            for attachment in generate_mock_attachments(&mut rng) {
+                let data = attachment.data.as_ref().expect("mock data is inline");
+                assert_eq!(attachment.size, data.len());
+                seen += 1;
+            }
+        }
+        assert!(seen > 0, "expected the generator to produce attachments");
+    }
+
+    #[test]
+    fn mock_attachment_payload_matches_the_requested_size() {
+        // Longer than the header, so it pads.
+        let padded = mock_attachment_payload("report.pdf", "application/pdf", 4_096);
+        assert_eq!(padded.len(), 4_096);
+        // Shorter than the header, so it truncates.
+        let clipped = mock_attachment_payload("report.pdf", "application/pdf", 12);
+        assert_eq!(clipped.len(), 12);
+        assert_eq!(&clipped, b"This is a pl");
     }
 }

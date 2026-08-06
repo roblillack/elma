@@ -7,8 +7,8 @@
 
 use crate::{
     backend::{
-        ActionStatus, BackendEvent, MailBackend, MailboxSnapshot, OutgoingAttachment,
-        OutgoingMessage,
+        ActionStatus, BackendEvent, MailBackend, MailboxSnapshot, OutgoingMessage,
+        build_compose_body,
     },
     model::{
         Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
@@ -23,13 +23,7 @@ use jmap_client::{
     identity::Property as IdentityProperty,
     mailbox::{Mailbox as JmapMailbox, Property as MailboxProperty, Role as MailboxRole},
 };
-use lettre::{
-    Message as LettreEmail,
-    message::{
-        Attachment as LettreAttachment, Mailbox as LettreMailbox, MultiPart, SinglePart,
-        header::ContentType as LettreContentType,
-    },
-};
+use lettre::{Message as LettreEmail, message::Mailbox as LettreMailbox};
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -985,31 +979,6 @@ impl JmapInner {
 
         builder.multipart(body).context("building MIME message")
     }
-}
-
-fn build_compose_body(
-    text_body: String,
-    html_body: String,
-    attachments: Vec<OutgoingAttachment>,
-) -> Result<MultiPart> {
-    let alternative = MultiPart::alternative()
-        .singlepart(SinglePart::plain(text_body))
-        .singlepart(SinglePart::html(html_body));
-
-    if attachments.is_empty() {
-        return Ok(alternative);
-    }
-
-    let mut mixed = MultiPart::mixed().multipart(alternative);
-    for attachment in attachments {
-        let content_type: LettreContentType = attachment
-            .mime_type
-            .parse()
-            .unwrap_or_else(|_| LettreContentType::parse("application/octet-stream").unwrap());
-        let part = LettreAttachment::new(attachment.filename).body(attachment.data, content_type);
-        mixed = mixed.singlepart(part);
-    }
-    Ok(mixed)
 }
 
 #[derive(Clone, Debug)]
