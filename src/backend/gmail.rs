@@ -935,9 +935,14 @@ impl GmailInner {
             {
                 starred = Some(entry_name.clone());
             }
-            if important.is_none() {
+            if has_important_attribute(attrs) {
+                important = Some(entry_name.clone());
+            } else if important.is_none() {
+                // Fallback for servers that omit the attribute: match the
+                // English name.  Only correct for English-locale accounts, so
+                // the attribute above always wins.
                 let lower = entry_name.to_ascii_lowercase();
-                if lower == "\\important" || lower == "important" || lower.ends_with("/important") {
+                if lower == "important" || lower.ends_with("/important") {
                     important = Some(entry_name.clone());
                 }
             }
@@ -1784,6 +1789,22 @@ impl SharedState {
     }
 }
 
+/// Does this LIST entry carry Gmail's `\Important` special-use attribute?
+///
+/// `\Important` (RFC 8457) is not one of the RFC 6154 attributes the IMAP
+/// parser knows, so it arrives as `NameAttribute::Extension("\\Important")`.
+/// Detecting it is the only locale-independent way to find the mailbox: Gmail
+/// localises the name itself (`[Gmail]/Important`, `[Gmail]/Wichtig`, …).
+fn has_important_attribute(attrs: &[NameAttribute<'_>]) -> bool {
+    attrs.iter().any(|attr| match attr {
+        NameAttribute::Extension(name) => {
+            let trimmed = name.trim_start_matches('\\');
+            trimmed.eq_ignore_ascii_case("Important")
+        }
+        _ => false,
+    })
+}
+
 fn build_message_from_fetch(fetch: &Fetch) -> Result<Option<StoredMessage>> {
     let uid = fetch
         .uid
@@ -2481,6 +2502,30 @@ mod tests {
         let result = state.update_labels(1, vec!["\\\\Important".to_string()]);
         let updated = result.expect("labels changed");
         assert!(updated.important);
+    }
+
+    // ---------------------------------------------------------------
+    //  has_important_attribute
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn important_attribute_detected_regardless_of_locale() {
+        // Both an English and a German account list the same `\Important`
+        // attribute, only the mailbox name differs.
+        let attrs = vec![
+            NameAttribute::NoInferiors,
+            NameAttribute::Extension("\\Important".into()),
+        ];
+        assert!(has_important_attribute(&attrs));
+    }
+
+    #[test]
+    fn important_attribute_absent_on_other_mailboxes() {
+        let attrs = vec![NameAttribute::NoInferiors, NameAttribute::Flagged];
+        assert!(!has_important_attribute(&attrs));
+
+        let attrs = vec![NameAttribute::Extension("\\Foobar".into())];
+        assert!(!has_important_attribute(&attrs));
     }
 
     #[test]
