@@ -84,8 +84,11 @@ impl OutgoingAttachment {
 /// * `load_inbox` produces both the initial message list and a channel that streams
 ///   [`BackendEvent`] updates.  This ensures there is a single source of truth for
 ///   mailbox mutations.
-/// * `load_message` stays synchronous because the UI only invokes it when opening a
-///   single message; implementors are free to run async code internally.
+/// * `load_message`, `send_message`, `save_draft` and `fetch_attachment_blob` are
+///   blocking calls that the UI always makes from a worker thread, never from the
+///   event loop.  They may take as long as the network does, and two of them (or
+///   one of them plus an `apply_actions` batch) can be in flight at the same time,
+///   so implementations have to serialise their own connection state.
 /// * `apply_actions` accepts the full action batch and must never block the caller.
 ///   Implementations should spawn work (e.g. on a thread or async runtime) and send
 ///   [`ActionStatus`] entries as each action completes.
@@ -123,6 +126,8 @@ pub trait MailBackend: Send + Sync {
         self.load_mailbox(MailboxKind::Inbox)
     }
     /// Load the full content for a single message.
+    ///
+    /// Called from a worker thread, so blocking here is expected.
     fn load_message(&self, message_id: MessageId) -> Result<MessageContent>;
     /// Begin processing a batch of actions and return a channel with completion updates.
     fn apply_actions(&self, actions: Vec<Action>) -> Result<Receiver<ActionStatus>>;
@@ -134,11 +139,17 @@ pub trait MailBackend: Send + Sync {
         self.apply_actions(actions)
     }
     /// Send a fully composed message.
+    ///
+    /// Called from a worker thread; uploading megabytes of attachments here is
+    /// expected and does not stall the UI.
     fn send_message(&self, message: OutgoingMessage) -> Result<()>;
     /// Store a draft message.
+    ///
+    /// Called from a worker thread, like [`send_message`](MailBackend::send_message).
     fn save_draft(&self, message: OutgoingMessage) -> Result<()>;
     /// Download the raw bytes for an attachment identified by its backend blob id.
     ///
+    /// Called from a worker thread, once per attachment that needs it.
     /// Backends that deliver the full message payload up-front populate
     /// [`MessageAttachment::data`](crate::model::MessageAttachment::data) directly
     /// and can leave this method unimplemented.  Backends that only return a

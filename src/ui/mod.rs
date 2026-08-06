@@ -17,6 +17,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap},
 };
+use std::time::Duration;
 use time::OffsetDateTime;
 
 const ACTION_BAR_BG: Color = Color::Rgb(211, 211, 211);
@@ -55,6 +56,25 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
             frame.set_cursor_position((x, y));
         }
     }
+}
+
+/// Frame of the throbber shown next to a background operation.
+///
+/// Driven purely by elapsed time, so every spinner in the UI animates off the
+/// main loop's redraw tick without any state of its own.
+fn spinner_frame(elapsed: Duration) -> char {
+    const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let idx = (elapsed.as_millis() / 80) as usize % SPINNER.len();
+    SPINNER[idx]
+}
+
+/// `⠹ Loading 'Invoice' (1.2s)` — one line describing work still running.
+fn progress_text(label: &str, elapsed: Duration) -> String {
+    format!(
+        "{} {label} ({:.1}s)",
+        spinner_frame(elapsed),
+        elapsed.as_secs_f32()
+    )
 }
 
 /// Draw the action bar, optionally reserving space for the commit indicator.
@@ -152,7 +172,11 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     let mut info_text = app.inbox_info_bar();
-    if let Some(status) = app.inbox_status_line()
+    // A load in flight outranks the last status: it is what the user is waiting for.
+    if let Some((label, elapsed)) = app.pending_message_load() {
+        info_text.push_str(" — ");
+        info_text.push_str(&progress_text(label, elapsed));
+    } else if let Some(status) = app.inbox_status_line()
         && !status.is_empty()
     {
         info_text.push_str(" — ");
@@ -378,20 +402,30 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
 
     render_compose_body(frame, layout[3], app);
 
+    // While the backend has the message the whole view is read-only, so nothing
+    // offers focus: no lit button, no cursor.
+    let pending_outgoing = app
+        .pending_outgoing()
+        .map(|(label, elapsed)| format!("{} — please wait", progress_text(label, elapsed)));
+    let busy = pending_outgoing.is_some();
+
     {
         let state = app.compose_state().expect("compose state should exist");
-        render_compose_buttons(frame, layout[4], state);
+        render_compose_buttons(frame, layout[4], state, busy);
     }
 
-    let status_text = app
-        .compose_status_line()
-        .map(|text| text.to_string())
+    let status_text = pending_outgoing
+        .or_else(|| app.compose_status_line().map(|text| text.to_string()))
         .unwrap_or_else(|| {
             "Tab to move between fields; Enter activates a button. Drop a file on the terminal to attach it."
                 .to_string()
         });
     let status = Paragraph::new(status_text)
-        .style(popup_style)
+        .style(if busy {
+            popup_style.fg(Color::Yellow)
+        } else {
+            popup_style
+        })
         .alignment(Alignment::Center);
     frame.render_widget(status, layout[5]);
 
@@ -403,6 +437,10 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
         if let Some(pos) = prompt_cursor {
             cursor_pos = Some(pos);
         }
+    }
+
+    if busy {
+        cursor_pos = None;
     }
 
     if let Some((x, y)) = cursor_pos {
@@ -735,7 +773,7 @@ fn render_compose_body(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_compose_buttons(frame: &mut Frame<'_>, area: Rect, state: &ComposeState) {
+fn render_compose_buttons(frame: &mut Frame<'_>, area: Rect, state: &ComposeState, disabled: bool) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -752,6 +790,13 @@ fn render_compose_buttons(frame: &mut Frame<'_>, area: Rect, state: &ComposeStat
     for (idx, (button, label)) in buttons.iter().enumerate() {
         if idx > 0 {
             spans.push(Span::raw("   "));
+        }
+        if disabled {
+            spans.push(Span::styled(
+                format!("[{label}]"),
+                Style::default().fg(Color::DarkGray),
+            ));
+            continue;
         }
         let focused = matches!(state.focus(), ComposeFocus::Button(active) if active == *button);
         if focused {
@@ -798,7 +843,10 @@ fn render_message(frame: &mut Frame<'_>, app: &mut App) {
 
     render_message_body(frame, view, layout[1]);
 
-    let info_text = view.info_line.clone().unwrap_or_else(String::new);
+    let info_text = match app.pending_message_load() {
+        Some((label, elapsed)) => progress_text(label, elapsed),
+        None => view.info_line.clone().unwrap_or_default(),
+    };
     let info_bar = Paragraph::new(info_text)
         .style(action_bar_style())
         .block(Block::default());
@@ -1353,11 +1401,9 @@ fn render_save_attachment_dialog(
     }
 
     let status_line = if let Some((filename, elapsed)) = dialog.active_operation() {
-        const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-        let idx = (elapsed.as_millis() / 80) as usize % SPINNER.len();
         Line::from(vec![
             Span::styled(
-                SPINNER[idx].to_string(),
+                spinner_frame(elapsed).to_string(),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),

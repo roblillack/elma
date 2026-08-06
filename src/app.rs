@@ -203,6 +203,77 @@ struct MailboxLoaderState {
     receiver: Receiver<MailboxLoadUpdate>,
 }
 
+/// What the UI does with a message body once the worker delivers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MessageLoadPurpose {
+    /// Show it in the message viewer.
+    View,
+    Reply {
+        reply_all: bool,
+    },
+    Forward,
+    /// Reopen it in compose for further editing.
+    Draft,
+}
+
+impl MessageLoadPurpose {
+    /// Whether compose needs the attachment bytes, which may mean a download.
+    fn needs_attachments(self) -> bool {
+        matches!(self, Self::Forward | Self::Draft)
+    }
+}
+
+/// Everything a single background message load produces.
+struct LoadedMessage {
+    content: MessageContent,
+    /// Attachments rebuilt for compose; empty unless the load feeds compose.
+    attachments: Vec<OutgoingAttachment>,
+    /// How many attachments could not be recovered at all.
+    unavailable: usize,
+}
+
+/// A message body being fetched on a worker thread.
+struct MessageLoadOperation {
+    /// The list entry the load started from; headers are taken from here.
+    message: Message,
+    purpose: MessageLoadPurpose,
+    /// Body the viewer had already rendered, reused so a reply quotes exactly
+    /// what was on screen.
+    cached_document: Option<Document>,
+    receiver: Receiver<Result<LoadedMessage, String>>,
+    started: Instant,
+    /// What the progress indicator says while this runs.
+    label: String,
+}
+
+/// Whether an in-flight submission is a send or a draft save.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutgoingKind {
+    Send,
+    Draft,
+}
+
+impl OutgoingKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Send => "Sending message",
+            Self::Draft => "Saving draft",
+        }
+    }
+}
+
+/// A composed message handed to the backend on a worker thread.
+///
+/// Compose stays open and locked until the worker reports back: on success it
+/// closes, on failure the text is still there to retry with.
+struct OutgoingOperation {
+    kind: OutgoingKind,
+    /// Draft this submission replaces; deleted once the backend accepts it.
+    draft_id: Option<MessageId>,
+    receiver: Receiver<Result<(), String>>,
+    started: Instant,
+}
+
 struct SearchState {
     input: TextFieldState,
     focused: bool,
@@ -253,6 +324,8 @@ pub struct AccountState {
     commit_progress: Option<CommitProgress>,
     mailbox_loader: Option<MailboxLoaderState>,
     mailbox_load_progress: Option<CommitProgress>,
+    /// Message body being fetched for this account, if any.
+    message_loader: Option<MessageLoadOperation>,
     scheduled_actions: Vec<Action>,
     current_mailbox: MailboxKind,
     search: Option<SearchState>,
@@ -314,6 +387,8 @@ pub struct App {
     pending_shortcut: Option<ShortcutMenuState>,
     pending_navigation: Option<PendingNavigation>,
     save_attachment: Option<SaveAttachmentDialog>,
+    /// Send or draft-save running on a worker thread.
+    outgoing: Option<OutgoingOperation>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1347,6 +1422,7 @@ impl App {
                 commit_progress: None,
                 mailbox_loader: None,
                 mailbox_load_progress: initial_load_progress,
+                message_loader: None,
                 scheduled_actions: Vec::new(),
                 current_mailbox: MailboxKind::Inbox,
                 search: None,
@@ -1361,6 +1437,7 @@ impl App {
             pending_shortcut: None,
             pending_navigation: None,
             save_attachment: None,
+            outgoing: None,
         })
     }
 
@@ -1651,6 +1728,8 @@ impl App {
                 total: PROGRESS_SEGMENTS,
                 completed: 0,
             });
+            // A body still arriving for the mailbox we are leaving is of no use.
+            account.message_loader = None;
             account.message_view = None;
             account.search = None;
             account.current_mailbox = target;
@@ -1787,8 +1866,10 @@ impl App {
     pub fn poll_backend_events(&mut self) {
         self.check_read_timer();
         self.poll_mailbox_loader();
+        self.poll_message_loader();
         self.poll_commit_updates();
         self.poll_save_attachment_operation();
+        self.poll_outgoing_operation();
 
         let mut refresh = false;
         let current_id = self
@@ -2444,11 +2525,29 @@ impl App {
             Some(_) => "Edit Draft",
             None => "Compose",
         };
+        // Do not advertise keys that are locked out while the backend has the message.
+        if let Some((operation, _)) = self.pending_outgoing() {
+            return format!("{label} - {operation}...");
+        }
         format!("{label} - Tab:Next Shift+Tab:Prev Esc:Cancel Enter:Activate")
     }
 
     pub(crate) fn compose_status_line(&self) -> Option<&str> {
         self.compose.as_ref().and_then(|state| state.status())
+    }
+
+    /// Label and elapsed time of the message body loading in the background.
+    pub(crate) fn pending_message_load(&self) -> Option<(&str, std::time::Duration)> {
+        self.message_loader
+            .as_ref()
+            .map(|op| (op.label.as_str(), op.started.elapsed()))
+    }
+
+    /// Label and elapsed time of the send or draft save in flight.
+    pub(crate) fn pending_outgoing(&self) -> Option<(&str, std::time::Duration)> {
+        self.outgoing
+            .as_ref()
+            .map(|op| (op.kind.label(), op.started.elapsed()))
     }
 
     fn open_search(&mut self) {
@@ -2751,9 +2850,23 @@ impl App {
     }
 
     fn open_compose(&mut self) {
+        // A reply/forward/draft body still on its way would replace this blank
+        // message -- and anything typed into it -- the moment it lands.
+        self.cancel_compose_bound_load();
         self.compose = Some(ComposeState::new());
         self.message_view = None;
         self.mailbox.status_line = Some("Compose mode active.".to_string());
+    }
+
+    /// Drop a pending load whose result would open the compose view.
+    fn cancel_compose_bound_load(&mut self) {
+        if self
+            .message_loader
+            .as_ref()
+            .is_some_and(|op| op.purpose != MessageLoadPurpose::View)
+        {
+            self.current_account_mut().message_loader = None;
+        }
     }
 
     pub(crate) fn save_attachment_dialog(&self) -> Option<&SaveAttachmentDialog> {
@@ -3003,42 +3116,188 @@ impl App {
         }
     }
 
-    fn document_for_message(&mut self, message: &Message) -> Result<Document> {
-        if let Some(view) = self.message_view.as_ref()
-            && view.message_id == message.id
+    /// Start a background load of `message`'s body.
+    ///
+    /// Nothing here touches the network on the UI thread: the worker fetches the
+    /// body and, for compose-bound loads, the attachment bytes that backends
+    /// like JMAP only hand out as blob pointers.  [`Self::poll_message_loader`]
+    /// picks the result up on a later tick.
+    ///
+    /// Moving on to another message supersedes the request, but the worker
+    /// cannot be cancelled -- it runs to completion and its result is dropped
+    /// when the channel goes away.  Backends serialise their own I/O, so this
+    /// costs at most one redundant fetch.
+    fn begin_message_load(
+        &mut self,
+        message: Message,
+        purpose: MessageLoadPurpose,
+        mut cached: Option<MessageContent>,
+        cached_document: Option<Document>,
+    ) {
+        // Repeating the keystroke that started a load should not start a second.
+        if self
+            .message_loader
+            .as_ref()
+            .is_some_and(|op| op.message.id == message.id && op.purpose == purpose)
         {
-            if let Some(document) = &view.document {
-                return Ok(document.clone());
-            }
-            return Ok(document_from_message_content(&view.content));
+            return;
         }
 
-        let content = self
-            .backend
-            .load_message(message.id)
-            .with_context(|| format!("failed to load message {}", message.id))?;
-        Ok(document_from_message_content(&content))
+        let needs_attachments = purpose.needs_attachments();
+
+        // With the body already in hand and no attachment bytes to fetch there
+        // is nothing to wait for.  Replying to the message on screen is the
+        // common case and should not cost a tick of latency.
+        if !needs_attachments && let Some(content) = cached.take() {
+            self.deliver_loaded_message(
+                message,
+                purpose,
+                cached_document,
+                LoadedMessage {
+                    content,
+                    attachments: Vec::new(),
+                    unavailable: 0,
+                },
+            );
+            return;
+        }
+
+        let backend = Arc::clone(&self.backend);
+        let message_id = message.id;
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            let result = (|| -> Result<LoadedMessage, String> {
+                let content = match cached {
+                    Some(content) => content,
+                    None => backend
+                        .load_message(message_id)
+                        .map_err(|err| err.to_string())?,
+                };
+                let (attachments, unavailable) = if needs_attachments {
+                    restore_compose_attachments(backend.as_ref(), &content)
+                } else {
+                    (Vec::new(), 0)
+                };
+                Ok(LoadedMessage {
+                    content,
+                    attachments,
+                    unavailable,
+                })
+            })();
+            let _ = sender.send(result);
+        });
+
+        let label = message_load_label(purpose, &message);
+        self.current_account_mut().message_loader = Some(MessageLoadOperation {
+            message,
+            purpose,
+            cached_document,
+            receiver,
+            started: Instant::now(),
+            label,
+        });
+    }
+
+    fn poll_message_loader(&mut self) {
+        let result = {
+            let Some(op) = self.message_loader.as_ref() else {
+                return;
+            };
+            match op.receiver.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    Err("the loader thread exited unexpectedly".to_string())
+                }
+            }
+        };
+
+        let Some(op) = self.current_account_mut().message_loader.take() else {
+            return;
+        };
+        self.finish_message_load(op, result);
+    }
+
+    fn finish_message_load(
+        &mut self,
+        op: MessageLoadOperation,
+        result: Result<LoadedMessage, String>,
+    ) {
+        let loaded = match result {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                let text = format!("Failed to load message: {err}");
+                if let Some(view) = self.message_view.as_mut() {
+                    view.info_line = Some(text.clone());
+                }
+                self.mailbox.status_line = Some(text);
+                return;
+            }
+        };
+
+        self.deliver_loaded_message(op.message, op.purpose, op.cached_document, loaded);
+    }
+
+    /// Hand a loaded body to whatever asked for it.
+    fn deliver_loaded_message(
+        &mut self,
+        message: Message,
+        purpose: MessageLoadPurpose,
+        cached_document: Option<Document>,
+        loaded: LoadedMessage,
+    ) {
+        if purpose == MessageLoadPurpose::View {
+            self.show_loaded_message(message.id, loaded.content);
+            return;
+        }
+
+        let document =
+            cached_document.unwrap_or_else(|| document_from_message_content(&loaded.content));
+
+        match purpose {
+            MessageLoadPurpose::View => unreachable!("handled above"),
+            MessageLoadPurpose::Reply { reply_all } => {
+                self.show_reply_compose(&message, document, reply_all);
+            }
+            MessageLoadPurpose::Forward => {
+                self.show_forward_compose(&message, document, loaded);
+            }
+            MessageLoadPurpose::Draft => {
+                self.show_draft_compose(&message, document, loaded);
+            }
+        }
+    }
+
+    /// Start loading the selected message so compose can be seeded from it.
+    fn begin_compose_from_selected(&mut self, purpose: MessageLoadPurpose) {
+        let Some(message) = self.selected_loaded_message().cloned() else {
+            self.mailbox
+                .status_line
+                .get_or_insert_with(|| "Message is still loading.".to_string());
+            return;
+        };
+
+        // The open viewer already holds the body, so reuse it; only blob-backed
+        // attachments then still need the network.
+        let (cached, cached_document) = match self
+            .message_view
+            .as_ref()
+            .filter(|view| view.message_id == message.id)
+        {
+            Some(view) => (Some(view.content.clone()), view.document.clone()),
+            None => (None, None),
+        };
+
+        self.begin_message_load(message, purpose, cached, cached_document);
     }
 
     fn open_reply(&mut self, reply_all: bool) -> Result<()> {
-        let message = match self.selected_loaded_message() {
-            Some(message) => message.clone(),
-            None => {
-                self.mailbox
-                    .status_line
-                    .get_or_insert_with(|| "Message is still loading.".to_string());
-                return Ok(());
-            }
-        };
+        self.begin_compose_from_selected(MessageLoadPurpose::Reply { reply_all });
+        Ok(())
+    }
 
-        let document = match self.document_for_message(&message) {
-            Ok(doc) => doc,
-            Err(err) => {
-                self.mailbox.status_line = Some(format!("Failed to load message body: {err}"));
-                return Ok(());
-            }
-        };
-
+    fn show_reply_compose(&mut self, message: &Message, document: Document, reply_all: bool) {
         let mut compose = ComposeState::new();
         let subject = prefix_subject(&message.subject, "Re:");
         compose.set_field_text(ComposeField::Subject, subject);
@@ -3080,63 +3339,45 @@ impl App {
             format!("Replying to '{}'.", message.subject)
         };
         self.mailbox.status_line = Some(status);
-        Ok(())
     }
 
     fn open_forward(&mut self) -> Result<()> {
-        let message = match self.selected_loaded_message() {
-            Some(message) => message.clone(),
-            None => {
-                self.mailbox
-                    .status_line
-                    .get_or_insert_with(|| "Message is still loading.".to_string());
-                return Ok(());
-            }
-        };
+        self.begin_compose_from_selected(MessageLoadPurpose::Forward);
+        Ok(())
+    }
 
-        // Forwarding has to carry the original attachments, so the content is
-        // needed here and not just the rendered document. Take both from the
-        // open viewer when it holds this message -- loading again would re-fetch
-        // every attachment byte.
-        let cached = self
-            .message_view
-            .as_ref()
-            .filter(|view| view.message_id == message.id)
-            .map(|view| (view.content.clone(), view.document.clone()));
-
-        let (content, cached_document) = match cached {
-            Some((content, document)) => (content, document),
-            None => match self.backend.load_message(message.id) {
-                Ok(content) => (content, None),
-                Err(err) => {
-                    self.mailbox.status_line = Some(format!("Failed to load message body: {err}"));
-                    return Ok(());
-                }
-            },
-        };
-
-        let document = cached_document.unwrap_or_else(|| document_from_message_content(&content));
-        let (attachments, unavailable) = self.restore_compose_attachments(&content);
-
+    fn show_forward_compose(
+        &mut self,
+        message: &Message,
+        document: Document,
+        loaded: LoadedMessage,
+    ) {
         let mut compose = ComposeState::new();
         let subject = prefix_subject(&message.subject, "Fwd:");
         compose.set_field_text(ComposeField::Subject, subject);
-        compose.set_body(build_forward_document(&document, &message));
-        compose.set_attachments(attachments);
+        compose.set_body(build_forward_document(&document, message));
+        compose.set_attachments(loaded.attachments);
         compose.set_focus(ComposeFocus::Body);
 
         self.compose = Some(compose);
         self.message_view = None;
         self.mailbox.status_line = Some(draft_status_line(
             &format!("Forwarding '{}'.", message.subject),
-            unavailable,
+            loaded.unavailable,
         ));
-        Ok(())
     }
 
     fn handle_compose_key(&mut self, key: KeyEvent) -> Result<()> {
         if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
+            return Ok(());
+        }
+
+        // The backend already has this message: editing it now would change
+        // something in flight, and cancelling would throw away text that is
+        // still needed if the submission fails.  The progress line explains the
+        // wait; every other key is ignored until the worker reports back.
+        if self.outgoing.is_some() {
             return Ok(());
         }
 
@@ -3328,8 +3569,8 @@ impl App {
                 Ok(())
             }
             ComposeButton::Edit => self.edit_compose_body(),
-            ComposeButton::Draft => self.save_current_draft(),
-            ComposeButton::Send => self.send_current_compose(),
+            ComposeButton::Draft => self.submit_outgoing(OutgoingKind::Draft),
+            ComposeButton::Send => self.submit_outgoing(OutgoingKind::Send),
         }
     }
 
@@ -3459,6 +3700,11 @@ impl App {
     /// which pasted text reaches any field -- dropping it here means the paste
     /// silently disappears.
     pub(crate) fn handle_paste_text(&mut self, text: &str) -> Result<()> {
+        // Compose is locked while the backend has the message; see handle_compose_key.
+        if self.outgoing.is_some() {
+            return Ok(());
+        }
+
         if self.compose.is_some()
             && self.save_attachment.is_none()
             && let Some(paths) = dropped_file_paths(text)
@@ -3653,7 +3899,17 @@ impl App {
         }
     }
 
-    fn send_current_compose(&mut self) -> Result<()> {
+    /// Hand the composed message to the backend on a worker thread.
+    ///
+    /// Uploading a message with attachments can take minutes, which is why this
+    /// never calls into the backend directly: the UI keeps redrawing (and the
+    /// progress line keeps ticking) while the worker runs, and
+    /// [`Self::poll_outgoing_operation`] applies the outcome.
+    fn submit_outgoing(&mut self, kind: OutgoingKind) -> Result<()> {
+        if self.outgoing.is_some() {
+            return Ok(());
+        }
+
         let (draft_id, message) = match self.compose.as_ref() {
             Some(compose) => {
                 let draft_id = compose.draft_id();
@@ -3661,7 +3917,11 @@ impl App {
                     Ok(message) => (draft_id, message),
                     Err(err) => {
                         if let Some(compose) = self.compose.as_mut() {
-                            compose.set_status(format!("Failed to prepare message: {err}"));
+                            let what = match kind {
+                                OutgoingKind::Send => "message",
+                                OutgoingKind::Draft => "draft",
+                            };
+                            compose.set_status(format!("Failed to prepare {what}: {err}"));
                         }
                         return Ok(());
                     }
@@ -3670,65 +3930,84 @@ impl App {
             None => return Ok(()),
         };
 
-        if message.to.is_empty() && message.cc.is_empty() && message.bcc.is_empty() {
+        if kind == OutgoingKind::Send
+            && message.to.is_empty()
+            && message.cc.is_empty()
+            && message.bcc.is_empty()
+        {
             if let Some(compose) = self.compose.as_mut() {
                 compose.set_status("Add at least one recipient.");
             }
             return Ok(());
         }
 
-        match self.backend.send_message(message) {
-            Ok(()) => {
-                let mut status = "Message sent.".to_string();
-                if let Some(id) = draft_id {
-                    self.remove_message_from_mailbox(id);
-                    if let Err(err) = self.submit_actions(vec![Action::new(ActionType::Delete, id)])
-                    {
-                        status = format!("Message sent but failed to remove draft: {err}");
-                    }
-                }
-                self.compose = None;
-                self.mailbox.status_line = Some(status);
-            }
-            Err(err) => {
-                if let Some(compose) = self.compose.as_mut() {
-                    compose.set_status(format!("Failed to send: {err}"));
-                }
-            }
+        let backend = Arc::clone(&self.backend);
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            let result = match kind {
+                OutgoingKind::Send => backend.send_message(message),
+                OutgoingKind::Draft => backend.save_draft(message),
+            };
+            let _ = sender.send(result.map_err(|err| err.to_string()));
+        });
+
+        if let Some(compose) = self.compose.as_mut() {
+            compose.clear_status();
         }
+        self.outgoing = Some(OutgoingOperation {
+            kind,
+            draft_id,
+            receiver,
+            started: Instant::now(),
+        });
+
         Ok(())
     }
 
-    fn save_current_draft(&mut self) -> Result<()> {
-        let (draft_id, message) = match self.compose.as_ref() {
-            Some(compose) => {
-                let draft_id = compose.draft_id();
-                match compose.to_outgoing() {
-                    Ok(message) => (draft_id, message),
-                    Err(err) => {
-                        if let Some(compose) = self.compose.as_mut() {
-                            compose.set_status(format!("Failed to prepare draft: {err}"));
-                        }
-                        return Ok(());
-                    }
+    fn poll_outgoing_operation(&mut self) {
+        let result = {
+            let Some(op) = self.outgoing.as_ref() else {
+                return;
+            };
+            match op.receiver.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    Err("the worker thread exited unexpectedly".to_string())
                 }
             }
-            None => return Ok(()),
         };
 
-        match self.backend.save_draft(message) {
+        let Some(op) = self.outgoing.take() else {
+            return;
+        };
+        self.finish_outgoing(op, result);
+    }
+
+    fn finish_outgoing(&mut self, op: OutgoingOperation, result: Result<(), String>) {
+        match result {
             Ok(()) => {
-                let mut status = if draft_id.is_some() {
-                    "Draft updated.".to_string()
-                } else {
-                    "Draft saved.".to_string()
+                let mut status = match (op.kind, op.draft_id.is_some()) {
+                    (OutgoingKind::Send, _) => "Message sent.".to_string(),
+                    (OutgoingKind::Draft, true) => "Draft updated.".to_string(),
+                    (OutgoingKind::Draft, false) => "Draft saved.".to_string(),
                 };
 
-                if let Some(id) = draft_id {
+                // The stored copy this replaces is only safe to delete now that
+                // the backend has accepted the new one.
+                if let Some(id) = op.draft_id {
                     self.remove_message_from_mailbox(id);
                     if let Err(err) = self.submit_actions(vec![Action::new(ActionType::Delete, id)])
                     {
-                        status = format!("Draft saved but failed to remove previous copy: {err}");
+                        status = match op.kind {
+                            OutgoingKind::Send => {
+                                format!("Message sent but failed to remove draft: {err}")
+                            }
+                            OutgoingKind::Draft => {
+                                format!("Draft saved but failed to remove previous copy: {err}")
+                            }
+                        };
                     }
                 }
 
@@ -3736,12 +4015,17 @@ impl App {
                 self.mailbox.status_line = Some(status);
             }
             Err(err) => {
-                if let Some(compose) = self.compose.as_mut() {
-                    compose.set_status(format!("Failed to save draft: {err}"));
+                let text = match op.kind {
+                    OutgoingKind::Send => format!("Failed to send: {err}"),
+                    OutgoingKind::Draft => format!("Failed to save draft: {err}"),
+                };
+                // Keep the message: compose is still open for a retry.
+                match self.compose.as_mut() {
+                    Some(compose) => compose.set_status(text),
+                    None => self.mailbox.status_line = Some(text),
                 }
             }
         }
-        Ok(())
     }
 
     fn open_selected_entry(&mut self) -> Result<()> {
@@ -3752,9 +4036,8 @@ impl App {
     }
 
     fn try_open_selected_draft(&mut self) -> Result<bool> {
-        let idx = match self.mailbox.selected {
-            Some(idx) => idx,
-            None => return Ok(false),
+        let Some(idx) = self.real_selected_index() else {
+            return Ok(false);
         };
 
         let Some(message) = self.mailbox.messages.get(idx).cloned() else {
@@ -3765,13 +4048,11 @@ impl App {
             return Ok(false);
         }
 
-        let content = self
-            .backend
-            .load_message(message.id)
-            .with_context(|| format!("failed to load draft {}", message.id))?;
+        self.begin_message_load(message, MessageLoadPurpose::Draft, None, None);
+        Ok(true)
+    }
 
-        let body = document_from_message_content(&content);
-
+    fn show_draft_compose(&mut self, message: &Message, body: Document, loaded: LoadedMessage) {
         let mut compose = ComposeState::from_draft(
             message.id,
             message.recipients.join(", "),
@@ -3783,52 +4064,11 @@ impl App {
 
         // Without this the attachments are dropped on the floor and re-saving
         // the draft silently discards them.
-        let (attachments, unavailable) = self.restore_compose_attachments(&content);
-        compose.set_attachments(attachments);
+        compose.set_attachments(loaded.attachments);
 
         self.compose = Some(compose);
         self.message_view = None;
-        self.mailbox.status_line = Some(draft_status_line("Editing draft.", unavailable));
-        Ok(true)
-    }
-
-    /// Rebuild compose attachments from a stored message's MIME parts.
-    ///
-    /// Returns the attachments plus the number that could not be recovered.
-    /// Backends that hand out blob pointers instead of bytes (JMAP) are
-    /// downloaded here, synchronously -- same as the `load_message` call this
-    /// always follows.
-    fn restore_compose_attachments(
-        &self,
-        content: &MessageContent,
-    ) -> (Vec<OutgoingAttachment>, usize) {
-        let mut restored = Vec::new();
-        let mut unavailable = 0usize;
-
-        for (idx, attachment) in content.attachments.iter().enumerate() {
-            let data = match attachment.data.clone() {
-                Some(data) => Some(data),
-                None => match attachment.blob_id.as_deref() {
-                    Some(blob_id) => self.backend.fetch_attachment_blob(blob_id).ok(),
-                    None => None,
-                },
-            };
-
-            match data {
-                Some(data) => restored.push(OutgoingAttachment {
-                    filename: attachment
-                        .filename
-                        .clone()
-                        .filter(|name| !name.trim().is_empty())
-                        .unwrap_or_else(|| fallback_attachment_name(idx, &attachment.mime_type)),
-                    mime_type: attachment.mime_type.clone(),
-                    data,
-                }),
-                None => unavailable += 1,
-            }
-        }
-
-        (restored, unavailable)
+        self.mailbox.status_line = Some(draft_status_line("Editing draft.", loaded.unavailable));
     }
 
     fn is_draft_message(&self, message: &Message) -> bool {
@@ -4399,12 +4639,7 @@ impl App {
             return Ok(());
         }
 
-        let real_idx = match self.real_selected_index() {
-            Some(idx) => idx,
-            None => return Ok(()),
-        };
-
-        let mut message = match self.selected_loaded_message() {
+        let message = match self.selected_loaded_message() {
             Some(msg) => msg.clone(),
             None => {
                 self.mailbox
@@ -4414,15 +4649,32 @@ impl App {
             }
         };
 
-        let content = self
-            .backend
-            .load_message(message.id)
-            .with_context(|| format!("failed to load message {}", message.id))?;
+        self.begin_message_load(message, MessageLoadPurpose::View, None, None);
+        Ok(())
+    }
+
+    /// Install a body that finished loading in the message viewer.
+    ///
+    /// The mailbox may have moved on while the load ran, so the list entry is
+    /// looked up again by id rather than trusting the index we started with.
+    fn show_loaded_message(&mut self, message_id: MessageId, content: MessageContent) {
+        let found = self
+            .mailbox
+            .messages
+            .iter()
+            .enumerate()
+            .find(|(_, msg)| msg.id == message_id)
+            .map(|(idx, msg)| (idx, msg.clone()));
+
+        let Some((real_idx, mut message)) = found else {
+            self.mailbox.status_line = Some("Message is no longer in this mailbox.".to_string());
+            return;
+        };
 
         let has_attachments = !content.attachments.is_empty();
         if message.has_attachments != has_attachments {
             message.has_attachments = has_attachments;
-            if let Some(slot) = self.selected_loaded_message_mut() {
+            if let Some(slot) = self.mailbox.messages.get_mut(real_idx) {
                 slot.has_attachments = has_attachments;
             }
         }
@@ -4458,8 +4710,6 @@ impl App {
             info_line: None,
             read_at,
         });
-
-        Ok(())
     }
 
     fn open_adjacent_message(&mut self, offset: isize) -> Result<()> {
@@ -4643,6 +4893,71 @@ fn sanitize_filename(name: &str) -> String {
     } else {
         cleaned
     }
+}
+
+/// Rebuild compose attachments from a stored message's MIME parts.
+///
+/// Returns the attachments plus the number that could not be recovered.
+/// Backends that hand out blob pointers instead of bytes (JMAP) are downloaded
+/// here, one round trip per attachment, so this belongs on a worker thread --
+/// [`App::begin_message_load`] is the only caller outside tests.
+fn restore_compose_attachments(
+    backend: &dyn MailBackend,
+    content: &MessageContent,
+) -> (Vec<OutgoingAttachment>, usize) {
+    let mut restored = Vec::new();
+    let mut unavailable = 0usize;
+
+    for (idx, attachment) in content.attachments.iter().enumerate() {
+        let data = match attachment.data.clone() {
+            Some(data) => Some(data),
+            None => match attachment.blob_id.as_deref() {
+                Some(blob_id) => backend.fetch_attachment_blob(blob_id).ok(),
+                None => None,
+            },
+        };
+
+        match data {
+            Some(data) => restored.push(OutgoingAttachment {
+                filename: attachment
+                    .filename
+                    .clone()
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| fallback_attachment_name(idx, &attachment.mime_type)),
+                mime_type: attachment.mime_type.clone(),
+                data,
+            }),
+            None => unavailable += 1,
+        }
+    }
+
+    (restored, unavailable)
+}
+
+/// Progress-indicator text for a message load in flight.
+fn message_load_label(purpose: MessageLoadPurpose, message: &Message) -> String {
+    let subject = truncate_label(message.subject.trim(), 40);
+    match purpose {
+        MessageLoadPurpose::View => format!("Loading '{subject}'"),
+        MessageLoadPurpose::Reply { reply_all: false } => format!("Loading '{subject}' to reply"),
+        MessageLoadPurpose::Reply { reply_all: true } => {
+            format!("Loading '{subject}' to reply to all")
+        }
+        MessageLoadPurpose::Forward => format!("Loading '{subject}' to forward"),
+        MessageLoadPurpose::Draft => format!("Opening draft '{subject}'"),
+    }
+}
+
+fn truncate_label(value: &str, max_chars: usize) -> String {
+    if value.is_empty() {
+        return "(no subject)".to_string();
+    }
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut truncated: String = value.chars().take(max_chars.saturating_sub(1)).collect();
+    truncated.push('…');
+    truncated
 }
 
 /// Append a warning to `base` when attachments could not be carried over.
@@ -5128,6 +5443,7 @@ mod tests {
             commit_progress: None,
             mailbox_loader: None,
             mailbox_load_progress: None,
+            message_loader: None,
             scheduled_actions: vec![],
             current_mailbox: MailboxKind::Inbox,
             search: None,
@@ -5142,6 +5458,7 @@ mod tests {
             pending_shortcut: None,
             pending_navigation: None,
             save_attachment: None,
+            outgoing: None,
         }
     }
 
@@ -5866,7 +6183,7 @@ mod tests {
             )],
         };
 
-        let (restored, unavailable) = app.restore_compose_attachments(&content);
+        let (restored, unavailable) = restore_compose_attachments(app.backend.as_ref(), &content);
         assert_eq!(unavailable, 0);
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].filename, "report.pdf");
@@ -5887,7 +6204,7 @@ mod tests {
             ],
         };
 
-        let (restored, unavailable) = app.restore_compose_attachments(&content);
+        let (restored, unavailable) = restore_compose_attachments(app.backend.as_ref(), &content);
         assert_eq!(unavailable, 0);
         assert_eq!(restored.len(), 2);
         assert_eq!(restored[0].data, b"blob:b1");
@@ -5910,7 +6227,7 @@ mod tests {
             ],
         };
 
-        let (restored, unavailable) = app.restore_compose_attachments(&content);
+        let (restored, unavailable) = restore_compose_attachments(app.backend.as_ref(), &content);
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].filename, "ok.txt");
         assert_eq!(
@@ -5949,7 +6266,8 @@ mod tests {
             read_at: None,
         });
 
-        app.open_forward().expect("forward should open compose");
+        app.open_forward().expect("forward should start loading");
+        pump_until(&mut app, "compose to open", |app| app.compose.is_some());
 
         let compose = app.compose.as_ref().expect("compose should be open");
         assert_eq!(
@@ -5959,5 +6277,326 @@ mod tests {
         );
         assert_eq!(compose.attachments()[0].filename, "invoice.pdf");
         assert_eq!(compose.attachments()[0].data, b"%PDF-1.7");
+    }
+
+    // -- Keeping the UI thread free -------------------------------------------
+
+    /// Drive the event loop until `predicate` holds, then return.
+    ///
+    /// Panics rather than hanging when the background work never lands.
+    fn pump_until(app: &mut App, what: &str, mut predicate: impl FnMut(&App) -> bool) {
+        for _ in 0..400 {
+            app.poll_backend_events();
+            if predicate(app) {
+                return;
+            }
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// Backend whose calls block until the test releases them.
+    ///
+    /// Every method the UI must not wait on parks on `gate`, so a test can
+    /// observe the state the UI is left in *while* the backend is busy.
+    struct GatedBackend {
+        gate: Mutex<mpsc::Receiver<()>>,
+        loads: Mutex<usize>,
+        sent: Mutex<Vec<OutgoingMessage>>,
+        drafts: Mutex<Vec<OutgoingMessage>>,
+        fail: bool,
+    }
+
+    impl GatedBackend {
+        /// Returns the backend plus the handle that unblocks it.
+        fn new(fail: bool) -> (Arc<Self>, mpsc::Sender<()>) {
+            let (tx, rx) = mpsc::channel();
+            let backend = Arc::new(Self {
+                gate: Mutex::new(rx),
+                loads: Mutex::new(0),
+                sent: Mutex::new(Vec::new()),
+                drafts: Mutex::new(Vec::new()),
+                fail,
+            });
+            (backend, tx)
+        }
+
+        fn wait(&self) {
+            let _ = self.gate.lock().unwrap().recv();
+        }
+
+        fn result(&self) -> anyhow::Result<()> {
+            if self.fail {
+                anyhow::bail!("backend refused");
+            }
+            Ok(())
+        }
+    }
+
+    impl MailBackend for GatedBackend {
+        fn load_mailbox(
+            &self,
+            _mailbox: MailboxKind,
+        ) -> anyhow::Result<(MailboxSnapshot, mpsc::Receiver<BackendEvent>)> {
+            let (_tx, rx) = mpsc::channel();
+            Ok((
+                MailboxSnapshot {
+                    total: 0,
+                    messages: vec![],
+                },
+                rx,
+            ))
+        }
+
+        fn load_message(&self, _message_id: MessageId) -> anyhow::Result<MessageContent> {
+            *self.loads.lock().unwrap() += 1;
+            self.wait();
+            self.result()?;
+            Ok(MessageContent {
+                mailer: String::new(),
+                parts: vec![MessageContentPart {
+                    content_type: "text/plain".to_string(),
+                    content: b"loaded body".to_vec(),
+                }],
+                attachments: vec![],
+            })
+        }
+
+        fn apply_actions(
+            &self,
+            actions: Vec<Action>,
+        ) -> anyhow::Result<mpsc::Receiver<ActionStatus>> {
+            let (tx, rx) = mpsc::channel();
+            for action in actions {
+                let _ = tx.send(ActionStatus {
+                    action,
+                    result: Ok(()),
+                });
+            }
+            Ok(rx)
+        }
+
+        fn send_message(&self, message: OutgoingMessage) -> anyhow::Result<()> {
+            self.wait();
+            self.result()?;
+            self.sent.lock().unwrap().push(message);
+            Ok(())
+        }
+
+        fn save_draft(&self, message: OutgoingMessage) -> anyhow::Result<()> {
+            self.wait();
+            self.result()?;
+            self.drafts.lock().unwrap().push(message);
+            Ok(())
+        }
+    }
+
+    fn compose_with_recipient(app: &mut App) {
+        let mut compose = ComposeState::new();
+        compose.set_field_text(ComposeField::To, "someone@example.com");
+        compose.set_field_text(ComposeField::Subject, "Hello");
+        app.compose = Some(compose);
+    }
+
+    #[test]
+    fn sending_does_not_block_the_ui_thread() {
+        let (backend, release) = GatedBackend::new(false);
+        let mut app = test_app_with_backend(vec![], backend.clone());
+        compose_with_recipient(&mut app);
+
+        // Returns while the backend is still parked inside send_message.
+        app.submit_outgoing(OutgoingKind::Send).expect("submit");
+
+        assert!(
+            app.pending_outgoing().is_some(),
+            "the send must be reported as in flight"
+        );
+        assert!(
+            app.compose.is_some(),
+            "compose stays open until the backend confirms"
+        );
+        assert!(
+            app.compose_action_bar().contains("Sending message"),
+            "the header has to say what the wait is for, got {:?}",
+            app.compose_action_bar()
+        );
+
+        release.send(()).expect("release the backend");
+        pump_until(&mut app, "the send to finish", |app| app.compose.is_none());
+
+        assert_eq!(backend.sent.lock().unwrap().len(), 1);
+        assert_eq!(app.mailbox.status_line.as_deref(), Some("Message sent."));
+        assert!(app.pending_outgoing().is_none());
+    }
+
+    #[test]
+    fn keys_are_ignored_while_a_send_is_in_flight() {
+        let (backend, _release) = GatedBackend::new(false);
+        let mut app = test_app_with_backend(vec![], backend);
+        compose_with_recipient(&mut app);
+        app.submit_outgoing(OutgoingKind::Send).expect("submit");
+
+        app.handle_key(KeyEvent::from(KeyCode::Esc)).expect("esc");
+        app.handle_key(KeyEvent::from(KeyCode::Char('x')))
+            .expect("typing");
+        app.handle_paste_text("pasted").expect("paste");
+
+        let compose = app
+            .compose
+            .as_ref()
+            .expect("Esc must not discard a message the backend already has");
+        assert_eq!(
+            compose.field_data(ComposeField::Subject).0,
+            "Hello",
+            "the message must not change while it is being sent"
+        );
+    }
+
+    #[test]
+    fn a_failed_send_keeps_the_message_in_compose() {
+        let (backend, release) = GatedBackend::new(true);
+        let mut app = test_app_with_backend(vec![], backend);
+        compose_with_recipient(&mut app);
+        app.submit_outgoing(OutgoingKind::Send).expect("submit");
+        release.send(()).expect("release the backend");
+
+        pump_until(&mut app, "the failure to surface", |app| {
+            app.compose_status_line().is_some()
+        });
+
+        let compose = app.compose.as_ref().expect("compose must stay open");
+        assert_eq!(
+            compose.field_data(ComposeField::To).0,
+            "someone@example.com",
+            "a failed send must not lose the message"
+        );
+        assert!(
+            app.compose_status_line()
+                .is_some_and(|status| status.starts_with("Failed to send:")),
+            "got {:?}",
+            app.compose_status_line()
+        );
+        assert!(app.pending_outgoing().is_none(), "the operation is over");
+    }
+
+    #[test]
+    fn saving_a_draft_runs_in_the_background() {
+        let (backend, release) = GatedBackend::new(false);
+        let mut app = test_app_with_backend(vec![], backend.clone());
+        compose_with_recipient(&mut app);
+
+        app.submit_outgoing(OutgoingKind::Draft).expect("submit");
+        assert!(app.pending_outgoing().is_some());
+
+        release.send(()).expect("release the backend");
+        pump_until(&mut app, "the draft to be stored", |app| {
+            app.compose.is_none()
+        });
+
+        assert_eq!(backend.drafts.lock().unwrap().len(), 1);
+        assert_eq!(app.mailbox.status_line.as_deref(), Some("Draft saved."));
+    }
+
+    #[test]
+    fn opening_a_message_loads_it_in_the_background() {
+        let (backend, release) = GatedBackend::new(false);
+        let message = make_message(1, MessageStatus::New);
+        let mut app = test_app_with_backend(vec![message], backend);
+
+        app.handle_key(KeyEvent::from(KeyCode::Enter))
+            .expect("enter");
+
+        assert!(
+            app.message_view.is_none(),
+            "the viewer must not open before the body arrives"
+        );
+        let (label, _) = app
+            .pending_message_load()
+            .expect("the load must be reported as in flight");
+        assert!(label.contains("Subject 1"), "got {label:?}");
+
+        release.send(()).expect("release the backend");
+        pump_until(&mut app, "the body to arrive", |app| {
+            app.message_view.is_some()
+        });
+
+        let view = app.message_view.as_ref().expect("viewer open");
+        assert_eq!(view.message_id, 1);
+        assert!(app.pending_message_load().is_none());
+    }
+
+    #[test]
+    fn repeating_the_open_key_does_not_start_a_second_load() {
+        let (backend, release) = GatedBackend::new(false);
+        let message = make_message(1, MessageStatus::Read);
+        let mut app = test_app_with_backend(vec![message], backend.clone());
+
+        app.handle_key(KeyEvent::from(KeyCode::Enter))
+            .expect("enter");
+        // Wait for the worker to reach the backend, so a second fetch would show up.
+        for _ in 0..400 {
+            if *backend.loads.lock().unwrap() > 0 {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        app.handle_key(KeyEvent::from(KeyCode::Enter))
+            .expect("enter again");
+        thread::sleep(std::time::Duration::from_millis(50));
+
+        assert_eq!(
+            *backend.loads.lock().unwrap(),
+            1,
+            "a second keypress must not fetch the same body twice"
+        );
+
+        release.send(()).expect("release the backend");
+        pump_until(&mut app, "the body to arrive", |app| {
+            app.message_view.is_some()
+        });
+    }
+
+    #[test]
+    fn a_failed_load_reports_instead_of_aborting() {
+        let (backend, release) = GatedBackend::new(true);
+        let message = make_message(1, MessageStatus::Read);
+        let mut app = test_app_with_backend(vec![message], backend);
+
+        app.handle_key(KeyEvent::from(KeyCode::Enter))
+            .expect("enter");
+        release.send(()).expect("release the backend");
+
+        pump_until(&mut app, "the failure to surface", |app| {
+            app.mailbox.status_line.is_some()
+        });
+
+        assert!(
+            app.mailbox
+                .status_line
+                .as_deref()
+                .is_some_and(|status| status.starts_with("Failed to load message:")),
+            "got {:?}",
+            app.mailbox.status_line
+        );
+        assert!(app.message_view.is_none());
+    }
+
+    #[test]
+    fn forwarding_downloads_blobs_off_the_ui_thread() {
+        let (backend, release) = GatedBackend::new(false);
+        let message = make_message(1, MessageStatus::Read);
+        let mut app = test_app_with_backend(vec![message], backend);
+
+        app.open_forward().expect("forward should start loading");
+
+        assert!(
+            app.compose.is_none(),
+            "compose must wait for the attachments instead of freezing the UI"
+        );
+        assert!(app.pending_message_load().is_some());
+
+        release.send(()).expect("release the backend");
+        pump_until(&mut app, "compose to open", |app| app.compose.is_some());
     }
 }
