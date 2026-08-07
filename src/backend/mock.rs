@@ -28,6 +28,9 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 const INITIAL_MESSAGE_COUNT: usize = 250;
 const MAILER_NAME: &str = "MockMailer/tdoc-demo";
 const DEFAULT_SENDER: &str = "user@mock.example";
+/// The one part that is a file without being an attachment.
+const INLINE_TEMPLATE: (&str, &str) = ("signature-logo.png", "image/png");
+
 const ATTACHMENT_TEMPLATES: &[(&str, &str)] = &[
     ("proposal.pdf", "application/pdf"),
     ("diagram.png", "image/png"),
@@ -510,6 +513,9 @@ impl MockBackend {
                 size: attachment.size(),
                 data: Some(attachment.data.clone()),
                 blob_id: None,
+                // Everything compose attaches is attached outright; nothing
+                // here is referenced by the body.
+                inline: false,
             });
             content_state.parts.push(MessageContentPart {
                 content_type: attachment.mime_type.clone(),
@@ -641,9 +647,10 @@ impl MailBackend for MockBackend {
 }
 
 fn generate_mock_attachments(rng: &mut SimpleRng) -> Vec<MessageAttachment> {
+    let mut attachments = Vec::new();
+
     if rng.one_in(3) {
         let count = rng.gen_range_usize_inclusive(1, 3);
-        let mut attachments = Vec::with_capacity(count);
         for _ in 0..count {
             let (filename, mime_type) =
                 ATTACHMENT_TEMPLATES[rng.gen_range_usize(0..ATTACHMENT_TEMPLATES.len())];
@@ -657,12 +664,28 @@ fn generate_mock_attachments(rng: &mut SimpleRng) -> Vec<MessageAttachment> {
                 size: data.len(),
                 data: Some(data),
                 blob_id: None,
+                inline: false,
             });
         }
-        attachments
-    } else {
-        Vec::new()
     }
+
+    // The signature logo an HTML mail references as `cid:…`.  It earns the
+    // message no `@` in the list, but `S` still offers it -- which is the whole
+    // distinction, and worth having in the demo mailbox to look at.
+    if rng.one_in(3) {
+        let (filename, mime_type) = INLINE_TEMPLATE;
+        let data = mock_attachment_payload(filename, mime_type, mock_attachment_size(rng));
+        attachments.push(MessageAttachment {
+            filename: Some(filename.to_string()),
+            mime_type: mime_type.to_string(),
+            size: data.len(),
+            data: Some(data),
+            blob_id: None,
+            inline: true,
+        });
+    }
+
+    attachments
 }
 
 /// Sizes are deliberately modest -- every generated message is held in memory,
@@ -714,7 +737,9 @@ fn new_random_message(
 
     let attachments = generate_mock_attachments(rng);
     let attachments_bytes = attachments.iter().map(|att| att.size).sum::<usize>();
-    let has_attachments = !attachments.is_empty();
+    // An embedded image is part of how the message reads, so it does not earn
+    // the message a marker in the list -- see LeafPart::role.
+    let has_attachments = attachments.iter().any(|attachment| !attachment.inline);
     content.attachments = attachments;
 
     let size = rng.gen_range_usize(0..7_203_680) + 200 + attachments_bytes;

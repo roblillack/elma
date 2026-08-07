@@ -120,47 +120,72 @@ pub(crate) struct LeafPart<'a> {
     pub(crate) has_content_id: bool,
 }
 
+/// What a leaf part is to the reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PartRole {
+    /// Body text or markup: the viewer renders it, and there is nothing here to
+    /// save that the reader is not already looking at.
+    Body,
+    /// Content the body points at with `cid:…`, an embedded image being the
+    /// usual case. Part of how the message reads rather than something the
+    /// sender attached — but still a file, and still worth being able to keep.
+    Inline,
+    /// A file the sender attached.
+    Attachment,
+}
+
 impl LeafPart<'_> {
-    /// Whether this part should be offered to the user as an attachment.
+    /// What this part is, by the one rule every backend follows.
     ///
-    /// Every backend answers this the same way, and each one answers it twice:
-    /// once for the message list, from what the server says about a message it
-    /// has not fetched yet, and once for the opened message, from the parts it
-    /// actually got. If the two disagree the `@` marker in the list flips as
-    /// soon as the user opens the message, so the rule lives here rather than
-    /// being written out per backend.
-    pub(crate) fn is_attachment(&self) -> bool {
+    /// Each backend asks twice: once for the message list, from what the server
+    /// says about a message it has not fetched yet, and once for the opened
+    /// message, from the parts it actually got. If the two disagree the `@`
+    /// marker in the list flips as soon as the user opens the message, so the
+    /// rule lives here rather than being written out per backend.
+    pub(crate) fn role(&self) -> PartRole {
         // An explicit `attachment` disposition settles it, even for parts that
         // also carry a Content-ID.
         if self
             .disposition
             .is_some_and(|value| value.eq_ignore_ascii_case("attachment"))
         {
-            return true;
+            return PartRole::Attachment;
         }
 
         // A Content-ID on a part the sender did not mark as an attachment is
         // there for the body to reference as `cid:…` — the logo in an HTML
-        // mail, not something the reader wants in their Downloads folder.
-        // Whether the body *does* reference it cannot be checked from the
-        // message list, where there is no body yet, so the marker would flip
-        // on open; treating every such part as inline keeps both sides honest.
+        // mail. Whether the body *does* reference it cannot be checked from the
+        // message list, where there is no body yet, so anything that could be
+        // referenced counts as inline and the marker stays put on open.
         if self.has_content_id
             && self
                 .disposition
                 .is_none_or(|value| value.eq_ignore_ascii_case("inline"))
         {
-            return false;
+            return PartRole::Inline;
         }
 
         if self.has_filename {
-            return true;
+            return PartRole::Attachment;
         }
 
         // What is left is either body text or something the reader cannot see
         // any other way.
-        !(self.major_type.eq_ignore_ascii_case("multipart")
-            || self.major_type.eq_ignore_ascii_case("text"))
+        if self.major_type.eq_ignore_ascii_case("multipart")
+            || self.major_type.eq_ignore_ascii_case("text")
+        {
+            PartRole::Body
+        } else {
+            PartRole::Attachment
+        }
+    }
+
+    /// Whether this part earns the message an attachment marker in the list.
+    ///
+    /// Deliberately narrower than "is a file": a signature logo would otherwise
+    /// mark every newsletter as carrying an attachment.
+    pub(crate) fn is_attachment(&self) -> bool {
+        matches!(self.role(), PartRole::Attachment)
     }
 }
 
@@ -255,7 +280,7 @@ pub trait MailBackend: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::LeafPart;
+    use super::{LeafPart, PartRole};
 
     fn part(major_type: &str, has_filename: bool) -> LeafPart<'_> {
         LeafPart {
@@ -286,6 +311,22 @@ mod tests {
         // can render, so it has to be offered for download.
         assert!(part("application", false).is_attachment());
         assert!(part("image", false).is_attachment());
+    }
+
+    /// The three roles are distinct: body text has nothing to save, an embedded
+    /// image has, and only the third earns a marker.
+    #[test]
+    fn a_part_the_body_references_is_a_file_without_being_an_attachment() {
+        let referenced = LeafPart {
+            major_type: "image",
+            has_filename: true,
+            disposition: Some("inline"),
+            has_content_id: true,
+        };
+
+        assert_eq!(referenced.role(), PartRole::Inline);
+        assert_eq!(part("text", false).role(), PartRole::Body);
+        assert_eq!(part("application", true).role(), PartRole::Attachment);
     }
 
     #[test]

@@ -109,9 +109,11 @@ Message status is indicated by a four symbol character prefix in the message lis
    - `@`: Message has one or more attachments
 
    A part counts as an attachment when it is not body text and the message
-   body cannot display it itself: an image an HTML mail references as
-   `cid:…` — a signature logo, say — is part of the message rather than
-   something to save, unless the sender explicitly marked it as an attachment.
+   body cannot display it itself. An image an HTML mail references as `cid:…`
+   — a signature logo, say — is part of how the message reads rather than
+   something the sender attached, so it earns no marker unless the sender said
+   otherwise. It is still a file: the save dialog lists it as `inline`, so an
+   embedded photo can be kept like any other (see [Attachments](#attachments)).
 
    Before a message is opened the marker comes from what the server reports
    about its structure (the IMAP `BODYSTRUCTURE`, JMAP's `hasAttachment`).
@@ -154,7 +156,9 @@ type and size.
 
 **Saving.** `S` in the message viewer opens the *Save attachment* dialog.
 `Tab` switches between the attachment list and the target folder, `Up`/`Down`
-pick an attachment, and `Enter` writes it. The folder defaults to
+pick an attachment, and `Enter` writes it. Images the body embeds are listed
+too, marked `inline` — the message list ignores them, but a photo sent that way
+(Apple Mail does this routinely) is still a file you can keep. The folder defaults to
 `$XDG_DOWNLOAD_DIR` (falling back to `~/Downloads`), `~` is expanded, and an
 existing file is never overwritten — Elma appends ` (1)`, ` (2)`, … instead.
 Backends that hand out attachment bodies on demand (JMAP) download in the
@@ -181,5 +185,7 @@ provider measures against its limit (25 MB for Gmail).
 Forwarding a message or reopening a draft keeps the original attachments;
 anything that cannot be recovered is reported in the status line rather than
 silently dropped. Replying does not — a reply carries the quoted text, not the
-files that came with it.
+files that came with it. Inline images stay behind on a forward as well: the
+quoted body no longer references them, so carrying them over would attach a
+signature logo to every forwarded newsletter.
 

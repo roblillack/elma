@@ -161,6 +161,12 @@ pub struct MessageAttachment {
     pub data: Option<Vec<u8>>,
     /// Opaque backend identifier for fetching the attachment body later.
     pub blob_id: Option<String>,
+    /// Whether the body displays this part itself, referencing it as `cid:…`.
+    ///
+    /// An embedded image is part of how the message reads, so it earns no
+    /// attachment marker in the list and is not carried into a forward — but it
+    /// is still a file, and the save dialog offers it like any other.
+    pub inline: bool,
 }
 
 #[derive(Clone, Debug)]

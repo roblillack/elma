@@ -3339,7 +3339,7 @@ impl App {
         cached_document: Option<Document>,
         loaded: LoadedMessage,
     ) {
-        self.sync_attachment_indicator(message.id, !loaded.content.attachments.is_empty());
+        self.sync_attachment_indicator(message.id, marks_as_having_attachments(&loaded.content));
 
         if purpose == MessageLoadPurpose::View {
             self.show_loaded_message(message.id, loaded.content);
@@ -4925,7 +4925,7 @@ impl App {
             return;
         };
 
-        let has_attachments = !content.attachments.is_empty();
+        let has_attachments = marks_as_having_attachments(&content);
         message.has_attachments = has_attachments;
         self.sync_attachment_indicator(message_id, has_attachments);
 
@@ -5114,6 +5114,20 @@ impl App {
     }
 }
 
+/// Whether a loaded body earns its message the `@` marker in the list.
+///
+/// Inline parts are listed among the attachments so the save dialog can offer
+/// them, but they are not what the marker means: an embedded signature logo
+/// would otherwise mark half the newsletters in a mailbox, and only from the
+/// moment each one was opened. Both places that correct the marker after a load
+/// ask here, so the two cannot drift apart.
+fn marks_as_having_attachments(content: &MessageContent) -> bool {
+    content
+        .attachments
+        .iter()
+        .any(|attachment| !attachment.inline)
+}
+
 /// What base64 turns `raw` bytes into: four characters per three bytes, plus
 /// the line break MIME requires every 76 characters.
 fn base64_size(raw: usize) -> usize {
@@ -5165,7 +5179,15 @@ fn restore_compose_attachments(
     let mut restored = Vec::new();
     let mut unavailable = 0usize;
 
-    for (idx, attachment) in content.attachments.iter().enumerate() {
+    // Inline parts stay behind. A forward quotes the body as text, so the
+    // `cid:` references that put them there are gone -- carrying them over
+    // would turn every signature logo into a file attached to the forward.
+    for (idx, attachment) in content
+        .attachments
+        .iter()
+        .filter(|attachment| !attachment.inline)
+        .enumerate()
+    {
         let data = match attachment.data.clone() {
             Some(data) => Some(data),
             None => match attachment.blob_id.as_deref() {
@@ -7008,6 +7030,15 @@ mod tests {
             size: data.map_or(0, |d| d.len()),
             data: data.map(<[u8]>::to_vec),
             blob_id: blob_id.map(str::to_string),
+            inline: false,
+        }
+    }
+
+    /// The same, but a part the body references as `cid:…`.
+    fn inline_attachment(filename: &str, data: &[u8]) -> MessageAttachment {
+        MessageAttachment {
+            inline: true,
+            ..attachment(Some(filename), "image/png", Some(data), None)
         }
     }
 
@@ -7075,6 +7106,80 @@ mod tests {
         assert_eq!(
             unavailable, 2,
             "attachments that cannot be recovered must be counted, not dropped silently"
+        );
+    }
+
+    /// An embedded image is a file, but it is not something the sender
+    /// attached: a forward quotes the body as text, so carrying the logo over
+    /// would attach it to a message that no longer references it.
+    #[test]
+    fn restore_compose_attachments_leaves_inline_parts_behind() {
+        let app = test_app(vec![]);
+        let content = MessageContent {
+            mailer: String::new(),
+            parts: vec![],
+            attachments: vec![
+                inline_attachment("signature-logo.png", b"PNG"),
+                attachment(Some("report.pdf"), "application/pdf", Some(b"%PDF"), None),
+            ],
+        };
+
+        let (restored, unavailable) = restore_compose_attachments(app.backend.as_ref(), &content);
+        assert_eq!(unavailable, 0, "a part left out on purpose is not a loss");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].filename, "report.pdf");
+    }
+
+    /// The save dialog is the one place inline parts are offered, so the guard
+    /// that refuses to open it has to count them.
+    #[test]
+    fn a_message_with_only_an_inline_image_can_still_be_saved_from() {
+        let message = make_message(1, MessageStatus::Read);
+        let mut app = test_app(vec![message]);
+        app.show_loaded_message(
+            1,
+            MessageContent {
+                mailer: String::new(),
+                parts: vec![],
+                attachments: vec![inline_attachment("signature-logo.png", b"PNG")],
+            },
+        );
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('S')))
+            .expect("open the save dialog");
+
+        assert!(
+            app.save_attachment.is_some(),
+            "an embedded image is still a file the reader can keep"
+        );
+        assert_eq!(app.save_attachment_attachments().len(), 1);
+    }
+
+    /// The whole point of the flag: listed for saving, ignored by the marker.
+    #[test]
+    fn opening_a_message_with_an_inline_image_leaves_the_marker_alone() {
+        let message = make_message(1, MessageStatus::Read);
+        let mut app = test_app(vec![message.clone()]);
+        assert!(!app.mailbox.messages[0].has_attachments);
+
+        app.deliver_loaded_message(
+            message,
+            MessageLoadPurpose::View,
+            None,
+            LoadedMessage {
+                content: MessageContent {
+                    mailer: String::new(),
+                    parts: vec![],
+                    attachments: vec![inline_attachment("signature-logo.png", b"PNG")],
+                },
+                attachments: Vec::new(),
+                unavailable: 0,
+            },
+        );
+
+        assert!(
+            !app.mailbox.messages[0].has_attachments,
+            "an `@` must not appear on a newsletter just because it was opened"
         );
     }
 

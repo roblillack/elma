@@ -7,7 +7,7 @@
 use crate::{
     backend::{
         ActionStatus, BackendEvent, LeafPart, MailBackend, MailboxSnapshot, OutgoingMessage,
-        build_compose_body,
+        PartRole, build_compose_body,
     },
     model::{
         Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
@@ -1969,20 +1969,23 @@ fn collect_parts(
             _ => None,
         };
         let content_id = mail.headers.get_first_value("Content-ID");
-        let is_attachment = LeafPart {
+        let role = LeafPart {
             major_type: mail.ctype.mimetype.split('/').next().unwrap_or_default(),
             has_filename: filename.is_some(),
             disposition: disposition_name,
             has_content_id: content_id.is_some_and(|id| !id.trim().is_empty()),
         }
-        .is_attachment();
-        if is_attachment {
+        .role();
+        // Inline parts are listed too: they earn no marker in the message list,
+        // but an embedded photo is still a file the reader may want to keep.
+        if role != PartRole::Body {
             attachments.push(MessageAttachment {
                 filename,
                 mime_type: content_type.clone(),
                 size: data.len(),
                 data: Some(data.clone()),
                 blob_id: None,
+                inline: role == PartRole::Inline,
             });
         }
         parts.push(MessageContentPart {
@@ -2332,7 +2335,7 @@ mod tests {
     }
 
     #[test]
-    fn a_logo_the_html_body_references_is_not_an_attachment() {
+    fn a_logo_the_html_body_references_is_savable_but_earns_no_marker() {
         // The signature logo of an HTML mail: `multipart/related` with a
         // Content-ID the body points at as `cid:…`.  Marking it as an
         // attachment would put an `@` on half the newsletters in the mailbox.
@@ -2368,13 +2371,20 @@ mod tests {
         let parsed = mailparse::parse_mail(raw.as_bytes()).expect("parsing the fixture");
         let content = build_message_content(&parsed).expect("building content");
 
+        // Listed, so the save dialog can offer it -- but flagged, so nothing
+        // reads it as the message carrying an attachment.
+        assert_eq!(content.attachments.len(), 1, "{:?}", content.attachments);
+        let logo = &content.attachments[0];
+        assert_eq!(logo.filename.as_deref(), Some("logo.png"));
         assert!(
-            content.attachments.is_empty(),
-            "the opened message has to agree with the list, got {:?}",
-            content.attachments
+            logo.inline,
+            "the opened message has to agree with the list about the marker"
         );
-        // The bytes are still there as a message part, they are just not
-        // offered as something to save.
+        assert_eq!(
+            logo.data.as_deref(),
+            Some(&b"PNG"[..]),
+            "the bytes have to come with it, or there is nothing to save"
+        );
         assert!(content.part("image/png").is_some());
     }
 

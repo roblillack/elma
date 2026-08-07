@@ -1509,9 +1509,11 @@ fn render_save_attachment_dialog(
                     .filter(|n| !n.is_empty())
                     .unwrap_or("(unnamed attachment)");
                 let text = format!(
-                    "{marker}{name}  ({mime}, {size})",
+                    "{marker}{name}  ({mime}, {size}{inline})",
                     mime = attachment.mime_type,
-                    size = format_size(attachment.size).trim()
+                    size = format_size(attachment.size).trim(),
+                    // Saying so explains why the message carries no `@`.
+                    inline = if attachment.inline { ", inline" } else { "" }
                 );
                 frame.render_widget(
                     Paragraph::new(Line::from(Span::styled(text, row_style))).style(POPUP_STYLE),
@@ -1575,9 +1577,10 @@ fn render_message_body(frame: &mut Frame<'_>, view: &MessageViewState, area: Rec
                 .unwrap_or("(unnamed attachment)");
             let size_display = format_size(attachment.size);
             let size_display = size_display.trim().to_string();
+            let inline = if attachment.inline { ", inline" } else { "" };
             lines.push(Line::raw(format!(
-                "- {} ({}, {})",
-                display_name, attachment.mime_type, size_display
+                "- {} ({}, {}{})",
+                display_name, attachment.mime_type, size_display, inline
             )));
         }
     }
