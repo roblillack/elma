@@ -171,7 +171,8 @@ removes. Sending and saving a draft run in the background, so a large upload
 does not freeze the UI; compose stays open and read-only until the backend has
 accepted the message.
 
-Replying to, forwarding, or reopening a draft keeps the original attachments.
-Anything that cannot be recovered is reported in the status line rather than
-silently dropped.
+Forwarding a message or reopening a draft keeps the original attachments;
+anything that cannot be recovered is reported in the status line rather than
+silently dropped. Replying does not — a reply carries the quoted text, not the
+files that came with it.
 
