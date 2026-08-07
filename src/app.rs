@@ -13,16 +13,19 @@ use crate::model::{
     MessageContentPart, MessageId, MessageStatus, format_size, padded_sender,
 };
 use anyhow::{Context, Result, anyhow};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::{
+    event::{DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyModifiers},
+    execute,
+};
 use shell_words::split as shell_split;
 use std::{
     cmp::{max, min},
     collections::VecDeque,
     env, fs,
-    io::{Cursor, Write},
+    io::{self, Cursor, Write},
     ops::{Deref, DerefMut},
     path::PathBuf,
-    process::Command,
+    process::{Command, ExitStatus},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -3825,16 +3828,17 @@ impl App {
 
         let temp_path: PathBuf = temp_file.path().to_path_buf();
 
-        let editor_status = if let Some((program, args)) = argv.split_first() {
-            let mut command = Command::new(program);
-            if !args.is_empty() {
+        let mut command = match argv.split_first() {
+            Some((program, args)) => {
+                let mut command = Command::new(program);
                 command.args(args);
+                command
             }
-            command.arg(&temp_path);
-            command.status()
-        } else {
-            Command::new("vi").arg(&temp_path).status()
+            None => Command::new("vi"),
         };
+        command.arg(&temp_path);
+
+        let editor_status = run_editor_command(&mut io::stdout(), &mut command);
 
         let status = match editor_status {
             Ok(status) => status,
@@ -4873,6 +4877,34 @@ impl App {
             }
         }
     }
+}
+
+/// Run the editor with the terminal handed over to it, then take back the modes
+/// the app relies on.
+///
+/// Bracketed paste is a terminal mode rather than a termios flag, so neither the
+/// child nor a raw-mode restore brings it back: vim, neovim and emacs all emit
+/// the disable sequence when they exit, whether or not they turned it on
+/// themselves.  Without re-issuing it here the app would never see another
+/// [`Event::Paste`](crossterm::event::Event::Paste) -- and
+/// [`App::handle_paste_text`] is the only route by which a terminal file drop
+/// becomes an attachment, so dropping a file would stop attaching anything the
+/// first time a user edited a message body.
+///
+/// The restore has to happen on every path out, including a child that exits
+/// non-zero and an editor that never launches at all.
+fn run_editor_command<W: Write>(terminal: &mut W, command: &mut Command) -> io::Result<ExitStatus> {
+    // Whoever reads the terminal owns the mode; while the editor has it, ours
+    // is not just unused but actively in the way.
+    let _ = execute!(terminal, DisableBracketedPaste);
+
+    let status = command.status();
+
+    // Nothing useful is left to do if this fails -- the terminal it writes to
+    // is the one the app is about to keep drawing on regardless.
+    let _ = execute!(terminal, EnableBracketedPaste);
+
+    status
 }
 
 fn default_download_dir() -> PathBuf {
@@ -6428,6 +6460,57 @@ mod tests {
             compose.field_data(ComposeField::To).0,
             "",
             "a drop must not also type the path into the focused field"
+        );
+    }
+
+    // -- Handing the terminal to the editor and getting it back ---------------
+
+    // Both tests are Unix-only because crossterm may drive a Windows console
+    // through the API instead of writing escape sequences, leaving the sink
+    // these assert on empty.  The behaviour under test is the same on both.
+
+    const DISABLE_PASTE: &str = "\u{1b}[?2004l";
+    const ENABLE_PASTE: &str = "\u{1b}[?2004h";
+
+    /// The drop-to-attach path above works only while bracketed paste is on,
+    /// and every editor worth the name turns it off on its way out.
+    #[cfg(unix)]
+    #[test]
+    fn the_editor_hands_bracketed_paste_back() {
+        let mut terminal = Vec::new();
+        let status = run_editor_command(&mut terminal, &mut Command::new("true")).expect("run");
+
+        assert!(status.success());
+        assert_eq!(
+            String::from_utf8(terminal).expect("utf-8"),
+            format!("{DISABLE_PASTE}{ENABLE_PASTE}"),
+            "the mode is released for the editor and taken back once it exits"
+        );
+
+        // An editor the user quit without saving exits non-zero -- but it still
+        // had the terminal, so the restore is just as necessary.
+        let mut terminal = Vec::new();
+        let status = run_editor_command(&mut terminal, &mut Command::new("false")).expect("run");
+
+        assert!(!status.success());
+        assert_eq!(
+            String::from_utf8(terminal).expect("utf-8"),
+            format!("{DISABLE_PASTE}{ENABLE_PASTE}")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bracketed_paste_survives_an_editor_that_never_launches() {
+        let mut terminal = Vec::new();
+        let result = run_editor_command(&mut terminal, &mut Command::new("elma-no-such-editor"));
+
+        assert!(result.is_err(), "a missing editor has to be reported");
+        assert!(
+            String::from_utf8(terminal)
+                .expect("utf-8")
+                .ends_with(ENABLE_PASTE),
+            "the early return out of edit_compose_body still leaves paste working"
         );
     }
 
