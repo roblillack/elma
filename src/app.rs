@@ -48,6 +48,14 @@ use time::{OffsetDateTime, format_description::well_known::Rfc2822};
 const PAGE_JUMP: isize = 5;
 const PROGRESS_SEGMENTS: usize = 5;
 
+/// A file this size or larger is worth asking about before it is attached.
+///
+/// Reading a file attaches its whole content to the message in memory, and
+/// providers reject what they consider too big only after the upload finishes
+/// -- Gmail's ceiling is 25 MB of *encoded* message.  Anything under this is
+/// small enough that asking would only be in the way.
+const LARGE_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
+
 /// Whether the progress indicator represents a read (loading) or write (committing) operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProgressMode {
@@ -547,6 +555,25 @@ struct TextFieldState {
     cursor: usize,
 }
 
+/// One attach request -- a path from the prompt, or a whole terminal drop --
+/// working its way into the message.
+///
+/// A drop can hold several files and any of them may be big enough to ask
+/// about, so the request cannot be finished in one go: it parks in `asking`
+/// until the user answers, and the tallies survive that wait so the closing
+/// summary can still say what the whole request did.
+#[derive(Default)]
+struct AttachBatch {
+    /// Paths not looked at yet.
+    queue: VecDeque<String>,
+    /// The oversized file waiting for a yes or no, with its size on disk.
+    asking: Option<(String, u64)>,
+    attached: usize,
+    /// Bytes attached so far, for the summary.
+    bytes: usize,
+    declined: usize,
+}
+
 pub(crate) struct ComposeState {
     to: TextFieldState,
     cc: TextFieldState,
@@ -555,7 +582,13 @@ pub(crate) struct ComposeState {
     attachments: Vec<OutgoingAttachment>,
     attachment_selected: usize,
     attachment_prompt: Option<TextFieldState>,
+    attach: AttachBatch,
     body: Document,
+    /// Serialized size of [`Self::body`], measured whenever it changes.
+    ///
+    /// Serializing renders the whole document, and the compose dialog redraws
+    /// on every tick, so the size cannot be computed where it is displayed.
+    body_bytes: usize,
     draft_id: Option<MessageId>,
     focus: ComposeFocus,
     status: Option<String>,
@@ -573,7 +606,9 @@ impl Default for ComposeState {
             attachments: Vec::new(),
             attachment_selected: 0,
             attachment_prompt: None,
+            attach: AttachBatch::default(),
             body: Document::new(),
+            body_bytes: 0,
             draft_id: None,
             focus: ComposeFocus::Field(ComposeField::To),
             status: None,
@@ -616,7 +651,7 @@ impl ComposeState {
         state.bcc.cursor = text_len(&state.bcc.value);
         state.subject.value = subject;
         state.subject.cursor = text_len(&state.subject.value);
-        state.body = body;
+        state.assign_body(body);
         state.body_scroll = 0;
         state.body_view_height = 0;
         state.focus = ComposeFocus::Body;
@@ -782,6 +817,40 @@ impl ComposeState {
         &self.attachments
     }
 
+    /// Rough size of the message as it will go on the wire.
+    ///
+    /// Attachments are base64-encoded when the MIME body is built, and the
+    /// encoded figure is the one a provider measures against its limit, so
+    /// showing what the files take on disk would understate the message by a
+    /// third.  Headers and MIME boundaries are left out: they are noise next to
+    /// anything worth watching the size of.
+    pub(crate) fn message_size(&self) -> usize {
+        let attachments: usize = self
+            .attachments
+            .iter()
+            .map(|attachment| base64_size(attachment.size()))
+            .sum();
+        self.body_bytes + attachments
+    }
+
+    /// The oversized file waiting for an answer: its name, its size on disk,
+    /// and what the message would weigh once it is in.
+    pub(crate) fn large_attachment_question(&self) -> Option<(String, usize, usize)> {
+        self.attach.asking.as_ref().map(|(path, size)| {
+            let size = *size as usize;
+            let expanded = expand_user_path(path);
+            let name = expanded
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
+            (name, size, self.message_size() + base64_size(size))
+        })
+    }
+
+    fn is_asking_about_large_attachment(&self) -> bool {
+        self.attach.asking.is_some()
+    }
+
     pub(crate) fn is_attachments_focused(&self) -> bool {
         matches!(self.focus, ComposeFocus::Attachments)
     }
@@ -884,9 +953,23 @@ impl ComposeState {
     }
 
     pub(crate) fn set_body(&mut self, document: Document) {
-        self.body = document;
+        self.assign_body(document);
         self.body_scroll = 0;
         self.body_view_height = 0;
+    }
+
+    /// Replace the body, keeping its measured size in step.
+    ///
+    /// The one place the document is assigned, so [`Self::body_bytes`] cannot
+    /// drift away from what it describes.  A body that fails to serialize
+    /// counts as nothing rather than aborting the edit -- the number is a
+    /// display aid, and [`Self::to_outgoing`] reports the real failure when the
+    /// message is actually sent.
+    fn assign_body(&mut self, document: Document) {
+        self.body = document;
+        let plain = self.serialize_body_plain().map_or(0, |text| text.len());
+        let html = self.serialize_body_html().map_or(0, |text| text.len());
+        self.body_bytes = plain + html;
     }
 
     pub(crate) fn set_field_text<S: Into<String>>(&mut self, field: ComposeField, value: S) {
@@ -907,7 +990,7 @@ impl ComposeState {
     pub(crate) fn update_body_from_markdown(&mut self, source: &str) -> Result<()> {
         let document = markdown::parse(Cursor::new(source))
             .map_err(|err| anyhow!("Failed to parse Markdown: {err}"))?;
-        self.body = document;
+        self.assign_body(document);
         self.body_scroll = 0;
         Ok(())
     }
@@ -3396,6 +3479,10 @@ impl App {
             return Ok(());
         };
 
+        if compose.is_asking_about_large_attachment() {
+            return self.handle_large_attachment_key(key);
+        }
+
         if compose.is_attachment_prompt_active() {
             return self.handle_attachment_prompt_key(key);
         }
@@ -3592,6 +3679,20 @@ impl App {
         }
     }
 
+    /// Answer the question about an oversized file.
+    ///
+    /// Nothing else in compose responds until it is answered: attaching reads
+    /// the whole file into the message, which is exactly the decision being
+    /// asked about.  Keys that mean neither yes nor no are ignored rather than
+    /// guessed at.
+    fn handle_large_attachment_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') => self.answer_large_attachment(true),
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => self.answer_large_attachment(false),
+            _ => Ok(()),
+        }
+    }
+
     fn handle_attachment_prompt_key(&mut self, key: KeyEvent) -> Result<()> {
         let Some(compose) = self.compose.as_mut() else {
             return Ok(());
@@ -3612,8 +3713,7 @@ impl App {
                     return Ok(());
                 }
                 compose.close_attachment_prompt();
-                self.attach_file_from_path(&path_text)?;
-                return Ok(());
+                return self.attach_paths(vec![path_text]);
             }
             KeyCode::Left => {
                 if let Some(state) = compose.attachment_prompt_mut() {
@@ -3668,6 +3768,100 @@ impl App {
         Ok(())
     }
 
+    /// Attach every path in `paths`, asking about the large ones on the way.
+    ///
+    /// The single entry point for attaching, whether the paths came from the
+    /// prompt or from a terminal drop.
+    fn attach_paths(&mut self, paths: Vec<String>) -> Result<()> {
+        if let Some(compose) = self.compose.as_mut() {
+            // Dropping onto the open prompt answers the question it was asking.
+            compose.close_attachment_prompt();
+            compose.attach = AttachBatch {
+                queue: paths.into(),
+                ..AttachBatch::default()
+            };
+        }
+        self.drain_attach_queue()
+    }
+
+    /// Attach queued files until one needs the user's say-so, or the batch ends.
+    fn drain_attach_queue(&mut self) -> Result<()> {
+        while let Some(path) = self
+            .compose
+            .as_mut()
+            .and_then(|compose| compose.attach.queue.pop_front())
+        {
+            // A file that cannot be measured is left to the read below, which
+            // reports why in the status line instead of guessing here.
+            let size = fs::metadata(expand_user_path(&path)).map_or(0, |meta| meta.len());
+            if size >= LARGE_ATTACHMENT_BYTES {
+                if let Some(compose) = self.compose.as_mut() {
+                    compose.attach.asking = Some((path, size));
+                }
+                return Ok(());
+            }
+
+            self.attach_file_from_path(&path)?;
+        }
+
+        self.finish_attach_batch();
+        Ok(())
+    }
+
+    /// Take the answer to the question [`Self::drain_attach_queue`] parked on,
+    /// then carry on with the rest of the batch.
+    fn answer_large_attachment(&mut self, attach: bool) -> Result<()> {
+        let Some((path, size)) = self
+            .compose
+            .as_mut()
+            .and_then(|compose| compose.attach.asking.take())
+        else {
+            return Ok(());
+        };
+
+        if attach {
+            self.attach_file_from_path(&path)?;
+        } else if let Some(compose) = self.compose.as_mut() {
+            let name = expand_user_path(&path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or(path);
+            compose.attach.declined += 1;
+            compose.set_status(format!(
+                "Skipped '{name}' ({}).",
+                format_size(size as usize).trim()
+            ));
+        }
+
+        self.drain_attach_queue()
+    }
+
+    /// Report what a batch did, once nothing is left to ask about.
+    ///
+    /// A batch that handled a single file has already said so in its own words,
+    /// naming the file; only a drop of several needs summarising.
+    fn finish_attach_batch(&mut self) {
+        let Some(compose) = self.compose.as_mut() else {
+            return;
+        };
+        let batch = std::mem::take(&mut compose.attach);
+        if batch.attached + batch.declined < 2 {
+            return;
+        }
+
+        let mut status = match batch.attached {
+            0 => String::new(),
+            n => format!("Attached {n} files ({}).", format_size(batch.bytes).trim()),
+        };
+        if batch.declined > 0 {
+            if !status.is_empty() {
+                status.push(' ');
+            }
+            status.push_str(&format!("Skipped {}.", batch.declined));
+        }
+        compose.set_status(status);
+    }
+
     /// Read `path_text` and add it to the compose attachment list.
     ///
     /// Returns whether an attachment was added; failures are reported in the
@@ -3699,7 +3893,12 @@ impl App {
             data,
         };
         compose.add_attachment(attachment);
-        compose.set_status(format!("Attached '{filename}' ({}).", format_size(size)));
+        compose.attach.attached += 1;
+        compose.attach.bytes += size;
+        compose.set_status(format!(
+            "Attached '{filename}' ({}).",
+            format_size(size).trim()
+        ));
         Ok(true)
     }
 
@@ -3716,11 +3915,21 @@ impl App {
             return Ok(());
         }
 
+        // A question about an oversized file owns the compose view until it is
+        // answered; a paste arriving now has nowhere to go.
+        if self
+            .compose
+            .as_ref()
+            .is_some_and(|compose| compose.is_asking_about_large_attachment())
+        {
+            return Ok(());
+        }
+
         if self.compose.is_some()
             && self.save_attachment.is_none()
             && let Some(paths) = dropped_file_paths(text)
         {
-            return self.attach_dropped_files(&paths);
+            return self.attach_paths(paths);
         }
 
         if let Some(dialog) = self.save_attachment.as_mut() {
@@ -3760,37 +3969,6 @@ impl App {
                 search.input.insert_str(text);
             }
             self.recompute_search_filter();
-        }
-
-        Ok(())
-    }
-
-    /// Attach every path from a terminal drop, summarising multi-file drops.
-    fn attach_dropped_files(&mut self, paths: &[String]) -> Result<()> {
-        // Dropping onto the open prompt answers the question it was asking.
-        if let Some(compose) = self.compose.as_mut() {
-            compose.close_attachment_prompt();
-        }
-
-        let mut attached = 0usize;
-        let mut total = 0usize;
-        for path in paths {
-            if self.attach_file_from_path(path)? {
-                attached += 1;
-                if let Some(compose) = self.compose.as_ref() {
-                    total += compose.attachments().last().map_or(0, |att| att.size());
-                }
-            }
-        }
-
-        // A single file already reported itself with its own name and size.
-        if attached > 1
-            && let Some(compose) = self.compose.as_mut()
-        {
-            compose.set_status(format!(
-                "Attached {attached} files ({}).",
-                format_size(total).trim()
-            ));
         }
 
         Ok(())
@@ -4934,6 +5112,13 @@ impl App {
             }
         }
     }
+}
+
+/// What base64 turns `raw` bytes into: four characters per three bytes, plus
+/// the line break MIME requires every 76 characters.
+fn base64_size(raw: usize) -> usize {
+    let encoded = raw.div_ceil(3) * 4;
+    encoded + encoded.div_ceil(76) * 2
 }
 
 fn default_download_dir() -> PathBuf {
@@ -6491,6 +6676,179 @@ mod tests {
             "",
             "a drop must not also type the path into the focused field"
         );
+    }
+
+    // -- Asking before attaching something big --------------------------------
+
+    /// A file over the threshold, made sparse: the guard reads the length from
+    /// the filesystem, so there is no reason to write ten megabytes to test it.
+    fn oversized_file() -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        file.as_file()
+            .set_len(LARGE_ATTACHMENT_BYTES + 1)
+            .expect("grow file");
+        file
+    }
+
+    fn drop_file(app: &mut App, file: &tempfile::NamedTempFile) {
+        let path = file.path().to_string_lossy().into_owned();
+        app.handle_paste_text(&path).expect("drop");
+    }
+
+    #[test]
+    fn a_large_file_is_not_read_until_the_user_approves_it() {
+        let file = oversized_file();
+        let mut app = test_app(vec![]);
+        app.open_compose();
+
+        drop_file(&mut app, &file);
+
+        let compose = app.compose.as_ref().expect("compose open");
+        assert!(
+            compose.attachments().is_empty(),
+            "the file must not be in the message before the question is answered"
+        );
+        let (name, size, projected) = compose
+            .large_attachment_question()
+            .expect("the user has to be asked");
+        assert_eq!(name, file.path().file_name().unwrap().to_string_lossy());
+        assert_eq!(size as u64, LARGE_ATTACHMENT_BYTES + 1);
+        assert!(
+            projected > size,
+            "the projected message counts the base64 encoding, not the bytes on disk"
+        );
+    }
+
+    #[test]
+    fn approving_a_large_file_attaches_it() {
+        let file = oversized_file();
+        let mut app = test_app(vec![]);
+        app.open_compose();
+        drop_file(&mut app, &file);
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('y')))
+            .expect("approve");
+
+        let compose = app.compose.as_ref().expect("compose open");
+        assert_eq!(compose.attachments().len(), 1);
+        assert_eq!(
+            compose.attachments()[0].size() as u64,
+            LARGE_ATTACHMENT_BYTES + 1
+        );
+        assert!(compose.large_attachment_question().is_none());
+    }
+
+    #[test]
+    fn declining_a_large_file_leaves_the_message_alone() {
+        let file = oversized_file();
+        let mut app = test_app(vec![]);
+        app.open_compose();
+        drop_file(&mut app, &file);
+
+        app.handle_key(KeyEvent::from(KeyCode::Esc)).expect("skip");
+
+        let compose = app
+            .compose
+            .as_ref()
+            .expect("Esc answers the question, it does not cancel compose");
+        assert!(compose.attachments().is_empty());
+        assert!(compose.large_attachment_question().is_none());
+        assert!(
+            compose
+                .status()
+                .is_some_and(|line| line.starts_with("Skipped")),
+            "a file left out has to say so: {:?}",
+            compose.status()
+        );
+    }
+
+    /// The question interrupts a drop part-way through, so the files behind it
+    /// have to survive the wait and still be attached afterwards.
+    #[test]
+    fn a_drop_carries_on_after_the_question_is_answered() {
+        use std::io::Write as _;
+
+        let mut small = tempfile::NamedTempFile::new().expect("temp file");
+        small.write_all(b"first").expect("write");
+        let large = oversized_file();
+        let mut last = tempfile::NamedTempFile::new().expect("temp file");
+        last.write_all(b"third").expect("write");
+
+        let mut app = test_app(vec![]);
+        app.open_compose();
+        app.handle_paste_text(&format!(
+            "{}\n{}\n{}",
+            small.path().display(),
+            large.path().display(),
+            last.path().display()
+        ))
+        .expect("drop");
+
+        {
+            let compose = app.compose.as_ref().expect("compose open");
+            assert_eq!(
+                compose.attachments().len(),
+                1,
+                "the drop stops at the file it has to ask about"
+            );
+            assert!(compose.large_attachment_question().is_some());
+        }
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('n')))
+            .expect("skip the big one");
+
+        let compose = app.compose.as_ref().expect("compose open");
+        let names: Vec<&str> = compose
+            .attachments()
+            .iter()
+            .map(|attachment| attachment.filename.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                small.path().file_name().unwrap().to_str().unwrap(),
+                last.path().file_name().unwrap().to_str().unwrap()
+            ],
+            "the file behind the question still gets attached"
+        );
+        assert_eq!(
+            compose.status(),
+            Some("Attached 2 files (10B). Skipped 1."),
+            "the summary covers the whole drop, not just the part after the answer"
+        );
+    }
+
+    #[test]
+    fn the_message_size_counts_the_body_and_the_encoded_attachments() {
+        use std::io::Write as _;
+
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(&[0u8; 3000]).expect("write");
+
+        let mut app = test_app(vec![]);
+        app.open_compose();
+        let body_only = app.compose.as_ref().expect("compose").message_size();
+
+        drop_file(&mut app, &file);
+
+        let compose = app.compose.as_ref().expect("compose open");
+        assert_eq!(compose.message_size(), body_only + base64_size(3000));
+        assert!(
+            compose.message_size() > body_only + 3000,
+            "base64 costs a third on top of the bytes on disk"
+        );
+    }
+
+    #[test]
+    fn base64_size_counts_the_padding_and_the_line_breaks() {
+        assert_eq!(base64_size(0), 0);
+        // Three bytes are one full quantum: four characters, one line, one CRLF.
+        assert_eq!(base64_size(3), 4 + 2);
+        // One byte still costs a padded quantum.
+        assert_eq!(base64_size(1), 4 + 2);
+        // 57 bytes is exactly one 76-character line.
+        assert_eq!(base64_size(57), 76 + 2);
+        assert_eq!(base64_size(58), 80 + 4);
     }
 
     // -- Handing the terminal to the editor and getting it back ---------------

@@ -481,6 +481,16 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
         }
     }
 
+    if let Some((name, size, projected)) = app
+        .compose_state()
+        .and_then(|state| state.large_attachment_question())
+    {
+        render_large_attachment_prompt(frame, modal_area, &name, size, projected);
+        // The question owns the view until it is answered; nothing underneath
+        // it takes typing, so nothing underneath it shows a caret.
+        cursor_pos = None;
+    }
+
     if busy {
         cursor_pos = None;
     }
@@ -504,12 +514,20 @@ fn render_compose_attachments(frame: &mut Frame<'_>, area: Rect, state: &Compose
         .add_modifier(Modifier::BOLD);
     let muted = Style::default().fg(Color::DarkGray);
 
-    let header_text = format!(
-        "Attachments ({}):  [Del/Backspace to remove]",
-        attachments.len()
-    );
-    let header =
-        Paragraph::new(Line::from(vec![Span::styled(header_text, label_style)])).style(POPUP_STYLE);
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(format!("Attachments ({}):", attachments.len()), label_style),
+        // What the message weighs on the wire, which is what a provider's limit
+        // is measured against -- see ComposeState::message_size.
+        Span::styled(
+            format!(
+                "  message size {}",
+                format_size(state.message_size()).trim()
+            ),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled("  [Del/Backspace to remove]", muted),
+    ]))
+    .style(POPUP_STYLE);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)])
@@ -645,6 +663,81 @@ fn render_attachment_prompt(
     let max_x = inner.x + inner.width.saturating_sub(1);
     let cursor_x = (inner.x + label_width + cursor_col).min(max_x);
     Some((cursor_x, inner.y))
+}
+
+/// Ask whether a file large enough to matter should really be attached.
+///
+/// No text field, so nothing here claims the cursor: the dialog takes a yes or
+/// a no and hands compose straight back.
+fn render_large_attachment_prompt(
+    frame: &mut Frame<'_>,
+    modal_area: Rect,
+    name: &str,
+    size: usize,
+    projected: usize,
+) {
+    let min_width: u16 = 50;
+    let width = modal_area
+        .width
+        .saturating_sub(4)
+        .min(80)
+        .max(min_width.min(modal_area.width));
+    if width < 10 {
+        return;
+    }
+    let height: u16 = 4;
+    if modal_area.height < height + 2 {
+        return;
+    }
+
+    let x = modal_area.x + modal_area.width.saturating_sub(width) / 2;
+    let y = modal_area.y + modal_area.height.saturating_sub(height) / 2;
+    let area = Rect::new(x, y, width, height);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title_top(Line::styled(
+            " Large attachment ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(vec![
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw("/"),
+            Span::styled("y", Style::default().fg(Color::Yellow)),
+            Span::raw(": attach  "),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::raw("/"),
+            Span::styled("n", Style::default().fg(Color::Yellow)),
+            Span::raw(": skip"),
+        ]));
+    let inner = block.inner(area);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // The size leads the second line rather than trailing the name, so a long
+    // name being clipped cannot take the number with it.
+    let lines = vec![
+        Line::from(Span::styled(
+            name.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::raw(format!(
+            "{}. Attach anyway? Message would be {}.",
+            format_size(size).trim(),
+            format_size(projected).trim()
+        ))),
+    ];
+    frame.render_widget(Paragraph::new(lines).style(POPUP_STYLE), inner);
 }
 
 fn render_compose_field(
@@ -1712,5 +1805,61 @@ mod tests {
     #[test]
     fn text_field_view_handles_a_zero_width_field() {
         assert_eq!(text_field_view("anything", 4, 0), ("", 0));
+    }
+
+    #[test]
+    fn the_large_attachment_question_reaches_the_screen() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                super::render_large_attachment_prompt(
+                    frame,
+                    area,
+                    "holiday.mov",
+                    24_000_000,
+                    33_000_000,
+                );
+            })
+            .expect("draw");
+
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(screen.contains("holiday.mov"), "{screen}");
+        assert!(screen.contains("Large attachment"), "{screen}");
+        // Both sizes: what the file weighs and what it would do to the message.
+        assert!(screen.contains("24M"), "{screen}");
+        assert!(screen.contains("33M"), "{screen}");
+        assert!(screen.contains("attach"), "{screen}");
+    }
+
+    /// A terminal too short for the dialog must skip it, not panic.
+    #[test]
+    fn the_large_attachment_question_gives_up_on_a_tiny_screen() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        for (width, height) in [(60u16, 4u16), (8, 14), (1, 1)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    super::render_large_attachment_prompt(
+                        frame,
+                        area,
+                        "holiday.mov",
+                        24_000_000,
+                        33_000_000,
+                    );
+                })
+                .expect("draw");
+        }
     }
 }

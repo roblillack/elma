@@ -171,6 +171,13 @@ removes. Sending and saving a draft run in the background, so a large upload
 does not freeze the UI; compose stays open and read-only until the backend has
 accepted the message.
 
+A file of 10 MiB or more is not attached until you say so: Elma names it, says
+what it would do to the message, and takes `Enter`/`y` or `Esc`/`n`. The rest of
+a multi-file drop waits its turn and continues once the question is answered.
+The attachment list header carries the running message size — attachments are
+base64-encoded on the wire, so it counts the encoded figure, which is the one a
+provider measures against its limit (25 MB for Gmail).
+
 Forwarding a message or reopening a draft keeps the original attachments;
 anything that cannot be recovered is reported in the status line rather than
 silently dropped. Replying does not — a reply carries the quoted text, not the
