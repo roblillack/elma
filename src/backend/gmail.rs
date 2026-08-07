@@ -6,7 +6,7 @@
 
 use crate::{
     backend::{
-        ActionStatus, BackendEvent, MailBackend, MailboxSnapshot, OutgoingMessage,
+        ActionStatus, BackendEvent, LeafPart, MailBackend, MailboxSnapshot, OutgoingMessage,
         build_compose_body,
     },
     model::{
@@ -23,8 +23,8 @@ use async_imap::{
 use async_native_tls::connect as tls_connect;
 use futures::TryStreamExt;
 use imap_proto::types::{
-    AttributeValue, BodyContentCommon, BodyParams, BodyStructure, MailboxDatum, NameAttribute,
-    Response,
+    AttributeValue, BodyContentCommon, BodyContentSinglePart, BodyParams, BodyStructure,
+    MailboxDatum, NameAttribute, Response,
 };
 use lettre::{
     Message as LettreEmail, SmtpTransport, Transport, message::Mailbox as LettreMailbox,
@@ -1864,55 +1864,46 @@ fn build_message_from_fetch(fetch: &Fetch) -> Result<Option<StoredMessage>> {
     Ok(Some(StoredMessage { message, seq, uid }))
 }
 
+/// Whether the message described by this BODYSTRUCTURE carries an attachment.
+///
+/// This is what the message list marker is built from, long before the body
+/// itself is fetched; [`collect_parts`] has to reach the same verdict from the
+/// parsed message, which is why both go through [`LeafPart::is_attachment`].
 fn body_contains_attachment(structure: &BodyStructure<'_>) -> bool {
     match structure {
         BodyStructure::Multipart { bodies, .. } => bodies.iter().any(body_contains_attachment),
-        BodyStructure::Message { common, body, .. } => {
-            body_part_is_attachment(common) || body_contains_attachment(body)
-        }
-        BodyStructure::Text { common, .. } | BodyStructure::Basic { common, .. } => {
-            body_part_is_attachment(common)
+        BodyStructure::Message {
+            common,
+            other,
+            body,
+            ..
+        } => body_part_is_attachment(common, other) || body_contains_attachment(body),
+        BodyStructure::Text { common, other, .. } | BodyStructure::Basic { common, other, .. } => {
+            body_part_is_attachment(common, other)
         }
     }
 }
 
-/// Whether a leaf MIME part should be counted as an attachment.
-///
-/// Two places ask this and they have to give the same answer: the message
-/// list decides from the BODYSTRUCTURE before any body has been fetched, and
-/// `collect_parts` decides from the parsed MIME tree once the message is
-/// open. If they disagree the `@` marker flips as soon as the user opens the
-/// message.
-fn part_is_attachment(
-    major_type: &str,
-    has_filename: bool,
-    disposition_is_attachment: bool,
+fn body_part_is_attachment(
+    common: &BodyContentCommon<'_>,
+    other: &BodyContentSinglePart<'_>,
 ) -> bool {
-    if disposition_is_attachment || has_filename {
-        return true;
-    }
-
-    // Everything that is not body text is offered as an attachment — that is
-    // what makes inline images and `application/*` parts show up.
-    !(major_type.eq_ignore_ascii_case("multipart") || major_type.eq_ignore_ascii_case("text"))
-}
-
-fn body_part_is_attachment(common: &BodyContentCommon<'_>) -> bool {
-    let disposition_is_attachment = common
-        .disposition
-        .as_ref()
-        .is_some_and(|disposition| disposition.ty.as_ref().eq_ignore_ascii_case("attachment"));
-
     let has_filename = common.disposition.as_ref().is_some_and(|disposition| {
         body_params_contains(&disposition.params, "filename")
             || body_params_contains(&disposition.params, "name")
     }) || body_params_contains(&common.ty.params, "name");
 
-    part_is_attachment(
-        common.ty.ty.as_ref(),
+    LeafPart {
+        major_type: common.ty.ty.as_ref(),
         has_filename,
-        disposition_is_attachment,
-    )
+        disposition: common
+            .disposition
+            .as_ref()
+            .map(|disposition| disposition.ty.as_ref()),
+        // `other.id` is the part's Content-ID.
+        has_content_id: other.id.as_ref().is_some_and(|id| !id.trim().is_empty()),
+    }
+    .is_attachment()
 }
 
 fn body_params_contains(params: &BodyParams<'_>, name: &str) -> bool {
@@ -1972,12 +1963,19 @@ fn collect_parts(
             .or_else(|| disposition.params.get("name").cloned())
             .or_else(|| mail.ctype.params.get("name").cloned())
             .filter(|name| !name.trim().is_empty());
-        let major_type = mail.ctype.mimetype.split('/').next().unwrap_or_default();
-        let is_attachment = part_is_attachment(
-            major_type,
-            filename.is_some(),
-            matches!(disposition.disposition, DispositionType::Attachment),
-        );
+        let disposition_name = match disposition.disposition {
+            DispositionType::Attachment => Some("attachment"),
+            DispositionType::Inline => Some("inline"),
+            _ => None,
+        };
+        let content_id = mail.headers.get_first_value("Content-ID");
+        let is_attachment = LeafPart {
+            major_type: mail.ctype.mimetype.split('/').next().unwrap_or_default(),
+            has_filename: filename.is_some(),
+            disposition: disposition_name,
+            has_content_id: content_id.is_some_and(|id| !id.trim().is_empty()),
+        }
+        .is_attachment();
         if is_attachment {
             attachments.push(MessageAttachment {
                 filename,
@@ -2157,9 +2155,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use imap_proto::types::{
-        BodyContentSinglePart, ContentDisposition, ContentEncoding, ContentType,
-    };
+    use imap_proto::types::{ContentDisposition, ContentEncoding, ContentType};
     use std::borrow::Cow;
 
     fn make_message(id: u64, seq: u32) -> StoredMessage {
@@ -2231,6 +2227,7 @@ mod tests {
         mime_type: &str,
         ctype_params: &[(&str, &str)],
         disposition: Option<(&str, &[(&str, &str)])>,
+        content_id: Option<&str>,
     ) -> BodyStructure<'static> {
         let (ty, subtype) = mime_type.split_once('/').expect("major/minor type");
         let common = BodyContentCommon {
@@ -2247,7 +2244,7 @@ mod tests {
             location: None,
         };
         let other = BodyContentSinglePart {
-            id: None,
+            id: content_id.map(|id| Cow::from(id.to_string())),
             md5: None,
             description: None,
             transfer_encoding: ContentEncoding::SevenBit,
@@ -2293,36 +2290,92 @@ mod tests {
         assert!(!body_contains_attachment(&body_part(
             "text/plain",
             &[],
+            None,
             None
         )));
         assert!(!body_contains_attachment(&multipart(
             "alternative",
             vec![
-                body_part("text/plain", &[], None),
-                body_part("text/html", &[], None),
+                body_part("text/plain", &[], None, None),
+                body_part("text/html", &[], None, None),
             ]
         )));
 
-        // An attached PDF, and an inline logo: both are offered for download,
-        // so both light up the marker.
+        // An attached PDF lights up the marker.
         assert!(body_contains_attachment(&multipart(
             "mixed",
             vec![
-                body_part("text/plain", &[], None),
+                body_part("text/plain", &[], None, None),
                 body_part(
                     "application/pdf",
                     &[],
-                    Some(("attachment", &[("filename", "invoice.pdf")]))
+                    Some(("attachment", &[("filename", "invoice.pdf")])),
+                    None
                 ),
             ]
         )));
+
+        // An image with no Content-ID cannot be shown in the body, so it is
+        // offered for download however the sender labelled it.
         assert!(body_contains_attachment(&multipart(
             "related",
             vec![
-                body_part("text/html", &[], None),
-                body_part("image/png", &[("name", "logo.png")], Some(("inline", &[]))),
+                body_part("text/html", &[], None, None),
+                body_part(
+                    "image/png",
+                    &[("name", "logo.png")],
+                    Some(("inline", &[])),
+                    None
+                ),
             ]
         )));
+    }
+
+    #[test]
+    fn a_logo_the_html_body_references_is_not_an_attachment() {
+        // The signature logo of an HTML mail: `multipart/related` with a
+        // Content-ID the body points at as `cid:…`.  Marking it as an
+        // attachment would put an `@` on half the newsletters in the mailbox.
+        let structure = multipart(
+            "related",
+            vec![
+                body_part("text/html", &[], None, None),
+                body_part(
+                    "image/png",
+                    &[("name", "logo.png")],
+                    Some(("inline", &[("filename", "logo.png")])),
+                    Some("<logo@example.com>"),
+                ),
+            ],
+        );
+        assert!(!body_contains_attachment(&structure));
+
+        let raw = concat!(
+            "Content-Type: multipart/related; boundary=\"b\"\r\n",
+            "\r\n",
+            "--b\r\n",
+            "Content-Type: text/html\r\n",
+            "\r\n",
+            "<p>hi <img src=\"cid:logo@example.com\"></p>\r\n",
+            "--b\r\n",
+            "Content-Type: image/png; name=\"logo.png\"\r\n",
+            "Content-Disposition: inline; filename=\"logo.png\"\r\n",
+            "Content-ID: <logo@example.com>\r\n",
+            "\r\n",
+            "PNG\r\n",
+            "--b--\r\n",
+        );
+        let parsed = mailparse::parse_mail(raw.as_bytes()).expect("parsing the fixture");
+        let content = build_message_content(&parsed).expect("building content");
+
+        assert!(
+            content.attachments.is_empty(),
+            "the opened message has to agree with the list, got {:?}",
+            content.attachments
+        );
+        // The bytes are still there as a message part, they are just not
+        // offered as something to save.
+        assert!(content.part("image/png").is_some());
     }
 
     #[test]
@@ -2334,8 +2387,8 @@ mod tests {
         assert!(body_contains_attachment(&multipart(
             "mixed",
             vec![
-                body_part("text/plain", &[], None),
-                body_part("text/csv", &[("name", "report.csv")], None),
+                body_part("text/plain", &[], None, None),
+                body_part("text/csv", &[("name", "report.csv")], None, None),
             ]
         )));
 

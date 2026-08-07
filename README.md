@@ -108,12 +108,15 @@ Message status is indicated by a four symbol character prefix in the message lis
    - ` `: No attachment
    - `@`: Message has one or more attachments
 
+   A part counts as an attachment when it is not body text and the message
+   body cannot display it itself: an image an HTML mail references as
+   `cid:…` — a signature logo, say — is part of the message rather than
+   something to save, unless the sender explicitly marked it as an attachment.
+
    Before a message is opened the marker comes from what the server reports
-   about the message structure (the IMAP `BODYSTRUCTURE`, JMAP's
-   `hasAttachment`). Opening, replying to, or forwarding a message parses the
-   real MIME tree and corrects the marker in the list if the two disagree.
-   Anything that is not body text counts — an attached PDF as much as a logo
-   the sender embedded in an HTML mail.
+   about its structure (the IMAP `BODYSTRUCTURE`, JMAP's `hasAttachment`).
+   Opening, replying to, or forwarding a message parses the real MIME tree and
+   corrects the marker in the list if the two disagree.
 
 ### Key bindings
 

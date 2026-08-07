@@ -7,7 +7,7 @@
 
 use crate::{
     backend::{
-        ActionStatus, BackendEvent, MailBackend, MailboxSnapshot, OutgoingMessage,
+        ActionStatus, BackendEvent, LeafPart, MailBackend, MailboxSnapshot, OutgoingMessage,
         build_compose_body,
     },
     model::{
@@ -1387,10 +1387,16 @@ fn build_message_content(email: &JmapEmail) -> Result<MessageContent> {
         collect_parts(email, html_parts, &mut parts);
     }
 
+    // `attachments` is everything outside the text and HTML bodies, so it also
+    // holds the images an HTML mail references as `cid:…`.  The server leaves
+    // those out of `hasAttachment`, which is what the message list marker is
+    // built from, so listing them here would make the marker appear the moment
+    // the message is opened.
     let attachments = email
         .attachments()
         .unwrap_or_default()
         .iter()
+        .filter(|part| jmap_part_is_attachment(part))
         .map(|part| MessageAttachment {
             filename: part.name().map(|name| name.to_string()),
             mime_type: part
@@ -1408,6 +1414,22 @@ fn build_message_content(email: &JmapEmail) -> Result<MessageContent> {
         parts,
         attachments,
     })
+}
+
+/// Whether a JMAP body part is an attachment, by the rule every backend shares.
+///
+/// JMAP hands the decision over ready-made: `type`, `disposition` and `cid` are
+/// separate properties, so there is nothing to parse out of a header.
+fn jmap_part_is_attachment(part: &EmailBodyPart) -> bool {
+    let content_type = part.content_type().unwrap_or("application/octet-stream");
+
+    LeafPart {
+        major_type: content_type.split('/').next().unwrap_or_default(),
+        has_filename: part.name().is_some_and(|name| !name.trim().is_empty()),
+        disposition: part.content_disposition(),
+        has_content_id: part.content_id().is_some_and(|cid| !cid.trim().is_empty()),
+    }
+    .is_attachment()
 }
 
 fn collect_parts(

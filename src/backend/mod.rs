@@ -105,6 +105,65 @@ pub(crate) fn build_compose_body(
     Ok(mixed)
 }
 
+/// The MIME headers of a leaf body part that decide how to treat it.
+///
+/// Filled in from whatever the backend has at hand: an IMAP `BODYSTRUCTURE`,
+/// a parsed MIME tree, or a JMAP `EmailBodyPart`.
+pub(crate) struct LeafPart<'a> {
+    /// Major type only — `text`, `image`, `application`, …
+    pub(crate) major_type: &'a str,
+    /// Whether the part names a file, in the disposition or the content type.
+    pub(crate) has_filename: bool,
+    /// `Content-Disposition`, without its parameters.
+    pub(crate) disposition: Option<&'a str>,
+    /// Whether the part carries a `Content-ID` the body could point at.
+    pub(crate) has_content_id: bool,
+}
+
+impl LeafPart<'_> {
+    /// Whether this part should be offered to the user as an attachment.
+    ///
+    /// Every backend answers this the same way, and each one answers it twice:
+    /// once for the message list, from what the server says about a message it
+    /// has not fetched yet, and once for the opened message, from the parts it
+    /// actually got. If the two disagree the `@` marker in the list flips as
+    /// soon as the user opens the message, so the rule lives here rather than
+    /// being written out per backend.
+    pub(crate) fn is_attachment(&self) -> bool {
+        // An explicit `attachment` disposition settles it, even for parts that
+        // also carry a Content-ID.
+        if self
+            .disposition
+            .is_some_and(|value| value.eq_ignore_ascii_case("attachment"))
+        {
+            return true;
+        }
+
+        // A Content-ID on a part the sender did not mark as an attachment is
+        // there for the body to reference as `cid:…` — the logo in an HTML
+        // mail, not something the reader wants in their Downloads folder.
+        // Whether the body *does* reference it cannot be checked from the
+        // message list, where there is no body yet, so the marker would flip
+        // on open; treating every such part as inline keeps both sides honest.
+        if self.has_content_id
+            && self
+                .disposition
+                .is_none_or(|value| value.eq_ignore_ascii_case("inline"))
+        {
+            return false;
+        }
+
+        if self.has_filename {
+            return true;
+        }
+
+        // What is left is either body text or something the reader cannot see
+        // any other way.
+        !(self.major_type.eq_ignore_ascii_case("multipart")
+            || self.major_type.eq_ignore_ascii_case("text"))
+    }
+}
+
 /// Abstraction over a mail provider implementation.
 ///
 /// The trait is purposely synchronous from the caller's perspective while the
@@ -191,5 +250,82 @@ pub trait MailBackend: Send + Sync {
         Err(anyhow::anyhow!(
             "this backend does not support on-demand attachment download"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LeafPart;
+
+    fn part(major_type: &str, has_filename: bool) -> LeafPart<'_> {
+        LeafPart {
+            major_type,
+            has_filename,
+            disposition: None,
+            has_content_id: false,
+        }
+    }
+
+    #[test]
+    fn body_text_is_not_an_attachment() {
+        assert!(!part("text", false).is_attachment());
+        assert!(!part("multipart", false).is_attachment());
+    }
+
+    #[test]
+    fn a_named_part_is_an_attachment_whatever_its_type() {
+        // Older mailers send `text/csv; name="report.csv"` with no
+        // Content-Disposition at all.
+        assert!(part("text", true).is_attachment());
+        assert!(part("application", true).is_attachment());
+    }
+
+    #[test]
+    fn a_part_the_reader_cannot_see_otherwise_is_an_attachment() {
+        // No name, no disposition — but a PDF is not something the body pane
+        // can render, so it has to be offered for download.
+        assert!(part("application", false).is_attachment());
+        assert!(part("image", false).is_attachment());
+    }
+
+    #[test]
+    fn an_image_the_body_can_reference_is_not_an_attachment() {
+        // The logo in an HTML mail: the body points at it as `cid:…`, so it is
+        // part of the message, not something to save.  Senders write this both
+        // with an explicit `inline` disposition and with none at all.
+        let referenced = LeafPart {
+            major_type: "image",
+            has_filename: true,
+            disposition: Some("inline"),
+            has_content_id: true,
+        };
+        assert!(!referenced.is_attachment());
+        assert!(
+            !LeafPart {
+                disposition: None,
+                ..referenced
+            }
+            .is_attachment()
+        );
+
+        // Without a Content-ID nothing can reference it, so it stays an
+        // attachment however the sender labelled it.
+        assert!(
+            LeafPart {
+                has_content_id: false,
+                ..referenced
+            }
+            .is_attachment()
+        );
+
+        // And a sender who says `attachment` outright is taken at their word,
+        // Content-ID or not.
+        assert!(
+            LeafPart {
+                disposition: Some("attachment"),
+                ..referenced
+            }
+            .is_attachment()
+        );
     }
 }
