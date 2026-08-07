@@ -6028,6 +6028,213 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_filename_cannot_escape_the_target_folder() {
+        // A MIME filename is attacker-controlled, so every separator has to
+        // become part of the name instead of a directory step.
+        assert_eq!(sanitize_filename("../../etc/passwd"), ".._.._etc_passwd");
+        assert_eq!(sanitize_filename("/etc/passwd"), "etc_passwd");
+        assert_eq!(
+            sanitize_filename("nested/dir/report.pdf"),
+            "nested_dir_report.pdf"
+        );
+        assert_eq!(sanitize_filename("C:\\Windows\\hosts"), "C:_Windows_hosts");
+        assert_eq!(sanitize_filename("evil\0.txt"), "evil_.txt");
+    }
+
+    #[test]
+    fn sanitize_filename_rejects_names_that_carry_no_content() {
+        // The caller falls back to `attachment-N.ext` on an empty result, so
+        // "." and ".." must not survive as usable names.
+        assert_eq!(sanitize_filename(".."), "");
+        assert_eq!(sanitize_filename("."), "");
+        assert_eq!(sanitize_filename("   "), "");
+        assert_eq!(sanitize_filename("/"), "");
+        assert_eq!(sanitize_filename(""), "");
+        // Leading dots are only a problem on their own.
+        assert_eq!(sanitize_filename("..invoice.pdf"), "..invoice.pdf");
+        assert_eq!(sanitize_filename("  report.pdf  "), "report.pdf");
+    }
+
+    #[test]
+    fn unique_path_in_never_overwrites_an_existing_file() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let folder = dir.path();
+
+        // Nothing there yet: the name is used as is.
+        assert_eq!(
+            unique_path_in(folder, "report.pdf"),
+            folder.join("report.pdf")
+        );
+
+        // The counter goes before the extension, not after it.
+        fs::write(folder.join("report.pdf"), b"first").expect("write");
+        assert_eq!(
+            unique_path_in(folder, "report.pdf"),
+            folder.join("report (1).pdf")
+        );
+
+        // And it keeps counting rather than reusing " (1)".
+        fs::write(folder.join("report (1).pdf"), b"second").expect("write");
+        assert_eq!(
+            unique_path_in(folder, "report.pdf"),
+            folder.join("report (2).pdf")
+        );
+    }
+
+    #[test]
+    fn unique_path_in_handles_names_without_an_extension() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let folder = dir.path();
+
+        fs::write(folder.join("notes"), b"first").expect("write");
+        assert_eq!(unique_path_in(folder, "notes"), folder.join("notes (1)"));
+
+        // A dotfile has no stem, so the leading dot is not an extension either.
+        fs::write(folder.join(".gitignore"), b"first").expect("write");
+        assert_eq!(
+            unique_path_in(folder, ".gitignore"),
+            folder.join(".gitignore (1)")
+        );
+    }
+
+    // -- Compose focus order --------------------------------------------------
+
+    fn outgoing_attachment(filename: &str) -> OutgoingAttachment {
+        OutgoingAttachment {
+            filename: filename.to_string(),
+            mime_type: "application/pdf".to_string(),
+            data: b"%PDF-1.7".to_vec(),
+        }
+    }
+
+    #[test]
+    fn focus_sequence_skips_the_attachment_list_when_there_is_none() {
+        let mut compose = ComposeState::new();
+        assert_eq!(
+            compose.focus_sequence(),
+            vec![
+                ComposeFocus::Field(ComposeField::To),
+                ComposeFocus::Field(ComposeField::Cc),
+                ComposeFocus::Field(ComposeField::Bcc),
+                ComposeFocus::Field(ComposeField::Subject),
+                ComposeFocus::Body,
+                ComposeFocus::Button(ComposeButton::Attach),
+                ComposeFocus::Button(ComposeButton::Cancel),
+                ComposeFocus::Button(ComposeButton::Edit),
+                ComposeFocus::Button(ComposeButton::Draft),
+                ComposeFocus::Button(ComposeButton::Send),
+            ]
+        );
+
+        // Tab from the last header lands on the body, not on an empty list.
+        compose.set_focus(ComposeFocus::Field(ComposeField::Subject));
+        compose.focus_next();
+        assert_eq!(compose.focus(), ComposeFocus::Body);
+
+        // And Shift+Tab from the first field wraps to the last button.
+        compose.set_focus(ComposeFocus::Field(ComposeField::To));
+        compose.focus_prev();
+        assert_eq!(compose.focus(), ComposeFocus::Button(ComposeButton::Send));
+    }
+
+    #[test]
+    fn focus_sequence_includes_the_attachment_list_once_a_file_is_attached() {
+        let mut compose = ComposeState::new();
+        compose.add_attachment(outgoing_attachment("invoice.pdf"));
+
+        assert_eq!(
+            compose.focus_sequence(),
+            vec![
+                ComposeFocus::Field(ComposeField::To),
+                ComposeFocus::Field(ComposeField::Cc),
+                ComposeFocus::Field(ComposeField::Bcc),
+                ComposeFocus::Field(ComposeField::Subject),
+                ComposeFocus::Attachments,
+                ComposeFocus::Body,
+                ComposeFocus::Button(ComposeButton::Attach),
+                ComposeFocus::Button(ComposeButton::Cancel),
+                ComposeFocus::Button(ComposeButton::Edit),
+                ComposeFocus::Button(ComposeButton::Draft),
+                ComposeFocus::Button(ComposeButton::Send),
+            ]
+        );
+
+        // The list sits between the headers and the body in both directions.
+        compose.set_focus(ComposeFocus::Field(ComposeField::Subject));
+        compose.focus_next();
+        assert_eq!(compose.focus(), ComposeFocus::Attachments);
+        compose.focus_next();
+        assert_eq!(compose.focus(), ComposeFocus::Body);
+        compose.focus_prev();
+        assert_eq!(compose.focus(), ComposeFocus::Attachments);
+    }
+
+    // -- Attachment indicator -------------------------------------------------
+
+    #[test]
+    fn the_message_list_marks_messages_that_carry_attachments() {
+        let mut message = make_message(1, MessageStatus::Read);
+        let app = test_app(vec![message.clone()]);
+
+        assert_eq!(
+            app.formatted_message_row(&message, OffsetDateTime::UNIX_EPOCH)
+                .flags,
+            "    ",
+            "no attachments, no marker"
+        );
+
+        message.has_attachments = true;
+        assert_eq!(
+            app.formatted_message_row(&message, OffsetDateTime::UNIX_EPOCH)
+                .flags,
+            "   @"
+        );
+
+        // The marker has its own column, so it survives the other flags.
+        message.status = MessageStatus::New;
+        message.starred = true;
+        message.answered = true;
+        assert_eq!(
+            app.formatted_message_row(&message, OffsetDateTime::UNIX_EPOCH)
+                .flags,
+            "N*↩@"
+        );
+    }
+
+    #[test]
+    fn opening_a_message_corrects_the_attachment_indicator() {
+        let message = make_message(1, MessageStatus::Read);
+        let mut app = test_app(vec![message]);
+
+        // The list said "no attachments" -- the parsed message says otherwise.
+        app.show_loaded_message(
+            1,
+            MessageContent {
+                attachments: vec![attachment(
+                    Some("invoice.pdf"),
+                    "application/pdf",
+                    Some(b"%PDF-1.7"),
+                    None,
+                )],
+                ..Default::default()
+            },
+        );
+
+        assert!(app.mailbox.messages[0].has_attachments);
+        assert!(
+            app.message_view
+                .as_ref()
+                .is_some_and(|view| view.message.has_attachments),
+            "the open viewer has to agree with the list"
+        );
+
+        // And the correction works the other way round, too.
+        app.mailbox.messages[0].has_attachments = true;
+        app.show_loaded_message(1, MessageContent::default());
+        assert!(!app.mailbox.messages[0].has_attachments);
+    }
+
+    #[test]
     fn text_field_insert_str_flattens_pasted_text() {
         let mut field = TextFieldState::default();
         // Enclosing line breaks (the terminal's) go away; the inner one becomes
