@@ -14,8 +14,10 @@ use crate::model::{
 };
 use anyhow::{Context, Result, anyhow};
 use crossterm::{
+    cursor::Show,
     event::{DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyModifiers},
     execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use shell_words::split as shell_split;
 use std::{
@@ -392,6 +394,10 @@ pub struct App {
     save_attachment: Option<SaveAttachmentDialog>,
     /// Send or draft-save running on a worker thread.
     outgoing: Option<OutgoingOperation>,
+    /// Set when something took the screen away from the renderer, so the next
+    /// frame has to be painted in full rather than diffed against a screen that
+    /// no longer holds what the renderer last drew.
+    needs_full_redraw: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1437,7 +1443,18 @@ impl App {
             pending_navigation: None,
             save_attachment: None,
             outgoing: None,
+            needs_full_redraw: false,
         })
+    }
+
+    /// Whether the screen has to be repainted from scratch, clearing the request.
+    ///
+    /// The renderer only writes the cells that changed since the last frame, so
+    /// anything that hands the terminal to another program -- the editor -- has
+    /// to say so, or the first frame back paints a diff against a screen that
+    /// was wiped meanwhile.
+    pub fn take_full_redraw(&mut self) -> bool {
+        std::mem::take(&mut self.needs_full_redraw)
     }
 
     fn current_account(&self) -> &AccountState {
@@ -3838,7 +3855,7 @@ impl App {
         };
         command.arg(&temp_path);
 
-        let editor_status = run_editor_command(&mut io::stdout(), &mut command);
+        let editor_status = self.run_editor_command(&mut io::stdout(), &mut command);
 
         let status = match editor_status {
             Ok(status) => status,
@@ -3881,6 +3898,46 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Run the editor with the terminal handed over to it, then take it back.
+    ///
+    /// The renderer owns three modes the editor cannot be expected to leave the
+    /// way it found them: raw mode, the alternate screen, and bracketed paste.
+    /// The editor needs a cooked terminal on the main screen to be usable at
+    /// all, and it draws over whatever the renderer had put there.  Bracketed
+    /// paste is the subtle one -- it is a terminal mode rather than a termios
+    /// flag, so restoring raw mode does not bring it back, and vim, neovim and
+    /// emacs all emit the disable sequence when they exit whether or not they
+    /// turned it on themselves.  Losing it means
+    /// [`Event::Paste`](crossterm::event::Event::Paste) never arrives again,
+    /// and [`Self::handle_paste_text`] is the only route by which a terminal
+    /// file drop becomes an attachment.
+    ///
+    /// Every mode has to be restored on every path out, including a child that
+    /// exits non-zero and an editor that never launches at all.  Failures to
+    /// restore go unreported on purpose: the terminal they would be reported on
+    /// is the one that just failed.
+    fn run_editor_command<W: Write>(
+        &mut self,
+        terminal: &mut W,
+        command: &mut Command,
+    ) -> io::Result<ExitStatus> {
+        // Hand over a terminal in the state a child expects to find one:
+        // cooked, on the main screen, with a cursor it can see.
+        let _ = disable_raw_mode();
+        let _ = execute!(terminal, DisableBracketedPaste, LeaveAlternateScreen, Show);
+
+        let status = command.status();
+
+        let _ = enable_raw_mode();
+        let _ = execute!(terminal, EnterAlternateScreen, EnableBracketedPaste);
+
+        // Re-entering the alternate screen clears it, so the renderer's record
+        // of what is on screen is now wrong in every cell.
+        self.needs_full_redraw = true;
+
+        status
     }
 
     fn cancel_compose(&mut self) {
@@ -4879,34 +4936,6 @@ impl App {
     }
 }
 
-/// Run the editor with the terminal handed over to it, then take back the modes
-/// the app relies on.
-///
-/// Bracketed paste is a terminal mode rather than a termios flag, so neither the
-/// child nor a raw-mode restore brings it back: vim, neovim and emacs all emit
-/// the disable sequence when they exit, whether or not they turned it on
-/// themselves.  Without re-issuing it here the app would never see another
-/// [`Event::Paste`](crossterm::event::Event::Paste) -- and
-/// [`App::handle_paste_text`] is the only route by which a terminal file drop
-/// becomes an attachment, so dropping a file would stop attaching anything the
-/// first time a user edited a message body.
-///
-/// The restore has to happen on every path out, including a child that exits
-/// non-zero and an editor that never launches at all.
-fn run_editor_command<W: Write>(terminal: &mut W, command: &mut Command) -> io::Result<ExitStatus> {
-    // Whoever reads the terminal owns the mode; while the editor has it, ours
-    // is not just unused but actively in the way.
-    let _ = execute!(terminal, DisableBracketedPaste);
-
-    let status = command.status();
-
-    // Nothing useful is left to do if this fails -- the terminal it writes to
-    // is the one the app is about to keep drawing on regardless.
-    let _ = execute!(terminal, EnableBracketedPaste);
-
-    status
-}
-
 fn default_download_dir() -> PathBuf {
     if let Some(value) = env::var_os("XDG_DOWNLOAD_DIR") {
         let path = PathBuf::from(&value);
@@ -5487,6 +5516,7 @@ mod tests {
             pending_navigation: None,
             save_attachment: None,
             outgoing: None,
+            needs_full_redraw: false,
         }
     }
 
@@ -6465,53 +6495,99 @@ mod tests {
 
     // -- Handing the terminal to the editor and getting it back ---------------
 
-    // Both tests are Unix-only because crossterm may drive a Windows console
-    // through the API instead of writing escape sequences, leaving the sink
-    // these assert on empty.  The behaviour under test is the same on both.
+    // These are Unix-only because crossterm may drive a Windows console through
+    // the API instead of writing escape sequences, leaving the sink they assert
+    // on empty.  The behaviour under test is the same on both.
 
-    const DISABLE_PASTE: &str = "\u{1b}[?2004l";
-    const ENABLE_PASTE: &str = "\u{1b}[?2004h";
+    /// What the editor is given: a cooked terminal on the main screen with a
+    /// visible cursor.  Raw mode is a termios call, so it leaves no bytes here.
+    #[cfg(unix)]
+    const RELEASED: &str = concat!(
+        "\u{1b}[?2004l", // DisableBracketedPaste
+        "\u{1b}[?1049l", // LeaveAlternateScreen
+        "\u{1b}[?25h",   // Show cursor
+    );
+
+    /// What the app takes back once the editor exits.
+    #[cfg(unix)]
+    const RESTORED: &str = concat!(
+        "\u{1b}[?1049h", // EnterAlternateScreen
+        "\u{1b}[?2004h", // EnableBracketedPaste
+    );
+
+    /// Drive the editor helper the way [`App::edit_compose_body`] does.
+    ///
+    /// Raw mode is process-wide and `cargo test` runs with the developer's
+    /// terminal attached, so this puts it back the way it was found before any
+    /// assertion can panic -- leaving it raw would wreck the shell that ran the
+    /// tests.
+    #[cfg(unix)]
+    fn run_editor_in_test(
+        app: &mut App,
+        sink: &mut Vec<u8>,
+        program: &str,
+    ) -> std::io::Result<ExitStatus> {
+        let was_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+        let status = app.run_editor_command(sink, &mut Command::new(program));
+        if !was_raw {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+        status
+    }
 
     /// The drop-to-attach path above works only while bracketed paste is on,
     /// and every editor worth the name turns it off on its way out.
     #[cfg(unix)]
     #[test]
-    fn the_editor_hands_bracketed_paste_back() {
+    fn the_editor_gets_the_terminal_and_gives_it_back() {
+        let mut app = test_app(vec![]);
         let mut terminal = Vec::new();
-        let status = run_editor_command(&mut terminal, &mut Command::new("true")).expect("run");
+        let status = run_editor_in_test(&mut app, &mut terminal, "true").expect("run");
 
         assert!(status.success());
         assert_eq!(
             String::from_utf8(terminal).expect("utf-8"),
-            format!("{DISABLE_PASTE}{ENABLE_PASTE}"),
-            "the mode is released for the editor and taken back once it exits"
+            format!("{RELEASED}{RESTORED}"),
+            "the modes are released for the editor and taken back once it exits"
         );
+        assert!(
+            app.take_full_redraw(),
+            "re-entering the alternate screen clears it, so the next frame cannot be a diff"
+        );
+        assert!(!app.take_full_redraw(), "the request is taken, not latched");
+    }
 
-        // An editor the user quit without saving exits non-zero -- but it still
-        // had the terminal, so the restore is just as necessary.
+    /// An editor the user quit without saving exits non-zero -- but it still had
+    /// the terminal, so the restore is just as necessary.
+    #[cfg(unix)]
+    #[test]
+    fn the_terminal_comes_back_from_an_editor_that_failed() {
+        let mut app = test_app(vec![]);
         let mut terminal = Vec::new();
-        let status = run_editor_command(&mut terminal, &mut Command::new("false")).expect("run");
+        let status = run_editor_in_test(&mut app, &mut terminal, "false").expect("run");
 
         assert!(!status.success());
         assert_eq!(
             String::from_utf8(terminal).expect("utf-8"),
-            format!("{DISABLE_PASTE}{ENABLE_PASTE}")
+            format!("{RELEASED}{RESTORED}")
         );
+        assert!(app.take_full_redraw());
     }
 
     #[cfg(unix)]
     #[test]
-    fn bracketed_paste_survives_an_editor_that_never_launches() {
+    fn the_terminal_comes_back_from_an_editor_that_never_launches() {
+        let mut app = test_app(vec![]);
         let mut terminal = Vec::new();
-        let result = run_editor_command(&mut terminal, &mut Command::new("elma-no-such-editor"));
+        let result = run_editor_in_test(&mut app, &mut terminal, "elma-no-such-editor");
 
         assert!(result.is_err(), "a missing editor has to be reported");
-        assert!(
-            String::from_utf8(terminal)
-                .expect("utf-8")
-                .ends_with(ENABLE_PASTE),
-            "the early return out of edit_compose_body still leaves paste working"
+        assert_eq!(
+            String::from_utf8(terminal).expect("utf-8"),
+            format!("{RELEASED}{RESTORED}"),
+            "the early return out of edit_compose_body still leaves a usable terminal"
         );
+        assert!(app.take_full_redraw());
     }
 
     // -- Carrying attachments into compose ------------------------------------

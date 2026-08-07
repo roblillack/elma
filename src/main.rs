@@ -53,6 +53,15 @@ fn run(app: &mut App) -> Result<()> {
     let mut terminal = init_terminal().context("failed to set up terminal")?;
     let result = loop {
         app.poll_backend_events();
+
+        // Something -- the editor -- had the screen and wiped what the renderer
+        // drew, so the next frame cannot be a diff against it.
+        if app.take_full_redraw() {
+            terminal
+                .clear()
+                .context("failed to repaint after returning from a child process")?;
+        }
+
         terminal
             .draw(|frame| ui::render(frame, app))
             .context("failed to render frame")?;
