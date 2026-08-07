@@ -3236,6 +3236,8 @@ impl App {
         cached_document: Option<Document>,
         loaded: LoadedMessage,
     ) {
+        self.sync_attachment_indicator(message.id, !loaded.content.attachments.is_empty());
+
         if purpose == MessageLoadPurpose::View {
             self.show_loaded_message(message.id, loaded.content);
             return;
@@ -4642,6 +4644,30 @@ impl App {
         Ok(())
     }
 
+    /// Correct the message list's attachment marker from a body we just parsed.
+    ///
+    /// Until a message is opened the marker comes from a backend guess — the
+    /// IMAP BODYSTRUCTURE or JMAP's `hasAttachment` — which can disagree with
+    /// what the parsed MIME tree yields. Every load runs through here, so
+    /// replying to, forwarding, or reopening a draft corrects the list as
+    /// well, not just opening the message.
+    fn sync_attachment_indicator(&mut self, message_id: MessageId, has_attachments: bool) {
+        if let Some(slot) = self
+            .mailbox
+            .messages
+            .iter_mut()
+            .find(|message| message.id == message_id)
+        {
+            slot.has_attachments = has_attachments;
+        }
+
+        if let Some(view) = self.message_view.as_mut()
+            && view.message_id == message_id
+        {
+            view.message.has_attachments = has_attachments;
+        }
+    }
+
     /// Install a body that finished loading in the message viewer.
     ///
     /// The mailbox may have moved on while the load ran, so the list entry is
@@ -4661,12 +4687,8 @@ impl App {
         };
 
         let has_attachments = !content.attachments.is_empty();
-        if message.has_attachments != has_attachments {
-            message.has_attachments = has_attachments;
-            if let Some(slot) = self.mailbox.messages.get_mut(real_idx) {
-                slot.has_attachments = has_attachments;
-            }
-        }
+        message.has_attachments = has_attachments;
+        self.sync_attachment_indicator(message_id, has_attachments);
 
         let raw_html = content
             .part("text/html")
@@ -6232,6 +6254,85 @@ mod tests {
         app.mailbox.messages[0].has_attachments = true;
         app.show_loaded_message(1, MessageContent::default());
         assert!(!app.mailbox.messages[0].has_attachments);
+    }
+
+    #[test]
+    fn forwarding_a_message_corrects_the_attachment_indicator_too() {
+        let message = make_message(1, MessageStatus::Read);
+        let mut app = test_app(vec![message.clone()]);
+
+        // No viewer is involved here: the body was fetched to seed compose.
+        // The list still has to learn what the fetch found.
+        app.deliver_loaded_message(
+            message,
+            MessageLoadPurpose::Forward,
+            None,
+            LoadedMessage {
+                content: MessageContent {
+                    attachments: vec![attachment(
+                        Some("invoice.pdf"),
+                        "application/pdf",
+                        Some(b"%PDF-1.7"),
+                        None,
+                    )],
+                    ..Default::default()
+                },
+                attachments: Vec::new(),
+                unavailable: 0,
+            },
+        );
+
+        assert!(app.compose.is_some(), "forwarding opens compose");
+        assert!(app.mailbox.messages[0].has_attachments);
+    }
+
+    /// Draw the whole UI into a test terminal and return it line by line.
+    fn rendered_screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| crate::ui::render(frame, app))
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_attachment_marker_reaches_the_screen() {
+        let mut with = make_message(1, MessageStatus::Read);
+        with.has_attachments = true;
+        with.subject = "Has an attachment".to_string();
+        let mut without = make_message(2, MessageStatus::Read);
+        without.subject = "Plain text only".to_string();
+
+        let mut app = test_app(vec![with, without]);
+        let screen = rendered_screen(&mut app, 100, 12);
+
+        let marked = screen
+            .iter()
+            .find(|line| line.contains("Has an attachment"))
+            .expect("the message list shows the first message");
+        assert!(
+            marked.contains('@'),
+            "the attachment marker has to be drawn, got {marked:?}"
+        );
+
+        let unmarked = screen
+            .iter()
+            .find(|line| line.contains("Plain text only"))
+            .expect("the message list shows the second message");
+        assert!(
+            !unmarked.contains('@'),
+            "a message without attachments stays unmarked, got {unmarked:?}"
+        );
     }
 
     #[test]

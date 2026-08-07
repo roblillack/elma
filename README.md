@@ -12,6 +12,8 @@ offering a modern feature set out-of-the-box, including:
 - Support for special-use mailboxes and labels, like starring and marking as
   important,
 - Multiple account support,
+- Attachments: an at-a-glance indicator in the message list, saving to disk,
+  and attaching files when composing,
 - Scheduled message actions (archive/delete),
 - Extensibility for additional backends.
 
@@ -102,9 +104,16 @@ Message status is indicated by a four symbol character prefix in the message lis
    - `↩`: This message has been replied to (ASCII mode: `r`)
    - `→`: This message has been forwarded (ASCII mode: `f`)
    - `⇄`: This message has been both replied to and forwarded (ASCII mode: `x`)
-4. Attachment indicator: (TODO)
+4. Attachment indicator:
    - ` `: No attachment
    - `@`: Message has one or more attachments
+
+   Before a message is opened the marker comes from what the server reports
+   about the message structure (the IMAP `BODYSTRUCTURE`, JMAP's
+   `hasAttachment`). Opening, replying to, or forwarding a message parses the
+   real MIME tree and corrects the marker in the list if the two disagree.
+   Anything that is not body text counts — an attached PDF as much as a logo
+   the sender embedded in an HTML mail.
 
 ### Key bindings
 
@@ -114,7 +123,11 @@ Message status is indicated by a four symbol character prefix in the message lis
 - `y` schedules the message for archival.
 - `!` schedules the message to move to spam.
 - `u` unschedules a pending action (delete/archive/spam/move-to-inbox), or toggles unread/read state on normal messages.
-- `s` toggles the star flag.
+- `s` toggles the star flag. In the message list `S` does the same; in the
+  message viewer `S` opens the *Save attachment* dialog instead (see
+  [Attachments](#attachments)).
+- `c` composes a new message; `r` replies, `a` replies to all, and `f` forwards
+  the selected or open message.
 - `$` commits scheduled actions (removing archived/deleted messages from the list).
 - Arrow keys, `PageUp`/`PageDown`, `Home`, `End` move the cursor in the inbox.
 - While a message is open, `j` / `k` jump to the next/previous message and `.` toggles raw HTML.
@@ -129,4 +142,33 @@ Message status is indicated by a four symbol character prefix in the message lis
   - `T` Trash (Should be `g` `r` or even `g` `#`?)
 
 When viewing a special mailbox (Archive, Spam, Trash), the primary action key for that mailbox is flipped: `d` in Trash, `y` in Archive, and `!` in Spam each schedule a move back to inbox instead. Pressing `u` then unstages that move, keeping the message where it is.
-  
+
+### Attachments
+
+Messages that carry attachments are marked with `@` in the message list (see
+[Email flags](#email-flags)); opening one lists them above the body with their
+type and size.
+
+**Saving.** `S` in the message viewer opens the *Save attachment* dialog.
+`Tab` switches between the attachment list and the target folder, `Up`/`Down`
+pick an attachment, and `Enter` writes it. The folder defaults to
+`$XDG_DOWNLOAD_DIR` (falling back to `~/Downloads`), `~` is expanded, and an
+existing file is never overwritten — Elma appends ` (1)`, ` (2)`, … instead.
+Backends that hand out attachment bodies on demand (JMAP) download in the
+background, so the dialog stays responsive; `Esc` closes it and cancels the
+save before anything is written.
+
+**Attaching.** In the compose view, `Tab` to the *Attach* button and press
+`Enter` (or `a`) to get a path prompt; `~` and shell-style escapes are
+understood. Dropping files onto the terminal works too — Elma treats a paste
+as a file drop when every item in it is an absolute path that exists, and as
+ordinary text otherwise. With one or more files attached, the attachment list
+becomes a focus stop of its own: `Up`/`Down` select, `Delete`/`Backspace`
+removes. Sending and saving a draft run in the background, so a large upload
+does not freeze the UI; compose stays open and read-only until the backend has
+accepted the message.
+
+Replying to, forwarding, or reopening a draft keeps the original attachments.
+Anything that cannot be recovered is reported in the status line rather than
+silently dropped.
+
