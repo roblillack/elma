@@ -31,3 +31,5 @@ imap-proto = "0.16"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "native-tls"] }
 shell-words = "1"
 tempfile = "3"
+mime_guess = "2"
+unicode-width = "0.2"

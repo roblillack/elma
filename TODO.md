@@ -12,7 +12,7 @@ while working on Elma.
 - [ ] Implement `a` to reply all
 - [ ] Implement `f` to forward message
 - [x] Add "Important" flag support
-- [ ] Add attachment indicator to message list
+- [x] Add attachment indicator to message list
 - [x] `=`/`+` and `-` to mark as important/unimportant
 - [ ] Implement search (`/` and `n`/`N`)
 - [x] Implement composing new message (`c`)
@@ -26,7 +26,7 @@ while working on Elma.
 - [ ] Add auto-complete for email addresses when composing messages based on the user's contacts or previously sent emails and last 1000 messages
 - [x] Add showing labels in the message view
 - [ ] Show FTML-based preview in compose dialog -- for editing open the draft as Markdown in the user's $EDITOR
-- [ ] Add support for attachments when composing messages
+- [x] Add support for attachments when composing messages
 - [ ] Switch from hardcoded folder named in Gmail backend to standard "Special Use" folders via IMAP (See [RFC 6154](https://datatracker.ietf.org/doc/html/rfc6154)) as per [Google Developer Docs](https://developers.google.com/workspace/gmail/imap/imap-extensions#special-use_extension_of_the_list_command)
 - [ ] Add command (`o`?) to open the current message in the web interface
 - [ ] Add support to copy the current message's content to the clipboard as Markdown (context menu?)

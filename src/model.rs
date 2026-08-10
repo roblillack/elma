@@ -153,6 +153,20 @@ pub struct MessageAttachment {
     pub filename: Option<String>,
     pub mime_type: String,
     pub size: usize,
+    /// Raw bytes of the attachment, if already fetched.
+    ///
+    /// Backends that deliver the full MIME payload up-front populate this.
+    /// JMAP leaves it empty and exposes `blob_id` instead so callers can
+    /// download the body on demand.
+    pub data: Option<Vec<u8>>,
+    /// Opaque backend identifier for fetching the attachment body later.
+    pub blob_id: Option<String>,
+    /// Whether the body displays this part itself, referencing it as `cid:…`.
+    ///
+    /// An embedded image is part of how the message reads, so it earns no
+    /// attachment marker in the list and is not carried into a forward — but it
+    /// is still a file, and the save dialog offers it like any other.
+    pub inline: bool,
 }
 
 #[derive(Clone, Debug)]
