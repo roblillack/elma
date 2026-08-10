@@ -5,7 +5,10 @@
 //! so the terminal UI never blocks while Gmail applies flag and mailbox updates.
 
 use crate::{
-    backend::{ActionStatus, BackendEvent, MailBackend, MailboxSnapshot, OutgoingMessage},
+    backend::{
+        ActionStatus, BackendEvent, LeafPart, MailBackend, MailboxSnapshot, OutgoingMessage,
+        PartRole, build_compose_body,
+    },
     model::{
         Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
         MessageContentPart, MessageId, MessageStatus,
@@ -20,12 +23,11 @@ use async_imap::{
 use tokio_rustls::TlsConnector;
 use futures::TryStreamExt;
 use imap_proto::types::{
-    AttributeValue, BodyContentCommon, BodyParams, BodyStructure, MailboxDatum, NameAttribute,
-    Response,
+    AttributeValue, BodyContentCommon, BodyContentSinglePart, BodyParams, BodyStructure,
+    MailboxDatum, NameAttribute, Response,
 };
 use lettre::{
-    Message as LettreEmail, SmtpTransport, Transport,
-    message::{Mailbox as LettreMailbox, MultiPart, SinglePart},
+    Message as LettreEmail, SmtpTransport, Transport, message::Mailbox as LettreMailbox,
     transport::smtp::authentication::Credentials,
 };
 use mailparse::{self, DispositionType, MailHeaderMap, ParsedMail};
@@ -949,9 +951,14 @@ impl GmailInner {
             {
                 starred = Some(entry_name.clone());
             }
-            if important.is_none() {
+            if has_important_attribute(attrs) {
+                important = Some(entry_name.clone());
+            } else if important.is_none() {
+                // Fallback for servers that omit the attribute: match the
+                // English name.  Only correct for English-locale accounts, so
+                // the attribute above always wins.
                 let lower = entry_name.to_ascii_lowercase();
-                if lower == "\\important" || lower == "important" || lower.ends_with("/important") {
+                if lower == "important" || lower.ends_with("/important") {
                     important = Some(entry_name.clone());
                 }
             }
@@ -1084,6 +1091,7 @@ impl GmailInner {
             subject,
             text_body,
             html_body,
+            attachments,
         } = outgoing;
 
         if to.is_empty() && cc.is_empty() && bcc.is_empty() {
@@ -1120,12 +1128,10 @@ impl GmailInner {
 
         builder = builder.subject(subject);
 
-        let multipart = MultiPart::alternative()
-            .singlepart(SinglePart::plain(text_body))
-            .singlepart(SinglePart::html(html_body));
+        let body = build_compose_body(text_body, html_body, attachments)?;
 
         builder
-            .multipart(multipart)
+            .multipart(body)
             .context("serialising compose body for SMTP")
     }
 
@@ -1798,6 +1804,22 @@ impl SharedState {
     }
 }
 
+/// Does this LIST entry carry Gmail's `\Important` special-use attribute?
+///
+/// `\Important` (RFC 8457) is not one of the RFC 6154 attributes the IMAP
+/// parser knows, so it arrives as `NameAttribute::Extension("\\Important")`.
+/// Detecting it is the only locale-independent way to find the mailbox: Gmail
+/// localises the name itself (`[Gmail]/Important`, `[Gmail]/Wichtig`, …).
+fn has_important_attribute(attrs: &[NameAttribute<'_>]) -> bool {
+    attrs.iter().any(|attr| match attr {
+        NameAttribute::Extension(name) => {
+            let trimmed = name.trim_start_matches('\\');
+            trimmed.eq_ignore_ascii_case("Important")
+        }
+        _ => false,
+    })
+}
+
 fn build_message_from_fetch(fetch: &Fetch) -> Result<Option<StoredMessage>> {
     let uid = fetch
         .uid
@@ -1856,43 +1878,46 @@ fn build_message_from_fetch(fetch: &Fetch) -> Result<Option<StoredMessage>> {
     Ok(Some(StoredMessage { message, seq, uid }))
 }
 
+/// Whether the message described by this BODYSTRUCTURE carries an attachment.
+///
+/// This is what the message list marker is built from, long before the body
+/// itself is fetched; [`collect_parts`] has to reach the same verdict from the
+/// parsed message, which is why both go through [`LeafPart::is_attachment`].
 fn body_contains_attachment(structure: &BodyStructure<'_>) -> bool {
     match structure {
         BodyStructure::Multipart { bodies, .. } => bodies.iter().any(body_contains_attachment),
-        BodyStructure::Message { common, body, .. } => {
-            body_part_is_attachment(common) || body_contains_attachment(body)
-        }
-        BodyStructure::Text { common, .. } | BodyStructure::Basic { common, .. } => {
-            body_part_is_attachment(common)
+        BodyStructure::Message {
+            common,
+            other,
+            body,
+            ..
+        } => body_part_is_attachment(common, other) || body_contains_attachment(body),
+        BodyStructure::Text { common, other, .. } | BodyStructure::Basic { common, other, .. } => {
+            body_part_is_attachment(common, other)
         }
     }
 }
 
-fn body_part_is_attachment(common: &BodyContentCommon<'_>) -> bool {
-    if let Some(disposition) = &common.disposition {
-        if disposition.ty.as_ref().eq_ignore_ascii_case("attachment") {
-            return true;
-        }
-        if body_params_contains(&disposition.params, "filename") {
-            return true;
-        }
-    }
+fn body_part_is_attachment(
+    common: &BodyContentCommon<'_>,
+    other: &BodyContentSinglePart<'_>,
+) -> bool {
+    let has_filename = common.disposition.as_ref().is_some_and(|disposition| {
+        body_params_contains(&disposition.params, "filename")
+            || body_params_contains(&disposition.params, "name")
+    }) || body_params_contains(&common.ty.params, "name");
 
-    if body_params_contains(&common.ty.params, "name")
-        && !common.ty.ty.as_ref().eq_ignore_ascii_case("text")
-    {
-        return true;
+    LeafPart {
+        major_type: common.ty.ty.as_ref(),
+        has_filename,
+        disposition: common
+            .disposition
+            .as_ref()
+            .map(|disposition| disposition.ty.as_ref()),
+        // `other.id` is the part's Content-ID.
+        has_content_id: other.id.as_ref().is_some_and(|id| !id.trim().is_empty()),
     }
-
-    let ty = common.ty.ty.as_ref();
-    if ty.eq_ignore_ascii_case("multipart") {
-        return false;
-    }
-    if ty.eq_ignore_ascii_case("text") {
-        return false;
-    }
-
-    true
+    .is_attachment()
 }
 
 fn body_params_contains(params: &BodyParams<'_>, name: &str) -> bool {
@@ -1952,21 +1977,29 @@ fn collect_parts(
             .or_else(|| disposition.params.get("name").cloned())
             .or_else(|| mail.ctype.params.get("name").cloned())
             .filter(|name| !name.trim().is_empty());
-        let is_text = mail
-            .ctype
-            .mimetype
-            .split('/')
-            .next()
-            .map(|major| major.eq_ignore_ascii_case("text"))
-            .unwrap_or(false);
-        let is_attachment = matches!(disposition.disposition, DispositionType::Attachment)
-            || filename.is_some()
-            || !is_text;
-        if is_attachment {
+        let disposition_name = match disposition.disposition {
+            DispositionType::Attachment => Some("attachment"),
+            DispositionType::Inline => Some("inline"),
+            _ => None,
+        };
+        let content_id = mail.headers.get_first_value("Content-ID");
+        let role = LeafPart {
+            major_type: mail.ctype.mimetype.split('/').next().unwrap_or_default(),
+            has_filename: filename.is_some(),
+            disposition: disposition_name,
+            has_content_id: content_id.is_some_and(|id| !id.trim().is_empty()),
+        }
+        .role();
+        // Inline parts are listed too: they earn no marker in the message list,
+        // but an embedded photo is still a file the reader may want to keep.
+        if role != PartRole::Body {
             attachments.push(MessageAttachment {
                 filename,
                 mime_type: content_type.clone(),
                 size: data.len(),
+                data: Some(data.clone()),
+                blob_id: None,
+                inline: role == PartRole::Inline,
             });
         }
         parts.push(MessageContentPart {
@@ -2139,6 +2172,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use imap_proto::types::{ContentDisposition, ContentEncoding, ContentType};
+    use std::borrow::Cow;
 
     fn make_message(id: u64, seq: u32) -> StoredMessage {
         let message = Message {
@@ -2186,6 +2221,222 @@ mod tests {
         };
 
         StoredMessage { message, seq, uid }
+    }
+
+    // ---------------------------------------------------------------
+    //  Attachment detection
+    // ---------------------------------------------------------------
+
+    fn body_params(pairs: &[(&str, &str)]) -> BodyParams<'static> {
+        if pairs.is_empty() {
+            return None;
+        }
+        Some(
+            pairs
+                .iter()
+                .map(|(key, value)| (Cow::from(key.to_string()), Cow::from(value.to_string())))
+                .collect(),
+        )
+    }
+
+    /// A leaf part as the server describes it in a BODYSTRUCTURE.
+    fn body_part(
+        mime_type: &str,
+        ctype_params: &[(&str, &str)],
+        disposition: Option<(&str, &[(&str, &str)])>,
+        content_id: Option<&str>,
+    ) -> BodyStructure<'static> {
+        let (ty, subtype) = mime_type.split_once('/').expect("major/minor type");
+        let common = BodyContentCommon {
+            ty: ContentType {
+                ty: Cow::from(ty.to_string()),
+                subtype: Cow::from(subtype.to_string()),
+                params: body_params(ctype_params),
+            },
+            disposition: disposition.map(|(ty, params)| ContentDisposition {
+                ty: Cow::from(ty.to_string()),
+                params: body_params(params),
+            }),
+            language: None,
+            location: None,
+        };
+        let other = BodyContentSinglePart {
+            id: content_id.map(|id| Cow::from(id.to_string())),
+            md5: None,
+            description: None,
+            transfer_encoding: ContentEncoding::SevenBit,
+            octets: 42,
+        };
+
+        if ty.eq_ignore_ascii_case("text") {
+            BodyStructure::Text {
+                common,
+                other,
+                lines: 3,
+                extension: None,
+            }
+        } else {
+            BodyStructure::Basic {
+                common,
+                other,
+                extension: None,
+            }
+        }
+    }
+
+    fn multipart(subtype: &str, bodies: Vec<BodyStructure<'static>>) -> BodyStructure<'static> {
+        BodyStructure::Multipart {
+            common: BodyContentCommon {
+                ty: ContentType {
+                    ty: Cow::from("multipart".to_string()),
+                    subtype: Cow::from(subtype.to_string()),
+                    params: None,
+                },
+                disposition: None,
+                language: None,
+                location: None,
+            },
+            bodies,
+            extension: None,
+        }
+    }
+
+    #[test]
+    fn the_list_marker_follows_the_body_structure() {
+        // A plain message, and the usual text+html pair: nothing to offer.
+        assert!(!body_contains_attachment(&body_part(
+            "text/plain",
+            &[],
+            None,
+            None
+        )));
+        assert!(!body_contains_attachment(&multipart(
+            "alternative",
+            vec![
+                body_part("text/plain", &[], None, None),
+                body_part("text/html", &[], None, None),
+            ]
+        )));
+
+        // An attached PDF lights up the marker.
+        assert!(body_contains_attachment(&multipart(
+            "mixed",
+            vec![
+                body_part("text/plain", &[], None, None),
+                body_part(
+                    "application/pdf",
+                    &[],
+                    Some(("attachment", &[("filename", "invoice.pdf")])),
+                    None
+                ),
+            ]
+        )));
+
+        // An image with no Content-ID cannot be shown in the body, so it is
+        // offered for download however the sender labelled it.
+        assert!(body_contains_attachment(&multipart(
+            "related",
+            vec![
+                body_part("text/html", &[], None, None),
+                body_part(
+                    "image/png",
+                    &[("name", "logo.png")],
+                    Some(("inline", &[])),
+                    None
+                ),
+            ]
+        )));
+    }
+
+    #[test]
+    fn a_logo_the_html_body_references_is_savable_but_earns_no_marker() {
+        // The signature logo of an HTML mail: `multipart/related` with a
+        // Content-ID the body points at as `cid:…`.  Marking it as an
+        // attachment would put an `@` on half the newsletters in the mailbox.
+        let structure = multipart(
+            "related",
+            vec![
+                body_part("text/html", &[], None, None),
+                body_part(
+                    "image/png",
+                    &[("name", "logo.png")],
+                    Some(("inline", &[("filename", "logo.png")])),
+                    Some("<logo@example.com>"),
+                ),
+            ],
+        );
+        assert!(!body_contains_attachment(&structure));
+
+        let raw = concat!(
+            "Content-Type: multipart/related; boundary=\"b\"\r\n",
+            "\r\n",
+            "--b\r\n",
+            "Content-Type: text/html\r\n",
+            "\r\n",
+            "<p>hi <img src=\"cid:logo@example.com\"></p>\r\n",
+            "--b\r\n",
+            "Content-Type: image/png; name=\"logo.png\"\r\n",
+            "Content-Disposition: inline; filename=\"logo.png\"\r\n",
+            "Content-ID: <logo@example.com>\r\n",
+            "\r\n",
+            "PNG\r\n",
+            "--b--\r\n",
+        );
+        let parsed = mailparse::parse_mail(raw.as_bytes()).expect("parsing the fixture");
+        let content = build_message_content(&parsed).expect("building content");
+
+        // Listed, so the save dialog can offer it -- but flagged, so nothing
+        // reads it as the message carrying an attachment.
+        assert_eq!(content.attachments.len(), 1, "{:?}", content.attachments);
+        let logo = &content.attachments[0];
+        assert_eq!(logo.filename.as_deref(), Some("logo.png"));
+        assert!(
+            logo.inline,
+            "the opened message has to agree with the list about the marker"
+        );
+        assert_eq!(
+            logo.data.as_deref(),
+            Some(&b"PNG"[..]),
+            "the bytes have to come with it, or there is nothing to save"
+        );
+        assert!(content.part("image/png").is_some());
+    }
+
+    #[test]
+    fn a_named_text_part_is_an_attachment_before_and_after_opening() {
+        // Older mailers attach a CSV as `text/csv; name=...` with no
+        // Content-Disposition at all.  The list used to read that as "no
+        // attachment" while the parsed message listed one, so the marker
+        // appeared out of nowhere the moment the message was opened.
+        assert!(body_contains_attachment(&multipart(
+            "mixed",
+            vec![
+                body_part("text/plain", &[], None, None),
+                body_part("text/csv", &[("name", "report.csv")], None, None),
+            ]
+        )));
+
+        let raw = concat!(
+            "Content-Type: multipart/mixed; boundary=\"b\"\r\n",
+            "\r\n",
+            "--b\r\n",
+            "Content-Type: text/plain\r\n",
+            "\r\n",
+            "hello\r\n",
+            "--b\r\n",
+            "Content-Type: text/csv; name=\"report.csv\"\r\n",
+            "\r\n",
+            "a,b\r\n",
+            "--b--\r\n",
+        );
+        let parsed = mailparse::parse_mail(raw.as_bytes()).expect("parsing the fixture");
+        let content = build_message_content(&parsed).expect("building content");
+
+        assert_eq!(content.attachments.len(), 1);
+        assert_eq!(
+            content.attachments[0].filename.as_deref(),
+            Some("report.csv")
+        );
     }
 
     fn populate_state(count: u32) -> SharedState {
@@ -2495,6 +2746,30 @@ mod tests {
         let result = state.update_labels(1, vec!["\\\\Important".to_string()]);
         let updated = result.expect("labels changed");
         assert!(updated.important);
+    }
+
+    // ---------------------------------------------------------------
+    //  has_important_attribute
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn important_attribute_detected_regardless_of_locale() {
+        // Both an English and a German account list the same `\Important`
+        // attribute, only the mailbox name differs.
+        let attrs = vec![
+            NameAttribute::NoInferiors,
+            NameAttribute::Extension("\\Important".into()),
+        ];
+        assert!(has_important_attribute(&attrs));
+    }
+
+    #[test]
+    fn important_attribute_absent_on_other_mailboxes() {
+        let attrs = vec![NameAttribute::NoInferiors, NameAttribute::Flagged];
+        assert!(!has_important_attribute(&attrs));
+
+        let attrs = vec![NameAttribute::Extension("\\Foobar".into())];
+        assert!(!has_important_attribute(&attrs));
     }
 
     #[test]

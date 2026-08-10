@@ -6,9 +6,9 @@
 
 use crate::app::{
     ActiveView, App, ComposeButton, ComposeField, ComposeFocus, ComposeState, MessageViewState,
-    ProgressMode, ShortcutMenu,
+    ProgressMode, SaveAttachmentDialog, SaveAttachmentFocus, ShortcutMenu, byte_index_for,
 };
-use crate::model::{MessageStatus, format_size};
+use crate::model::{MessageAttachment, MessageStatus, format_size};
 use crate::viewer;
 use ratatui::{
     Frame,
@@ -17,7 +17,9 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap},
 };
+use std::time::Duration;
 use time::OffsetDateTime;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const ACTION_BAR_BG: Color = Color::Rgb(211, 211, 211);
 const ACTION_BAR_FG: Color = Color::Rgb(105, 105, 105);
@@ -26,6 +28,48 @@ const LABEL_SPECIAL_BG: Color = Color::Rgb(64, 64, 64);
 const LABEL_SPECIAL_FG: Color = Color::White;
 const LABEL_DEFAULT_BG: Color = Color::Rgb(224, 224, 224);
 const LABEL_DEFAULT_FG: Color = Color::Black;
+/// Base style shared by every popup surface (compose, dialogs, prompts).
+const POPUP_STYLE: Style = Style::new().bg(Color::Black).fg(Color::White);
+
+/// Visible window of a single-line text field, plus the cursor's column in it.
+///
+/// A field is one row tall, so a value wider than the row scrolls with the
+/// cursor instead of being clipped at the end.  Both the window and the caret
+/// are measured in display columns, so double-width characters (CJK, emoji)
+/// keep the caret over the text it belongs to.
+fn text_field_view(value: &str, cursor: usize, width: u16) -> (&str, u16) {
+    if width == 0 {
+        return ("", 0);
+    }
+
+    let cursor_idx = byte_index_for(value, cursor);
+    // Keep one column free for the caret when it sits past the last character.
+    let before_budget = width.saturating_sub(1) as usize;
+
+    let mut start = cursor_idx;
+    let mut before = 0usize;
+    for (idx, ch) in value[..cursor_idx].char_indices().rev() {
+        let ch_width = ch.width().unwrap_or(0);
+        if before + ch_width > before_budget {
+            break;
+        }
+        before += ch_width;
+        start = idx;
+    }
+
+    let mut end = cursor_idx;
+    let mut used = before;
+    for (idx, ch) in value[cursor_idx..].char_indices() {
+        let ch_width = ch.width().unwrap_or(0);
+        if used + ch_width > width as usize {
+            break;
+        }
+        used += ch_width;
+        end = cursor_idx + idx + ch.len_utf8();
+    }
+
+    (&value[start..end], before as u16)
+}
 
 /// Render the entire UI based on the currently active view.
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
@@ -47,6 +91,33 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(menu) = app.shortcut_menu() {
         render_shortcut_menu(frame, menu);
     }
+
+    if let Some(dialog) = app.save_attachment_dialog() {
+        let attachments = app.save_attachment_attachments();
+        let cursor = render_save_attachment_dialog(frame, dialog, attachments);
+        if let Some((x, y)) = cursor {
+            frame.set_cursor_position((x, y));
+        }
+    }
+}
+
+/// Frame of the throbber shown next to a background operation.
+///
+/// Driven purely by elapsed time, so every spinner in the UI animates off the
+/// main loop's redraw tick without any state of its own.
+fn spinner_frame(elapsed: Duration) -> char {
+    const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let idx = (elapsed.as_millis() / 80) as usize % SPINNER.len();
+    SPINNER[idx]
+}
+
+/// `⠹ Loading 'Invoice' (1.2s)` — one line describing work still running.
+fn progress_text(label: &str, elapsed: Duration) -> String {
+    format!(
+        "{} {label} ({:.1}s)",
+        spinner_frame(elapsed),
+        elapsed.as_secs_f32()
+    )
 }
 
 /// Draw the action bar, optionally reserving space for the commit indicator.
@@ -144,7 +215,11 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     let mut info_text = app.inbox_info_bar();
-    if let Some(status) = app.inbox_status_line()
+    // A load in flight outranks the last status: it is what the user is waiting for.
+    if let Some((label, elapsed)) = app.pending_message_load() {
+        info_text.push_str(" — ");
+        info_text.push_str(&progress_text(label, elapsed));
+    } else if let Some(status) = app.inbox_status_line()
         && !status.is_empty()
     {
         info_text.push_str(" — ");
@@ -217,7 +292,7 @@ fn render_search_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let y = area.y + margin_top;
     let popup_area = Rect::new(x, y, width, height);
 
-    let popup_style = Style::default().bg(ACTION_BAR_BG).fg(ACTION_BAR_FG);
+    let menu_style = Style::default().bg(ACTION_BAR_BG).fg(ACTION_BAR_FG);
     let dark_fg = Style::default().fg(Color::Black);
 
     let key_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
@@ -235,7 +310,7 @@ fn render_search_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .style(popup_style)
+        .style(menu_style)
         .border_style(Style::default().fg(ACTION_BAR_FG))
         .title_top(Line::styled(
             title,
@@ -256,7 +331,7 @@ fn render_search_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ];
 
     frame.render_widget(Clear, popup_area);
-    let paragraph = Paragraph::new(lines).style(popup_style).block(block);
+    let paragraph = Paragraph::new(lines).style(menu_style).block(block);
     frame.render_widget(paragraph, popup_area);
 }
 
@@ -294,10 +369,9 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
         dialog_height,
     );
 
-    let popup_style = Style::default().bg(Color::Black).fg(Color::White);
     let block = Block::default()
         .borders(Borders::ALL)
-        .style(popup_style)
+        .style(POPUP_STYLE)
         .border_style(Style::default().fg(Color::Gray));
     let inner = block.inner(modal_area);
 
@@ -308,11 +382,22 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
         return;
     }
 
+    let attachment_count = app
+        .compose_state()
+        .map(|state| state.attachments().len())
+        .unwrap_or(0);
+    let attachments_height = if attachment_count == 0 {
+        0
+    } else {
+        (attachment_count as u16).saturating_add(1).min(6)
+    };
+
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Length(4),
+            Constraint::Length(attachments_height),
             Constraint::Min(4),
             Constraint::Length(2),
             Constraint::Length(1),
@@ -320,7 +405,7 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
         .split(inner);
 
     let header = Paragraph::new(app.compose_action_bar())
-        .style(popup_style)
+        .style(POPUP_STYLE)
         .alignment(Alignment::Center);
     frame.render_widget(header, layout[0]);
 
@@ -352,25 +437,307 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
         }
     }
 
-    render_compose_body(frame, layout[2], app);
+    if attachments_height > 0 {
+        let state = app.compose_state().expect("compose state should exist");
+        render_compose_attachments(frame, layout[2], state);
+    }
+
+    render_compose_body(frame, layout[3], app);
+
+    // While the backend has the message the whole view is read-only, so nothing
+    // offers focus: no lit button, no cursor.
+    let pending_outgoing = app
+        .pending_outgoing()
+        .map(|(label, elapsed)| format!("{} — please wait", progress_text(label, elapsed)));
+    let busy = pending_outgoing.is_some();
 
     {
         let state = app.compose_state().expect("compose state should exist");
-        render_compose_buttons(frame, layout[3], state);
+        render_compose_buttons(frame, layout[4], state, busy);
     }
 
-    let status_text = app
-        .compose_status_line()
-        .map(|text| text.to_string())
-        .unwrap_or_else(|| "Tab to move between fields; Enter activates a button.".to_string());
+    let status_text = pending_outgoing
+        .or_else(|| app.compose_status_line().map(|text| text.to_string()))
+        .unwrap_or_else(|| {
+            "Tab to move between fields; Enter activates a button. Drop a file on the terminal to attach it."
+                .to_string()
+        });
     let status = Paragraph::new(status_text)
-        .style(popup_style)
+        .style(if busy {
+            POPUP_STYLE.fg(Color::Yellow)
+        } else {
+            POPUP_STYLE
+        })
         .alignment(Alignment::Center);
-    frame.render_widget(status, layout[4]);
+    frame.render_widget(status, layout[5]);
+
+    if let Some(prompt) = app
+        .compose_state()
+        .and_then(|state| state.attachment_prompt().map(|(v, c)| (v.to_string(), c)))
+    {
+        let prompt_cursor = render_attachment_prompt(frame, modal_area, &prompt.0, prompt.1);
+        if let Some(pos) = prompt_cursor {
+            cursor_pos = Some(pos);
+        }
+    }
+
+    if let Some((name, size, projected)) = app
+        .compose_state()
+        .and_then(|state| state.large_attachment_question())
+    {
+        render_large_attachment_prompt(frame, modal_area, &name, size, projected);
+        // The question owns the view until it is answered; nothing underneath
+        // it takes typing, so nothing underneath it shows a caret.
+        cursor_pos = None;
+    }
+
+    if busy {
+        cursor_pos = None;
+    }
 
     if let Some((x, y)) = cursor_pos {
         frame.set_cursor_position((x, y));
     }
+}
+
+fn render_compose_attachments(frame: &mut Frame<'_>, area: Rect, state: &ComposeState) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let focused = state.is_attachments_focused();
+    let attachments = state.attachments();
+    let selected = state.attachment_selected();
+
+    let label_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(Color::DarkGray);
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(format!("Attachments ({}):", attachments.len()), label_style),
+        // What the message weighs on the wire, which is what a provider's limit
+        // is measured against -- see ComposeState::message_size.
+        Span::styled(
+            format!(
+                "  message size {}",
+                format_size(state.message_size()).trim()
+            ),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled("  [Del/Backspace to remove]", muted),
+    ]))
+    .style(POPUP_STYLE);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    frame.render_widget(header, rows[0]);
+
+    let list_area = rows[1];
+    if list_area.height == 0 {
+        return;
+    }
+
+    let visible = list_area.height as usize;
+    let total = attachments.len();
+    let sel = selected.unwrap_or(0);
+    let start = if total > visible {
+        sel.saturating_sub(visible - 1)
+    } else {
+        0
+    };
+
+    let entry_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(vec![Constraint::Length(1); visible.min(total.max(1))])
+        .split(list_area);
+
+    for (row_idx, attachment_idx) in (start..total.min(start + visible)).enumerate() {
+        let Some(area) = entry_rows.get(row_idx) else {
+            break;
+        };
+        let attachment = &attachments[attachment_idx];
+        let is_selected = Some(attachment_idx) == selected;
+        let row_style = if focused && is_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else if is_selected {
+            Style::default().bg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+        let marker = if is_selected { "▶ " } else { "  " };
+        let text = format!(
+            "{marker}{name}  ({mime}, {size})",
+            name = attachment.filename,
+            mime = attachment.mime_type,
+            size = format_size(attachment.size()).trim()
+        );
+        let line = Line::from(Span::styled(text, row_style));
+        let paragraph = Paragraph::new(line).style(POPUP_STYLE);
+        frame.render_widget(paragraph, *area);
+    }
+
+    if total == 0 {
+        let placeholder =
+            Paragraph::new(Line::from(Span::styled("(none)", muted))).style(POPUP_STYLE);
+        if let Some(area) = entry_rows.first() {
+            frame.render_widget(placeholder, *area);
+        }
+    }
+}
+
+fn render_attachment_prompt(
+    frame: &mut Frame<'_>,
+    modal_area: Rect,
+    value: &str,
+    cursor: usize,
+) -> Option<(u16, u16)> {
+    let min_width: u16 = 50;
+    let width = modal_area
+        .width
+        .saturating_sub(4)
+        .min(80)
+        .max(min_width.min(modal_area.width));
+    if width < 10 {
+        return None;
+    }
+    let height: u16 = 4;
+    if modal_area.height < height + 2 {
+        return None;
+    }
+
+    let x = modal_area.x + modal_area.width.saturating_sub(width) / 2;
+    let y = modal_area.y + modal_area.height.saturating_sub(height) / 2;
+    let area = Rect::new(x, y, width, height);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title_top(Line::styled(
+            " Attach file ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(vec![
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw(": attach  "),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::raw(": cancel"),
+        ]));
+    let inner = block.inner(area);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+
+    let label = "Path: ";
+    let label_width = label.width() as u16;
+    let (visible, cursor_col) =
+        text_field_view(value, cursor, inner.width.saturating_sub(label_width));
+
+    let line = Line::from(vec![
+        Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            visible.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let paragraph = Paragraph::new(line).style(POPUP_STYLE);
+    frame.render_widget(paragraph, inner);
+
+    let max_x = inner.x + inner.width.saturating_sub(1);
+    let cursor_x = (inner.x + label_width + cursor_col).min(max_x);
+    Some((cursor_x, inner.y))
+}
+
+/// Ask whether a file large enough to matter should really be attached.
+///
+/// No text field, so nothing here claims the cursor: the dialog takes a yes or
+/// a no and hands compose straight back.
+fn render_large_attachment_prompt(
+    frame: &mut Frame<'_>,
+    modal_area: Rect,
+    name: &str,
+    size: usize,
+    projected: usize,
+) {
+    let min_width: u16 = 50;
+    let width = modal_area
+        .width
+        .saturating_sub(4)
+        .min(80)
+        .max(min_width.min(modal_area.width));
+    if width < 10 {
+        return;
+    }
+    let height: u16 = 4;
+    if modal_area.height < height + 2 {
+        return;
+    }
+
+    let x = modal_area.x + modal_area.width.saturating_sub(width) / 2;
+    let y = modal_area.y + modal_area.height.saturating_sub(height) / 2;
+    let area = Rect::new(x, y, width, height);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title_top(Line::styled(
+            " Large attachment ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(vec![
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw("/"),
+            Span::styled("y", Style::default().fg(Color::Yellow)),
+            Span::raw(": attach  "),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::raw("/"),
+            Span::styled("n", Style::default().fg(Color::Yellow)),
+            Span::raw(": skip"),
+        ]));
+    let inner = block.inner(area);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // The size leads the second line rather than trailing the name, so a long
+    // name being clipped cannot take the number with it.
+    let lines = vec![
+        Line::from(Span::styled(
+            name.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::raw(format!(
+            "{}. Attach anyway? Message would be {}.",
+            format_size(size).trim(),
+            format_size(projected).trim()
+        ))),
+    ];
+    frame.render_widget(Paragraph::new(lines).style(POPUP_STYLE), inner);
 }
 
 fn render_compose_field(
@@ -385,8 +752,7 @@ fn render_compose_field(
     }
 
     let focused = state.is_field_focused(field);
-    let (value, _) = state.field_data(field);
-    let (before, _) = state.field_parts(field);
+    let (value, cursor) = state.field_data(field);
 
     let label_text = format!("{label}: ");
     let label_style = Style::default()
@@ -401,11 +767,18 @@ fn render_compose_field(
         Style::default().fg(Color::White)
     };
 
-    let mut spans = vec![Span::styled(label_text.clone(), label_style)];
+    let label_width = label_text.width() as u16;
+    // An unfocused field scrolls back to the start: its cursor is wherever the
+    // user last left it, and the head of an address is the useful part.
+    let view_cursor = if focused { cursor } else { 0 };
+    let (visible, cursor_col) =
+        text_field_view(value, view_cursor, area.width.saturating_sub(label_width));
+
+    let mut spans = vec![Span::styled(label_text, label_style)];
     if value.is_empty() {
         spans.push(Span::styled("<empty>".to_string(), placeholder_style));
     } else {
-        spans.push(Span::styled(value.to_string(), value_style));
+        spans.push(Span::styled(visible.to_string(), value_style));
     }
 
     let base_style = if focused {
@@ -414,22 +787,15 @@ fn render_compose_field(
         Style::default().bg(Color::Black)
     };
 
-    let paragraph = Paragraph::new(Line::from(spans))
-        .style(base_style)
-        .wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(Line::from(spans)).style(base_style);
     frame.render_widget(paragraph, area);
 
     if !focused {
         return None;
     }
 
-    let label_width = label_text.chars().count() as u16;
-    let before_width = before.chars().count() as u16;
     let max_x = area.x + area.width.saturating_sub(1);
-    let mut cursor_x = area.x + label_width + before_width;
-    if cursor_x > max_x {
-        cursor_x = max_x;
-    }
+    let cursor_x = (area.x + label_width + cursor_col).min(max_x);
 
     Some((cursor_x, area.y))
 }
@@ -523,12 +889,13 @@ fn render_compose_body(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_compose_buttons(frame: &mut Frame<'_>, area: Rect, state: &ComposeState) {
+fn render_compose_buttons(frame: &mut Frame<'_>, area: Rect, state: &ComposeState, disabled: bool) {
     if area.height == 0 || area.width == 0 {
         return;
     }
 
     let buttons = [
+        (ComposeButton::Attach, "Attach file..."),
         (ComposeButton::Cancel, "Cancel"),
         (ComposeButton::Edit, "Edit message"),
         (ComposeButton::Draft, "Draft"),
@@ -539,6 +906,13 @@ fn render_compose_buttons(frame: &mut Frame<'_>, area: Rect, state: &ComposeStat
     for (idx, (button, label)) in buttons.iter().enumerate() {
         if idx > 0 {
             spans.push(Span::raw("   "));
+        }
+        if disabled {
+            spans.push(Span::styled(
+                format!("[{label}]"),
+                Style::default().fg(Color::DarkGray),
+            ));
+            continue;
         }
         let focused = matches!(state.focus(), ComposeFocus::Button(active) if active == *button);
         if focused {
@@ -585,7 +959,10 @@ fn render_message(frame: &mut Frame<'_>, app: &mut App) {
 
     render_message_body(frame, view, layout[1]);
 
-    let info_text = view.info_line.clone().unwrap_or_else(String::new);
+    let info_text = match app.pending_message_load() {
+        Some((label, elapsed)) => progress_text(label, elapsed),
+        None => view.info_line.clone().unwrap_or_default(),
+    };
     let info_bar = Paragraph::new(info_text)
         .style(action_bar_style())
         .block(Block::default());
@@ -954,10 +1331,9 @@ fn render_shortcut_menu(frame: &mut Frame<'_>, menu: &ShortcutMenu) {
     let y = frame_area.y + frame_area.height - height - 1;
     let area = Rect::new(x, y, width, height);
 
-    let popup_style = Style::default().bg(Color::Black).fg(Color::White);
     let block = Block::default()
         .borders(Borders::ALL)
-        .style(popup_style)
+        .style(POPUP_STYLE)
         .border_style(Style::default().fg(Color::Gray))
         .title_top(Line::styled(
             title,
@@ -968,11 +1344,217 @@ fn render_shortcut_menu(frame: &mut Frame<'_>, menu: &ShortcutMenu) {
 
     frame.render_widget(Clear, area);
     let paragraph = Paragraph::new(lines)
-        .style(popup_style)
+        .style(POPUP_STYLE)
         .block(block)
         .wrap(Wrap { trim: false });
 
     frame.render_widget(paragraph, area);
+}
+
+fn render_save_attachment_dialog(
+    frame: &mut Frame<'_>,
+    dialog: &SaveAttachmentDialog,
+    attachments: &[MessageAttachment],
+) -> Option<(u16, u16)> {
+    let frame_area = frame.area();
+    let width = frame_area.width.min(80).max(30.min(frame_area.width));
+    let list_rows = attachments.len().min(10) as u16;
+    let height = (1 /* top border */ + 1 /* folder label */ + 1 /* folder value */ + 1 /* spacer */
+        + 1 /* list header */
+        + list_rows.max(1)
+        + 1 /* status */
+        + 1/* bottom border */)
+        .min(frame_area.height);
+
+    if width < 20 || height < 6 {
+        return None;
+    }
+
+    let x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
+    let y = frame_area.y + frame_area.height.saturating_sub(height) / 2;
+    let area = Rect::new(x, y, width, height);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(POPUP_STYLE)
+        .title_top(Line::styled(
+            " Save attachment ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(vec![
+            Span::styled("Tab", Style::default().fg(Color::Yellow)),
+            Span::raw(": switch focus  "),
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw(": save  "),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::raw(": cancel"),
+        ]));
+    let inner = block.inner(area);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let label_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled("Folder:", label_style))).style(POPUP_STYLE),
+        layout[0],
+    );
+
+    let folder_focused = matches!(dialog.focus(), SaveAttachmentFocus::Folder);
+    let (folder_value, folder_cursor) = dialog.folder_data();
+    // The leading space in front of the value.
+    let folder_indent = 1u16;
+    let (folder_visible, folder_cursor_col) = text_field_view(
+        folder_value,
+        if folder_focused { folder_cursor } else { 0 },
+        layout[1].width.saturating_sub(folder_indent),
+    );
+    let folder_style = if folder_focused {
+        Style::default()
+            .fg(Color::Yellow)
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let folder_text = if folder_value.is_empty() {
+        Span::styled("<empty>", Style::default().fg(Color::DarkGray))
+    } else {
+        Span::styled(folder_visible.to_string(), folder_style)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![Span::raw(" "), folder_text])).style(POPUP_STYLE),
+        layout[1],
+    );
+
+    let list_focused = matches!(dialog.focus(), SaveAttachmentFocus::List);
+    let list_header = format!("Attachments ({}):", attachments.len());
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(list_header, label_style))).style(POPUP_STYLE),
+        layout[3],
+    );
+
+    let list_area = layout[4];
+    if list_area.height > 0 {
+        let visible = list_area.height as usize;
+        let total = attachments.len();
+        let selected = dialog.selected().min(total.saturating_sub(1));
+        let start = if total > visible {
+            selected.saturating_sub(visible - 1)
+        } else {
+            0
+        };
+
+        let row_constraints: Vec<_> =
+            std::iter::repeat_n(Constraint::Length(1), visible.min(total.max(1))).collect();
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(row_constraints)
+            .split(list_area);
+
+        if total == 0 {
+            if let Some(area) = rows.first() {
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        "(none)",
+                        Style::default().fg(Color::DarkGray),
+                    )))
+                    .style(POPUP_STYLE),
+                    *area,
+                );
+            }
+        } else {
+            for (row_idx, attachment_idx) in (start..total.min(start + visible)).enumerate() {
+                let Some(area) = rows.get(row_idx) else {
+                    break;
+                };
+                let attachment = &attachments[attachment_idx];
+                let is_selected = attachment_idx == selected;
+                let row_style = if list_focused && is_selected {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else if is_selected {
+                    Style::default().bg(Color::DarkGray)
+                } else {
+                    Style::default()
+                };
+                let marker = if is_selected { "▶ " } else { "  " };
+                let name = attachment
+                    .filename
+                    .as_deref()
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or("(unnamed attachment)");
+                let text = format!(
+                    "{marker}{name}  ({mime}, {size}{inline})",
+                    mime = attachment.mime_type,
+                    size = format_size(attachment.size).trim(),
+                    // Saying so explains why the message carries no `@`.
+                    inline = if attachment.inline { ", inline" } else { "" }
+                );
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(text, row_style))).style(POPUP_STYLE),
+                    *area,
+                );
+            }
+        }
+    }
+
+    let status_line = if let Some((filename, elapsed)) = dialog.active_operation() {
+        Line::from(vec![
+            Span::styled(
+                spinner_frame(elapsed).to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("Saving '{filename}' ({:.1}s)...", elapsed.as_secs_f32()),
+                Style::default().fg(Color::Yellow),
+            ),
+        ])
+    } else {
+        let status_text = dialog.status().map(|s| s.to_string()).unwrap_or_else(|| {
+            "Tab to change focus, Up/Down to pick an attachment, Enter to save.".to_string()
+        });
+        Line::from(Span::styled(
+            status_text,
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+    frame.render_widget(Paragraph::new(status_line).style(POPUP_STYLE), layout[5]);
+
+    if folder_focused && !dialog.is_busy() {
+        let max_x = layout[1].x + layout[1].width.saturating_sub(1);
+        let cursor_x = (layout[1].x + folder_indent + folder_cursor_col).min(max_x);
+        Some((cursor_x, layout[1].y))
+    } else {
+        None
+    }
 }
 
 /// Render the message body pane, including metadata and FTML/HTML content.
@@ -995,9 +1577,10 @@ fn render_message_body(frame: &mut Frame<'_>, view: &MessageViewState, area: Rec
                 .unwrap_or("(unnamed attachment)");
             let size_display = format_size(attachment.size);
             let size_display = size_display.trim().to_string();
+            let inline = if attachment.inline { ", inline" } else { "" };
             lines.push(Line::raw(format!(
-                "- {} ({}, {})",
-                display_name, attachment.mime_type, size_display
+                "- {} ({}, {}{})",
+                display_name, attachment.mime_type, size_display, inline
             )));
         }
     }
@@ -1052,9 +1635,11 @@ fn render_message_body(frame: &mut Frame<'_>, view: &MessageViewState, area: Rec
 }
 
 fn message_action_bar(app: &App, view: &MessageViewState) -> String {
-    let mut text = String::from(
-        "q:Close s:Star +/=:Important -:NotImportant r:Reply f:Forward y:Archive d:Delete",
-    );
+    let mut text = String::from("q:Close s:Star");
+    if !view.content.attachments.is_empty() {
+        text.push_str(" S:SaveAttachment");
+    }
+    text.push_str(" +/=:Important -:NotImportant r:Reply f:Forward y:Archive d:Delete");
     text.push_str(" Up/Down/Space:Scroll");
 
     let total = app.inbox_messages().len();
@@ -1166,4 +1751,118 @@ fn plain_text(content: &crate::model::MessageContent) -> Option<String> {
         String::from_utf8(part.content.clone())
             .unwrap_or_else(|_| String::from_utf8_lossy(&part.content).into_owned())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::text_field_view;
+
+    #[test]
+    fn text_field_view_shows_the_whole_value_when_it_fits() {
+        assert_eq!(text_field_view("draft.txt", 9, 20), ("draft.txt", 9));
+        assert_eq!(text_field_view("draft.txt", 0, 20), ("draft.txt", 0));
+        assert_eq!(text_field_view("", 0, 20), ("", 0));
+    }
+
+    #[test]
+    fn text_field_view_scrolls_with_the_cursor() {
+        let path = "/home/rob/documents/invoice.pdf";
+
+        // Cursor at the end: the window ends there and keeps one column for the
+        // caret, so the tail of a long path stays readable instead of clipping.
+        assert_eq!(text_field_view(path, path.len(), 10), ("voice.pdf", 9));
+
+        // Cursor at the start: the window starts there and fills the field.
+        assert_eq!(text_field_view(path, 0, 10), ("/home/rob/", 0));
+
+        // Cursor in the middle: the text before it fills the field, and one
+        // more character shows on the far side.
+        assert_eq!(text_field_view(path, 12, 10), ("me/rob/doc", 9));
+    }
+
+    #[test]
+    fn text_field_view_measures_in_display_columns() {
+        // Each of these is two columns wide, so only four fit in a field of
+        // nine columns once the caret's column is reserved.
+        let (visible, cursor) = text_field_view("日本語表示", 5, 9);
+        assert_eq!(visible, "本語表示");
+        assert_eq!(cursor, 8);
+    }
+
+    #[test]
+    fn attachment_prompt_renders_a_wide_path_without_panicking() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("terminal");
+        let path = "/home/rob/文書/very-long-attachment-name.pdf";
+        for cursor in [0usize, 12, path.chars().count()] {
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    super::render_attachment_prompt(frame, area, path, cursor);
+                })
+                .expect("draw");
+        }
+    }
+
+    #[test]
+    fn text_field_view_handles_a_zero_width_field() {
+        assert_eq!(text_field_view("anything", 4, 0), ("", 0));
+    }
+
+    #[test]
+    fn the_large_attachment_question_reaches_the_screen() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                super::render_large_attachment_prompt(
+                    frame,
+                    area,
+                    "holiday.mov",
+                    24_000_000,
+                    33_000_000,
+                );
+            })
+            .expect("draw");
+
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(screen.contains("holiday.mov"), "{screen}");
+        assert!(screen.contains("Large attachment"), "{screen}");
+        // Both sizes: what the file weighs and what it would do to the message.
+        assert!(screen.contains("24M"), "{screen}");
+        assert!(screen.contains("33M"), "{screen}");
+        assert!(screen.contains("attach"), "{screen}");
+    }
+
+    /// A terminal too short for the dialog must skip it, not panic.
+    #[test]
+    fn the_large_attachment_question_gives_up_on_a_tiny_screen() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        for (width, height) in [(60u16, 4u16), (8, 14), (1, 1)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    super::render_large_attachment_prompt(
+                        frame,
+                        area,
+                        "holiday.mov",
+                        24_000_000,
+                        33_000_000,
+                    );
+                })
+                .expect("draw");
+        }
+    }
 }

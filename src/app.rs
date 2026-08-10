@@ -5,24 +5,32 @@
 //! The type is intentionally synchronous from the TUI's perspective yet internally
 //! manages asynchronous commit results via channels so the UI thread never blocks.
 
-use crate::backend::{ActionStatus, BackendEvent, MailBackend, OutgoingMessage};
+use crate::backend::{
+    ActionStatus, BackendEvent, MailBackend, OutgoingAttachment, OutgoingMessage,
+};
 use crate::model::{
-    Action, ActionType, MailboxKind, Message, MessageContent, MessageContentPart, MessageId,
-    MessageStatus, format_size, padded_sender,
+    Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
+    MessageContentPart, MessageId, MessageStatus, format_size, padded_sender,
 };
 use anyhow::{Context, Result, anyhow};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::{
+    cursor::Show,
+    event::{DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyModifiers},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
 use shell_words::split as shell_split;
 use std::{
     cmp::{max, min},
     collections::VecDeque,
     env, fs,
-    io::{Cursor, Write},
+    io::{self, Cursor, Write},
     ops::{Deref, DerefMut},
     path::PathBuf,
-    process::Command,
+    process::{Command, ExitStatus},
     sync::{
         Arc,
+        atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, TryRecvError},
     },
     thread,
@@ -39,6 +47,14 @@ use time::{OffsetDateTime, format_description::well_known::Rfc2822};
 
 const PAGE_JUMP: isize = 5;
 const PROGRESS_SEGMENTS: usize = 5;
+
+/// A file this size or larger is worth asking about before it is attached.
+///
+/// Reading a file attaches its whole content to the message in memory, and
+/// providers reject what they consider too big only after the upload finishes
+/// -- Gmail's ceiling is 25 MB of *encoded* message.  Anything under this is
+/// small enough that asking would only be in the way.
+const LARGE_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Whether the progress indicator represents a read (loading) or write (committing) operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +216,77 @@ struct MailboxLoaderState {
     receiver: Receiver<MailboxLoadUpdate>,
 }
 
+/// What the UI does with a message body once the worker delivers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MessageLoadPurpose {
+    /// Show it in the message viewer.
+    View,
+    Reply {
+        reply_all: bool,
+    },
+    Forward,
+    /// Reopen it in compose for further editing.
+    Draft,
+}
+
+impl MessageLoadPurpose {
+    /// Whether compose needs the attachment bytes, which may mean a download.
+    fn needs_attachments(self) -> bool {
+        matches!(self, Self::Forward | Self::Draft)
+    }
+}
+
+/// Everything a single background message load produces.
+struct LoadedMessage {
+    content: MessageContent,
+    /// Attachments rebuilt for compose; empty unless the load feeds compose.
+    attachments: Vec<OutgoingAttachment>,
+    /// How many attachments could not be recovered at all.
+    unavailable: usize,
+}
+
+/// A message body being fetched on a worker thread.
+struct MessageLoadOperation {
+    /// The list entry the load started from; headers are taken from here.
+    message: Message,
+    purpose: MessageLoadPurpose,
+    /// Body the viewer had already rendered, reused so a reply quotes exactly
+    /// what was on screen.
+    cached_document: Option<Document>,
+    receiver: Receiver<Result<LoadedMessage, String>>,
+    started: Instant,
+    /// What the progress indicator says while this runs.
+    label: String,
+}
+
+/// Whether an in-flight submission is a send or a draft save.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutgoingKind {
+    Send,
+    Draft,
+}
+
+impl OutgoingKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Send => "Sending message",
+            Self::Draft => "Saving draft",
+        }
+    }
+}
+
+/// A composed message handed to the backend on a worker thread.
+///
+/// Compose stays open and locked until the worker reports back: on success it
+/// closes, on failure the text is still there to retry with.
+struct OutgoingOperation {
+    kind: OutgoingKind,
+    /// Draft this submission replaces; deleted once the backend accepts it.
+    draft_id: Option<MessageId>,
+    receiver: Receiver<Result<(), String>>,
+    started: Instant,
+}
+
 struct SearchState {
     input: TextFieldState,
     focused: bool,
@@ -250,6 +337,8 @@ pub struct AccountState {
     commit_progress: Option<CommitProgress>,
     mailbox_loader: Option<MailboxLoaderState>,
     mailbox_load_progress: Option<CommitProgress>,
+    /// Message body being fetched for this account, if any.
+    message_loader: Option<MessageLoadOperation>,
     scheduled_actions: Vec<Action>,
     current_mailbox: MailboxKind,
     search: Option<SearchState>,
@@ -310,6 +399,105 @@ pub struct App {
     should_quit: bool,
     pending_shortcut: Option<ShortcutMenuState>,
     pending_navigation: Option<PendingNavigation>,
+    save_attachment: Option<SaveAttachmentDialog>,
+    /// Send or draft-save running on a worker thread.
+    outgoing: Option<OutgoingOperation>,
+    /// Set when something took the screen away from the renderer, so the next
+    /// frame has to be painted in full rather than diffed against a screen that
+    /// no longer holds what the renderer last drew.
+    needs_full_redraw: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SaveAttachmentFocus {
+    Folder,
+    List,
+}
+
+pub(crate) struct SaveAttachmentDialog {
+    folder: TextFieldState,
+    selected: usize,
+    focus: SaveAttachmentFocus,
+    status: Option<String>,
+    operation: Option<SaveAttachmentOperation>,
+}
+
+struct SaveAttachmentOperation {
+    receiver: Receiver<Result<PathBuf, String>>,
+    started: Instant,
+    filename: String,
+    /// Set when the user dismisses the dialog so the worker stops before it
+    /// writes anything to disk.
+    cancel: Arc<AtomicBool>,
+}
+
+impl SaveAttachmentDialog {
+    fn new(folder: String) -> Self {
+        let mut field = TextFieldState::default();
+        field.value = folder;
+        field.cursor = text_len(&field.value);
+        Self {
+            folder: field,
+            selected: 0,
+            focus: SaveAttachmentFocus::List,
+            status: None,
+            operation: None,
+        }
+    }
+
+    /// Folder value and cursor position, shaped like
+    /// [`ComposeState::field_data`] so both feed the same field renderer.
+    pub(crate) fn folder_data(&self) -> (&str, usize) {
+        (&self.folder.value[..], self.folder.cursor)
+    }
+
+    pub(crate) fn selected(&self) -> usize {
+        self.selected
+    }
+
+    pub(crate) fn focus(&self) -> SaveAttachmentFocus {
+        self.focus
+    }
+
+    pub(crate) fn status(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+
+    pub(crate) fn active_operation(&self) -> Option<(&str, std::time::Duration)> {
+        self.operation
+            .as_ref()
+            .map(|op| (op.filename.as_str(), op.started.elapsed()))
+    }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        self.operation.is_some()
+    }
+
+    fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            SaveAttachmentFocus::Folder => SaveAttachmentFocus::List,
+            SaveAttachmentFocus::List => SaveAttachmentFocus::Folder,
+        };
+    }
+
+    fn set_status<S: Into<String>>(&mut self, status: S) {
+        self.status = Some(status.into());
+    }
+
+    fn clear_status(&mut self) {
+        self.status = None;
+    }
+
+    /// Ask the running save operation to stop before it touches the disk.
+    ///
+    /// The download itself cannot be interrupted, but the worker checks this
+    /// flag before writing, so dismissing the dialog leaves no partial file
+    /// behind.
+    fn cancel_operation(&mut self) {
+        if let Some(op) = self.operation.as_ref() {
+            op.cancel.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Cached inbox view derived from backend events.
@@ -346,6 +534,7 @@ pub(crate) enum ComposeField {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ComposeButton {
+    Attach,
     Cancel,
     Edit,
     Draft,
@@ -355,6 +544,7 @@ pub(crate) enum ComposeButton {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ComposeFocus {
     Field(ComposeField),
+    Attachments,
     Body,
     Button(ComposeButton),
 }
@@ -365,12 +555,40 @@ struct TextFieldState {
     cursor: usize,
 }
 
+/// One attach request -- a path from the prompt, or a whole terminal drop --
+/// working its way into the message.
+///
+/// A drop can hold several files and any of them may be big enough to ask
+/// about, so the request cannot be finished in one go: it parks in `asking`
+/// until the user answers, and the tallies survive that wait so the closing
+/// summary can still say what the whole request did.
+#[derive(Default)]
+struct AttachBatch {
+    /// Paths not looked at yet.
+    queue: VecDeque<String>,
+    /// The oversized file waiting for a yes or no, with its size on disk.
+    asking: Option<(String, u64)>,
+    attached: usize,
+    /// Bytes attached so far, for the summary.
+    bytes: usize,
+    declined: usize,
+}
+
 pub(crate) struct ComposeState {
     to: TextFieldState,
     cc: TextFieldState,
     bcc: TextFieldState,
     subject: TextFieldState,
+    attachments: Vec<OutgoingAttachment>,
+    attachment_selected: usize,
+    attachment_prompt: Option<TextFieldState>,
+    attach: AttachBatch,
     body: Document,
+    /// Serialized size of [`Self::body`], measured whenever it changes.
+    ///
+    /// Serializing renders the whole document, and the compose dialog redraws
+    /// on every tick, so the size cannot be computed where it is displayed.
+    body_bytes: usize,
     draft_id: Option<MessageId>,
     focus: ComposeFocus,
     status: Option<String>,
@@ -385,7 +603,12 @@ impl Default for ComposeState {
             cc: TextFieldState::default(),
             bcc: TextFieldState::default(),
             subject: TextFieldState::default(),
+            attachments: Vec::new(),
+            attachment_selected: 0,
+            attachment_prompt: None,
+            attach: AttachBatch::default(),
             body: Document::new(),
+            body_bytes: 0,
             draft_id: None,
             focus: ComposeFocus::Field(ComposeField::To),
             status: None,
@@ -395,23 +618,12 @@ impl Default for ComposeState {
     }
 }
 
-const COMPOSE_BUTTON_SEQUENCE: [ComposeButton; 4] = [
+const COMPOSE_BUTTON_SEQUENCE: [ComposeButton; 5] = [
+    ComposeButton::Attach,
     ComposeButton::Cancel,
     ComposeButton::Edit,
     ComposeButton::Draft,
     ComposeButton::Send,
-];
-
-const COMPOSE_FOCUS_SEQUENCE: [ComposeFocus; 9] = [
-    ComposeFocus::Field(ComposeField::To),
-    ComposeFocus::Field(ComposeField::Cc),
-    ComposeFocus::Field(ComposeField::Bcc),
-    ComposeFocus::Field(ComposeField::Subject),
-    ComposeFocus::Body,
-    ComposeFocus::Button(ComposeButton::Cancel),
-    ComposeFocus::Button(ComposeButton::Edit),
-    ComposeFocus::Button(ComposeButton::Draft),
-    ComposeFocus::Button(ComposeButton::Send),
 ];
 
 impl ComposeState {
@@ -439,7 +651,7 @@ impl ComposeState {
         state.bcc.cursor = text_len(&state.bcc.value);
         state.subject.value = subject;
         state.subject.cursor = text_len(&state.subject.value);
-        state.body = body;
+        state.assign_body(body);
         state.body_scroll = 0;
         state.body_view_height = 0;
         state.focus = ComposeFocus::Body;
@@ -454,26 +666,45 @@ impl ComposeState {
         self.focus = focus;
     }
 
+    fn focus_sequence(&self) -> Vec<ComposeFocus> {
+        let mut sequence = vec![
+            ComposeFocus::Field(ComposeField::To),
+            ComposeFocus::Field(ComposeField::Cc),
+            ComposeFocus::Field(ComposeField::Bcc),
+            ComposeFocus::Field(ComposeField::Subject),
+        ];
+        if !self.attachments.is_empty() {
+            sequence.push(ComposeFocus::Attachments);
+        }
+        sequence.push(ComposeFocus::Body);
+        for button in COMPOSE_BUTTON_SEQUENCE {
+            sequence.push(ComposeFocus::Button(button));
+        }
+        sequence
+    }
+
     fn focus_next(&mut self) {
-        let current_idx = COMPOSE_FOCUS_SEQUENCE
+        let sequence = self.focus_sequence();
+        let current_idx = sequence
             .iter()
             .position(|focus| *focus == self.focus)
             .unwrap_or(0);
-        let next = (current_idx + 1) % COMPOSE_FOCUS_SEQUENCE.len();
-        self.focus = COMPOSE_FOCUS_SEQUENCE[next];
+        let next = (current_idx + 1) % sequence.len();
+        self.focus = sequence[next];
     }
 
     fn focus_prev(&mut self) {
-        let current_idx = COMPOSE_FOCUS_SEQUENCE
+        let sequence = self.focus_sequence();
+        let current_idx = sequence
             .iter()
             .position(|focus| *focus == self.focus)
             .unwrap_or(0);
         let prev = if current_idx == 0 {
-            COMPOSE_FOCUS_SEQUENCE.len() - 1
+            sequence.len() - 1
         } else {
             current_idx - 1
         };
-        self.focus = COMPOSE_FOCUS_SEQUENCE[prev];
+        self.focus = sequence[prev];
     }
 
     fn focus_button_next(&mut self) {
@@ -541,12 +772,6 @@ impl ComposeState {
         matches!(self.focus, ComposeFocus::Field(active) if active == field)
     }
 
-    pub(crate) fn field_parts(&self, field: ComposeField) -> (&str, &str) {
-        let (value, cursor) = self.field_data(field);
-        let idx = byte_index_for(value, cursor);
-        value.split_at(idx)
-    }
-
     fn field_state_mut(&mut self, field: ComposeField) -> &mut TextFieldState {
         match field {
             ComposeField::To => &mut self.to,
@@ -584,7 +809,143 @@ impl ComposeState {
             subject: self.subject.value.clone(),
             text_body,
             html_body,
+            attachments: self.attachments.clone(),
         })
+    }
+
+    pub(crate) fn attachments(&self) -> &[OutgoingAttachment] {
+        &self.attachments
+    }
+
+    /// Rough size of the message as it will go on the wire.
+    ///
+    /// Attachments are base64-encoded when the MIME body is built, and the
+    /// encoded figure is the one a provider measures against its limit, so
+    /// showing what the files take on disk would understate the message by a
+    /// third.  Headers and MIME boundaries are left out: they are noise next to
+    /// anything worth watching the size of.
+    pub(crate) fn message_size(&self) -> usize {
+        let attachments: usize = self
+            .attachments
+            .iter()
+            .map(|attachment| base64_size(attachment.size()))
+            .sum();
+        self.body_bytes + attachments
+    }
+
+    /// The oversized file waiting for an answer: its name, its size on disk,
+    /// and what the message would weigh once it is in.
+    pub(crate) fn large_attachment_question(&self) -> Option<(String, usize, usize)> {
+        self.attach.asking.as_ref().map(|(path, size)| {
+            let size = *size as usize;
+            let expanded = expand_user_path(path);
+            let name = expanded
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
+            (name, size, self.message_size() + base64_size(size))
+        })
+    }
+
+    fn is_asking_about_large_attachment(&self) -> bool {
+        self.attach.asking.is_some()
+    }
+
+    pub(crate) fn is_attachments_focused(&self) -> bool {
+        matches!(self.focus, ComposeFocus::Attachments)
+    }
+
+    pub(crate) fn attachment_selected(&self) -> Option<usize> {
+        if self.attachments.is_empty() {
+            None
+        } else {
+            Some(self.attachment_selected.min(self.attachments.len() - 1))
+        }
+    }
+
+    pub(crate) fn attachment_prompt(&self) -> Option<(&str, usize)> {
+        self.attachment_prompt
+            .as_ref()
+            .map(|state| (state.value.as_str(), state.cursor))
+    }
+
+    pub(crate) fn is_attachment_prompt_active(&self) -> bool {
+        self.attachment_prompt.is_some()
+    }
+
+    fn attachment_prompt_mut(&mut self) -> Option<&mut TextFieldState> {
+        self.attachment_prompt.as_mut()
+    }
+
+    fn open_attachment_prompt(&mut self) {
+        self.attachment_prompt = Some(TextFieldState::default());
+    }
+
+    fn close_attachment_prompt(&mut self) {
+        self.attachment_prompt = None;
+    }
+
+    fn add_attachment(&mut self, attachment: OutgoingAttachment) {
+        self.attachments.push(attachment);
+        self.attachment_selected = self.attachments.len() - 1;
+    }
+
+    /// Replace the attachment list, used when seeding compose from an existing
+    /// message (reopening a draft, forwarding).
+    fn set_attachments(&mut self, attachments: Vec<OutgoingAttachment>) {
+        self.attachments = attachments;
+        self.attachment_selected = 0;
+    }
+
+    fn remove_selected_attachment(&mut self) -> Option<OutgoingAttachment> {
+        if self.attachments.is_empty() {
+            return None;
+        }
+        let idx = self.attachment_selected.min(self.attachments.len() - 1);
+        let removed = self.attachments.remove(idx);
+        if self.attachments.is_empty() {
+            self.attachment_selected = 0;
+            if matches!(self.focus, ComposeFocus::Attachments) {
+                self.focus = ComposeFocus::Body;
+            }
+        } else if self.attachment_selected >= self.attachments.len() {
+            self.attachment_selected = self.attachments.len() - 1;
+        }
+        Some(removed)
+    }
+
+    fn select_attachment_next(&mut self) -> bool {
+        if self.attachments.is_empty() {
+            return false;
+        }
+        if self.attachment_selected + 1 < self.attachments.len() {
+            self.attachment_selected += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn select_attachment_prev(&mut self) -> bool {
+        if self.attachments.is_empty() {
+            return false;
+        }
+        if self.attachment_selected > 0 {
+            self.attachment_selected -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn select_attachment_first(&mut self) {
+        self.attachment_selected = 0;
+    }
+
+    fn select_attachment_last(&mut self) {
+        if !self.attachments.is_empty() {
+            self.attachment_selected = self.attachments.len() - 1;
+        }
     }
 
     pub(crate) fn body(&self) -> &Document {
@@ -592,9 +953,23 @@ impl ComposeState {
     }
 
     pub(crate) fn set_body(&mut self, document: Document) {
-        self.body = document;
+        self.assign_body(document);
         self.body_scroll = 0;
         self.body_view_height = 0;
+    }
+
+    /// Replace the body, keeping its measured size in step.
+    ///
+    /// The one place the document is assigned, so [`Self::body_bytes`] cannot
+    /// drift away from what it describes.  A body that fails to serialize
+    /// counts as nothing rather than aborting the edit -- the number is a
+    /// display aid, and [`Self::to_outgoing`] reports the real failure when the
+    /// message is actually sent.
+    fn assign_body(&mut self, document: Document) {
+        self.body = document;
+        let plain = self.serialize_body_plain().map_or(0, |text| text.len());
+        let html = self.serialize_body_html().map_or(0, |text| text.len());
+        self.body_bytes = plain + html;
     }
 
     pub(crate) fn set_field_text<S: Into<String>>(&mut self, field: ComposeField, value: S) {
@@ -615,7 +990,7 @@ impl ComposeState {
     pub(crate) fn update_body_from_markdown(&mut self, source: &str) -> Result<()> {
         let document = markdown::parse(Cursor::new(source))
             .map_err(|err| anyhow!("Failed to parse Markdown: {err}"))?;
-        self.body = document;
+        self.assign_body(document);
         self.body_scroll = 0;
         Ok(())
     }
@@ -655,6 +1030,38 @@ impl TextFieldState {
         }
         insert_char_at(&mut self.value, &mut self.cursor, ch);
         true
+    }
+
+    /// Insert pasted text at the cursor.
+    ///
+    /// These are single-line fields, so newlines become spaces (pasting a
+    /// two-line address block should not glue the lines together) and other
+    /// control characters are dropped. Enclosing line breaks are stripped --
+    /// terminals routinely append one to a paste -- but spaces are kept, since
+    /// a trailing space in a pasted `"addr, "` is deliberate.
+    fn insert_str(&mut self, text: &str) -> bool {
+        let mut inserted = false;
+        let mut pending_space = false;
+        for ch in text.trim_matches(['\r', '\n']).chars() {
+            let ch = if ch == '\n' || ch == '\r' || ch == '\t' {
+                // Collapse runs of line breaks into a single space.
+                if pending_space {
+                    continue;
+                }
+                pending_space = true;
+                ' '
+            } else if ch.is_control() {
+                continue;
+            } else {
+                pending_space = false;
+                ch
+            };
+
+            if self.insert(ch) {
+                inserted = true;
+            }
+        }
+        inserted
     }
 
     fn backspace(&mut self) -> bool {
@@ -837,7 +1244,7 @@ fn text_len(text: &str) -> usize {
     text.chars().count()
 }
 
-fn byte_index_for(text: &str, char_index: usize) -> usize {
+pub(crate) fn byte_index_for(text: &str, char_index: usize) -> usize {
     if char_index == 0 {
         return 0;
     }
@@ -1103,6 +1510,7 @@ impl App {
                 commit_progress: None,
                 mailbox_loader: None,
                 mailbox_load_progress: initial_load_progress,
+                message_loader: None,
                 scheduled_actions: Vec::new(),
                 current_mailbox: MailboxKind::Inbox,
                 search: None,
@@ -1116,7 +1524,20 @@ impl App {
             should_quit: false,
             pending_shortcut: None,
             pending_navigation: None,
+            save_attachment: None,
+            outgoing: None,
+            needs_full_redraw: false,
         })
+    }
+
+    /// Whether the screen has to be repainted from scratch, clearing the request.
+    ///
+    /// The renderer only writes the cells that changed since the last frame, so
+    /// anything that hands the terminal to another program -- the editor -- has
+    /// to say so, or the first frame back paints a diff against a screen that
+    /// was wiped meanwhile.
+    pub fn take_full_redraw(&mut self) -> bool {
+        std::mem::take(&mut self.needs_full_redraw)
     }
 
     fn current_account(&self) -> &AccountState {
@@ -1160,6 +1581,10 @@ impl App {
 
         if self.process_pending_navigation(key)? {
             return Ok(());
+        }
+
+        if self.save_attachment.is_some() {
+            return self.handle_save_attachment_key(key);
         }
 
         let active_view = self.active_view();
@@ -1402,6 +1827,8 @@ impl App {
                 total: PROGRESS_SEGMENTS,
                 completed: 0,
             });
+            // A body still arriving for the mailbox we are leaving is of no use.
+            account.message_loader = None;
             account.message_view = None;
             account.search = None;
             account.current_mailbox = target;
@@ -1538,7 +1965,10 @@ impl App {
     pub fn poll_backend_events(&mut self) {
         self.check_read_timer();
         self.poll_mailbox_loader();
+        self.poll_message_loader();
         self.poll_commit_updates();
+        self.poll_save_attachment_operation();
+        self.poll_outgoing_operation();
 
         let mut refresh = false;
         let current_id = self
@@ -2194,11 +2624,29 @@ impl App {
             Some(_) => "Edit Draft",
             None => "Compose",
         };
+        // Do not advertise keys that are locked out while the backend has the message.
+        if let Some((operation, _)) = self.pending_outgoing() {
+            return format!("{label} - {operation}...");
+        }
         format!("{label} - Tab:Next Shift+Tab:Prev Esc:Cancel Enter:Activate")
     }
 
     pub(crate) fn compose_status_line(&self) -> Option<&str> {
         self.compose.as_ref().and_then(|state| state.status())
+    }
+
+    /// Label and elapsed time of the message body loading in the background.
+    pub(crate) fn pending_message_load(&self) -> Option<(&str, std::time::Duration)> {
+        self.message_loader
+            .as_ref()
+            .map(|op| (op.label.as_str(), op.started.elapsed()))
+    }
+
+    /// Label and elapsed time of the send or draft save in flight.
+    pub(crate) fn pending_outgoing(&self) -> Option<(&str, std::time::Duration)> {
+        self.outgoing
+            .as_ref()
+            .map(|op| (op.kind.label(), op.started.elapsed()))
     }
 
     fn open_search(&mut self) {
@@ -2340,20 +2788,14 @@ impl App {
                 }
             }
             KeyCode::Char('$') => self.commit_actions()?,
-            KeyCode::Enter => {
-                if !self.try_open_selected_draft()? {
-                    self.open_selected_message()?;
-                }
-            }
+            KeyCode::Enter => self.open_selected_entry()?,
             KeyCode::Right => self.open_selected_message()?,
             KeyCode::Char('d') | KeyCode::Char('D') => self.schedule_delete(),
             KeyCode::Char('#') => self.schedule_delete(),
             KeyCode::Backspace | KeyCode::Delete => self.schedule_delete(),
             KeyCode::Char('/') => self.open_search(),
-            KeyCode::Esc => {
-                if self.search.is_some() {
-                    self.close_search();
-                }
+            KeyCode::Esc if self.search.is_some() => {
+                self.close_search();
             }
             _ => {}
         }
@@ -2391,7 +2833,7 @@ impl App {
             return Ok(());
         }
 
-        if matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
+        if matches!(key.code, KeyCode::Char('s')) {
             let current_id = self.message_view.as_ref().map(|view| view.message_id);
             self.toggle_star();
             if let Some(id) = current_id {
@@ -2409,6 +2851,11 @@ impl App {
                     view.message.starred = starred;
                 }
             }
+            return Ok(());
+        }
+
+        if matches!(key.code, KeyCode::Char('S')) {
+            self.open_save_attachment_dialog();
             return Ok(());
         }
 
@@ -2502,47 +2949,449 @@ impl App {
     }
 
     fn open_compose(&mut self) {
+        // A reply/forward/draft body still on its way would replace this blank
+        // message -- and anything typed into it -- the moment it lands.
+        self.cancel_compose_bound_load();
         self.compose = Some(ComposeState::new());
         self.message_view = None;
         self.mailbox.status_line = Some("Compose mode active.".to_string());
     }
 
-    fn document_for_message(&mut self, message: &Message) -> Result<Document> {
-        if let Some(view) = self.message_view.as_ref()
-            && view.message_id == message.id
+    /// Drop a pending load whose result would open the compose view.
+    fn cancel_compose_bound_load(&mut self) {
+        if self
+            .message_loader
+            .as_ref()
+            .is_some_and(|op| op.purpose != MessageLoadPurpose::View)
         {
-            if let Some(document) = &view.document {
-                return Ok(document.clone());
+            self.current_account_mut().message_loader = None;
+        }
+    }
+
+    pub(crate) fn save_attachment_dialog(&self) -> Option<&SaveAttachmentDialog> {
+        self.save_attachment.as_ref()
+    }
+
+    pub(crate) fn save_attachment_attachments(&self) -> &[MessageAttachment] {
+        self.message_view
+            .as_ref()
+            .map(|view| view.content.attachments.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn open_save_attachment_dialog(&mut self) {
+        let attachments_empty = self
+            .message_view
+            .as_ref()
+            .is_none_or(|view| view.content.attachments.is_empty());
+        if attachments_empty {
+            if let Some(view) = self.message_view.as_mut() {
+                view.info_line = Some("This message has no attachments.".to_string());
             }
-            return Ok(document_from_message_content(&view.content));
+            return;
         }
 
-        let content = self
-            .backend
-            .load_message(message.id)
-            .with_context(|| format!("failed to load message {}", message.id))?;
-        Ok(document_from_message_content(&content))
+        let folder = default_download_dir().to_string_lossy().into_owned();
+        self.save_attachment = Some(SaveAttachmentDialog::new(folder));
+    }
+
+    fn close_save_attachment_dialog(&mut self) {
+        self.save_attachment = None;
+    }
+
+    fn handle_save_attachment_key(&mut self, key: KeyEvent) -> Result<()> {
+        let total = self.save_attachment_attachments().len();
+        let Some(dialog) = self.save_attachment.as_mut() else {
+            return Ok(());
+        };
+
+        if dialog.is_busy() {
+            if matches!(key.code, KeyCode::Esc) {
+                dialog.cancel_operation();
+                self.close_save_attachment_dialog();
+            }
+            return Ok(());
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.close_save_attachment_dialog();
+                return Ok(());
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                dialog.toggle_focus();
+                return Ok(());
+            }
+            KeyCode::Enter => {
+                return self.commit_save_attachment();
+            }
+            _ => {}
+        }
+
+        match dialog.focus {
+            SaveAttachmentFocus::Folder => match key.code {
+                KeyCode::Left => {
+                    dialog.folder.move_left();
+                }
+                KeyCode::Right => {
+                    dialog.folder.move_right();
+                }
+                KeyCode::Home => {
+                    dialog.folder.move_home();
+                }
+                KeyCode::End => {
+                    dialog.folder.move_end();
+                }
+                KeyCode::Backspace if dialog.folder.backspace() => {
+                    dialog.clear_status();
+                }
+                KeyCode::Backspace => {}
+                KeyCode::Delete if dialog.folder.delete() => {
+                    dialog.clear_status();
+                }
+                KeyCode::Delete => {}
+                KeyCode::Up => {
+                    dialog.focus = SaveAttachmentFocus::List;
+                }
+                KeyCode::Down => {
+                    dialog.focus = SaveAttachmentFocus::List;
+                }
+                KeyCode::Char(ch) => {
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        || key.modifiers.contains(KeyModifiers::ALT)
+                    {
+                        return Ok(());
+                    }
+                    if dialog.folder.insert(ch) {
+                        dialog.clear_status();
+                    }
+                }
+                _ => {}
+            },
+            SaveAttachmentFocus::List => match key.code {
+                KeyCode::Up => {
+                    if dialog.selected > 0 {
+                        dialog.selected -= 1;
+                        dialog.clear_status();
+                    } else {
+                        dialog.focus = SaveAttachmentFocus::Folder;
+                    }
+                }
+                KeyCode::Down => {
+                    if dialog.selected + 1 < total {
+                        dialog.selected += 1;
+                        dialog.clear_status();
+                    } else {
+                        dialog.focus = SaveAttachmentFocus::Folder;
+                    }
+                }
+                KeyCode::Home => {
+                    dialog.selected = 0;
+                }
+                KeyCode::End => {
+                    dialog.selected = total.saturating_sub(1);
+                }
+                _ => {}
+            },
+        }
+
+        Ok(())
+    }
+
+    fn commit_save_attachment(&mut self) -> Result<()> {
+        if self
+            .save_attachment
+            .as_ref()
+            .is_some_and(|dialog| dialog.is_busy())
+        {
+            return Ok(());
+        }
+
+        let (folder_text, selected) = match self.save_attachment.as_ref() {
+            Some(dialog) => (dialog.folder.value.clone(), dialog.selected),
+            None => return Ok(()),
+        };
+
+        // Clone only the attachment we are about to write; cloning the whole
+        // vector would copy every other attachment's bytes as well.
+        let selected_attachment = self.message_view.as_ref().and_then(|view| {
+            let attachments = &view.content.attachments;
+            let idx = selected.min(attachments.len().saturating_sub(1));
+            attachments.get(idx).map(|att| (idx, att.clone()))
+        });
+
+        let Some((idx, attachment)) = selected_attachment else {
+            self.close_save_attachment_dialog();
+            return Ok(());
+        };
+
+        let folder = expand_user_path(&folder_text);
+        let base_name = attachment
+            .filename
+            .as_deref()
+            .map(sanitize_filename)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| fallback_attachment_name(idx, &attachment.mime_type));
+
+        let backend = Arc::clone(&self.backend);
+        let (tx, rx) = std::sync::mpsc::channel::<Result<PathBuf, String>>();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let filename_for_op = base_name.clone();
+        let worker_cancel = Arc::clone(&cancel);
+        thread::spawn(move || {
+            let result = (|| -> Result<PathBuf, String> {
+                let bytes = match attachment.data {
+                    Some(bytes) => bytes,
+                    None => match attachment.blob_id.as_deref() {
+                        Some(blob_id) => backend
+                            .fetch_attachment_blob(blob_id)
+                            .map_err(|err| format!("Failed to download attachment: {err}"))?,
+                        None => {
+                            return Err("Attachment content is not available.".to_string());
+                        }
+                    },
+                };
+
+                // Last chance to bail out: the download may have taken a while
+                // and the user may have dismissed the dialog meanwhile.
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return Err("Save cancelled.".to_string());
+                }
+
+                fs::create_dir_all(&folder)
+                    .map_err(|err| format!("Cannot create folder '{}': {err}", folder.display()))?;
+
+                let target = unique_path_in(&folder, &base_name);
+                fs::write(&target, &bytes)
+                    .map_err(|err| format!("Failed to write '{}': {err}", target.display()))?;
+                Ok(target)
+            })();
+            let _ = tx.send(result);
+        });
+
+        if let Some(dialog) = self.save_attachment.as_mut() {
+            dialog.clear_status();
+            dialog.operation = Some(SaveAttachmentOperation {
+                receiver: rx,
+                started: Instant::now(),
+                filename: filename_for_op,
+                cancel,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn poll_save_attachment_operation(&mut self) {
+        let Some(dialog) = self.save_attachment.as_mut() else {
+            return;
+        };
+        let Some(op) = dialog.operation.as_ref() else {
+            return;
+        };
+
+        match op.receiver.try_recv() {
+            Ok(Ok(path)) => {
+                dialog.operation = None;
+                dialog.set_status(format!("Saved to {}", path.display()));
+            }
+            Ok(Err(err)) => {
+                dialog.operation = None;
+                dialog.set_status(err);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                dialog.operation = None;
+                dialog.set_status("Download worker exited unexpectedly.");
+            }
+        }
+    }
+
+    /// Start a background load of `message`'s body.
+    ///
+    /// Nothing here touches the network on the UI thread: the worker fetches the
+    /// body and, for compose-bound loads, the attachment bytes that backends
+    /// like JMAP only hand out as blob pointers.  [`Self::poll_message_loader`]
+    /// picks the result up on a later tick.
+    ///
+    /// Moving on to another message supersedes the request, but the worker
+    /// cannot be cancelled -- it runs to completion and its result is dropped
+    /// when the channel goes away.  Backends serialise their own I/O, so this
+    /// costs at most one redundant fetch.
+    fn begin_message_load(
+        &mut self,
+        message: Message,
+        purpose: MessageLoadPurpose,
+        mut cached: Option<MessageContent>,
+        cached_document: Option<Document>,
+    ) {
+        // Repeating the keystroke that started a load should not start a second.
+        if self
+            .message_loader
+            .as_ref()
+            .is_some_and(|op| op.message.id == message.id && op.purpose == purpose)
+        {
+            return;
+        }
+
+        let needs_attachments = purpose.needs_attachments();
+
+        // With the body already in hand and no attachment bytes to fetch there
+        // is nothing to wait for.  Replying to the message on screen is the
+        // common case and should not cost a tick of latency.
+        if !needs_attachments && let Some(content) = cached.take() {
+            self.deliver_loaded_message(
+                message,
+                purpose,
+                cached_document,
+                LoadedMessage {
+                    content,
+                    attachments: Vec::new(),
+                    unavailable: 0,
+                },
+            );
+            return;
+        }
+
+        let backend = Arc::clone(&self.backend);
+        let message_id = message.id;
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            let result = (|| -> Result<LoadedMessage, String> {
+                let content = match cached {
+                    Some(content) => content,
+                    None => backend
+                        .load_message(message_id)
+                        .map_err(|err| err.to_string())?,
+                };
+                let (attachments, unavailable) = if needs_attachments {
+                    restore_compose_attachments(backend.as_ref(), &content)
+                } else {
+                    (Vec::new(), 0)
+                };
+                Ok(LoadedMessage {
+                    content,
+                    attachments,
+                    unavailable,
+                })
+            })();
+            let _ = sender.send(result);
+        });
+
+        let label = message_load_label(purpose, &message);
+        self.current_account_mut().message_loader = Some(MessageLoadOperation {
+            message,
+            purpose,
+            cached_document,
+            receiver,
+            started: Instant::now(),
+            label,
+        });
+    }
+
+    fn poll_message_loader(&mut self) {
+        let result = {
+            let Some(op) = self.message_loader.as_ref() else {
+                return;
+            };
+            match op.receiver.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    Err("the loader thread exited unexpectedly".to_string())
+                }
+            }
+        };
+
+        let Some(op) = self.current_account_mut().message_loader.take() else {
+            return;
+        };
+        self.finish_message_load(op, result);
+    }
+
+    fn finish_message_load(
+        &mut self,
+        op: MessageLoadOperation,
+        result: Result<LoadedMessage, String>,
+    ) {
+        let loaded = match result {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                let text = format!("Failed to load message: {err}");
+                if let Some(view) = self.message_view.as_mut() {
+                    view.info_line = Some(text.clone());
+                }
+                self.mailbox.status_line = Some(text);
+                return;
+            }
+        };
+
+        self.deliver_loaded_message(op.message, op.purpose, op.cached_document, loaded);
+    }
+
+    /// Hand a loaded body to whatever asked for it.
+    fn deliver_loaded_message(
+        &mut self,
+        message: Message,
+        purpose: MessageLoadPurpose,
+        cached_document: Option<Document>,
+        loaded: LoadedMessage,
+    ) {
+        self.sync_attachment_indicator(message.id, marks_as_having_attachments(&loaded.content));
+
+        if purpose == MessageLoadPurpose::View {
+            self.show_loaded_message(message.id, loaded.content);
+            return;
+        }
+
+        let document =
+            cached_document.unwrap_or_else(|| document_from_message_content(&loaded.content));
+
+        match purpose {
+            MessageLoadPurpose::View => unreachable!("handled above"),
+            MessageLoadPurpose::Reply { reply_all } => {
+                self.show_reply_compose(&message, document, reply_all);
+            }
+            MessageLoadPurpose::Forward => {
+                self.show_forward_compose(&message, document, loaded);
+            }
+            MessageLoadPurpose::Draft => {
+                self.show_draft_compose(&message, document, loaded);
+            }
+        }
+    }
+
+    /// Start loading the selected message so compose can be seeded from it.
+    fn begin_compose_from_selected(&mut self, purpose: MessageLoadPurpose) {
+        let Some(message) = self.selected_loaded_message().cloned() else {
+            self.mailbox
+                .status_line
+                .get_or_insert_with(|| "Message is still loading.".to_string());
+            return;
+        };
+
+        // The open viewer already holds the body, so reuse it; only blob-backed
+        // attachments then still need the network.
+        let (cached, cached_document) = match self
+            .message_view
+            .as_ref()
+            .filter(|view| view.message_id == message.id)
+        {
+            Some(view) => (Some(view.content.clone()), view.document.clone()),
+            None => (None, None),
+        };
+
+        self.begin_message_load(message, purpose, cached, cached_document);
     }
 
     fn open_reply(&mut self, reply_all: bool) -> Result<()> {
-        let message = match self.selected_loaded_message() {
-            Some(message) => message.clone(),
-            None => {
-                self.mailbox
-                    .status_line
-                    .get_or_insert_with(|| "Message is still loading.".to_string());
-                return Ok(());
-            }
-        };
+        self.begin_compose_from_selected(MessageLoadPurpose::Reply { reply_all });
+        Ok(())
+    }
 
-        let document = match self.document_for_message(&message) {
-            Ok(doc) => doc,
-            Err(err) => {
-                self.mailbox.status_line = Some(format!("Failed to load message body: {err}"));
-                return Ok(());
-            }
-        };
-
+    fn show_reply_compose(&mut self, message: &Message, document: Document, reply_all: bool) {
         let mut compose = ComposeState::new();
         let subject = prefix_subject(&message.subject, "Re:");
         compose.set_field_text(ComposeField::Subject, subject);
@@ -2584,38 +3433,32 @@ impl App {
             format!("Replying to '{}'.", message.subject)
         };
         self.mailbox.status_line = Some(status);
-        Ok(())
     }
 
     fn open_forward(&mut self) -> Result<()> {
-        let message = match self.selected_loaded_message() {
-            Some(message) => message.clone(),
-            None => {
-                self.mailbox
-                    .status_line
-                    .get_or_insert_with(|| "Message is still loading.".to_string());
-                return Ok(());
-            }
-        };
+        self.begin_compose_from_selected(MessageLoadPurpose::Forward);
+        Ok(())
+    }
 
-        let document = match self.document_for_message(&message) {
-            Ok(doc) => doc,
-            Err(err) => {
-                self.mailbox.status_line = Some(format!("Failed to load message body: {err}"));
-                return Ok(());
-            }
-        };
-
+    fn show_forward_compose(
+        &mut self,
+        message: &Message,
+        document: Document,
+        loaded: LoadedMessage,
+    ) {
         let mut compose = ComposeState::new();
         let subject = prefix_subject(&message.subject, "Fwd:");
         compose.set_field_text(ComposeField::Subject, subject);
-        compose.set_body(build_forward_document(&document, &message));
+        compose.set_body(build_forward_document(&document, message));
+        compose.set_attachments(loaded.attachments);
         compose.set_focus(ComposeFocus::Body);
 
         self.compose = Some(compose);
         self.message_view = None;
-        self.mailbox.status_line = Some(format!("Forwarding '{}'.", message.subject));
-        Ok(())
+        self.mailbox.status_line = Some(draft_status_line(
+            &format!("Forwarding '{}'.", message.subject),
+            loaded.unavailable,
+        ));
     }
 
     fn handle_compose_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -2624,9 +3467,25 @@ impl App {
             return Ok(());
         }
 
+        // The backend already has this message: editing it now would change
+        // something in flight, and cancelling would throw away text that is
+        // still needed if the submission fails.  The progress line explains the
+        // wait; every other key is ignored until the worker reports back.
+        if self.outgoing.is_some() {
+            return Ok(());
+        }
+
         let Some(compose) = self.compose.as_mut() else {
             return Ok(());
         };
+
+        if compose.is_asking_about_large_attachment() {
+            return self.handle_large_attachment_key(key);
+        }
+
+        if compose.is_attachment_prompt_active() {
+            return self.handle_attachment_prompt_key(key);
+        }
 
         match key.code {
             KeyCode::Esc => {
@@ -2704,6 +3563,35 @@ impl App {
                 }
                 _ => {}
             },
+            ComposeFocus::Attachments => match key.code {
+                KeyCode::Up => {
+                    if !compose.select_attachment_prev() {
+                        compose.focus_prev();
+                    }
+                    return Ok(());
+                }
+                KeyCode::Down => {
+                    if !compose.select_attachment_next() {
+                        compose.focus_next();
+                    }
+                    return Ok(());
+                }
+                KeyCode::Home => {
+                    compose.select_attachment_first();
+                    return Ok(());
+                }
+                KeyCode::End => {
+                    compose.select_attachment_last();
+                    return Ok(());
+                }
+                KeyCode::Delete | KeyCode::Backspace => {
+                    if let Some(removed) = compose.remove_selected_attachment() {
+                        compose.set_status(format!("Removed attachment '{}'.", removed.filename));
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            },
             ComposeFocus::Body => match key.code {
                 KeyCode::Up => {
                     compose.focus_prev();
@@ -2750,6 +3638,7 @@ impl App {
                 }
                 KeyCode::Char(ch) => {
                     let target = match ch {
+                        'a' | 'A' => Some(ComposeButton::Attach),
                         'c' | 'C' => Some(ComposeButton::Cancel),
                         'e' | 'E' => Some(ComposeButton::Edit),
                         'd' | 'D' => Some(ComposeButton::Draft),
@@ -2769,14 +3658,320 @@ impl App {
 
     fn activate_compose_button(&mut self, button: ComposeButton) -> Result<()> {
         match button {
+            ComposeButton::Attach => {
+                self.open_attach_prompt();
+                Ok(())
+            }
             ComposeButton::Cancel => {
                 self.cancel_compose();
                 Ok(())
             }
             ComposeButton::Edit => self.edit_compose_body(),
-            ComposeButton::Draft => self.save_current_draft(),
-            ComposeButton::Send => self.send_current_compose(),
+            ComposeButton::Draft => self.submit_outgoing(OutgoingKind::Draft),
+            ComposeButton::Send => self.submit_outgoing(OutgoingKind::Send),
         }
+    }
+
+    fn open_attach_prompt(&mut self) {
+        if let Some(compose) = self.compose.as_mut() {
+            compose.clear_status();
+            compose.open_attachment_prompt();
+        }
+    }
+
+    /// Answer the question about an oversized file.
+    ///
+    /// Nothing else in compose responds until it is answered: attaching reads
+    /// the whole file into the message, which is exactly the decision being
+    /// asked about.  Keys that mean neither yes nor no are ignored rather than
+    /// guessed at.
+    fn handle_large_attachment_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') => self.answer_large_attachment(true),
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => self.answer_large_attachment(false),
+            _ => Ok(()),
+        }
+    }
+
+    fn handle_attachment_prompt_key(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(compose) = self.compose.as_mut() else {
+            return Ok(());
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                compose.close_attachment_prompt();
+                return Ok(());
+            }
+            KeyCode::Enter => {
+                let path_text = compose
+                    .attachment_prompt()
+                    .map(|(value, _)| value.trim().to_string())
+                    .unwrap_or_default();
+                if path_text.is_empty() {
+                    compose.close_attachment_prompt();
+                    return Ok(());
+                }
+                compose.close_attachment_prompt();
+                return self.attach_paths(vec![path_text]);
+            }
+            KeyCode::Left => {
+                if let Some(state) = compose.attachment_prompt_mut() {
+                    state.move_left();
+                }
+                return Ok(());
+            }
+            KeyCode::Right => {
+                if let Some(state) = compose.attachment_prompt_mut() {
+                    state.move_right();
+                }
+                return Ok(());
+            }
+            KeyCode::Home => {
+                if let Some(state) = compose.attachment_prompt_mut() {
+                    state.move_home();
+                }
+                return Ok(());
+            }
+            KeyCode::End => {
+                if let Some(state) = compose.attachment_prompt_mut() {
+                    state.move_end();
+                }
+                return Ok(());
+            }
+            KeyCode::Backspace => {
+                if let Some(state) = compose.attachment_prompt_mut() {
+                    state.backspace();
+                }
+                return Ok(());
+            }
+            KeyCode::Delete => {
+                if let Some(state) = compose.attachment_prompt_mut() {
+                    state.delete();
+                }
+                return Ok(());
+            }
+            KeyCode::Char(ch) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::ALT)
+                {
+                    return Ok(());
+                }
+                if let Some(state) = compose.attachment_prompt_mut() {
+                    state.insert(ch);
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    /// Attach every path in `paths`, asking about the large ones on the way.
+    ///
+    /// The single entry point for attaching, whether the paths came from the
+    /// prompt or from a terminal drop.
+    fn attach_paths(&mut self, paths: Vec<String>) -> Result<()> {
+        if let Some(compose) = self.compose.as_mut() {
+            // Dropping onto the open prompt answers the question it was asking.
+            compose.close_attachment_prompt();
+            compose.attach = AttachBatch {
+                queue: paths.into(),
+                ..AttachBatch::default()
+            };
+        }
+        self.drain_attach_queue()
+    }
+
+    /// Attach queued files until one needs the user's say-so, or the batch ends.
+    fn drain_attach_queue(&mut self) -> Result<()> {
+        while let Some(path) = self
+            .compose
+            .as_mut()
+            .and_then(|compose| compose.attach.queue.pop_front())
+        {
+            // A file that cannot be measured is left to the read below, which
+            // reports why in the status line instead of guessing here.
+            let size = fs::metadata(expand_user_path(&path)).map_or(0, |meta| meta.len());
+            if size >= LARGE_ATTACHMENT_BYTES {
+                if let Some(compose) = self.compose.as_mut() {
+                    compose.attach.asking = Some((path, size));
+                }
+                return Ok(());
+            }
+
+            self.attach_file_from_path(&path)?;
+        }
+
+        self.finish_attach_batch();
+        Ok(())
+    }
+
+    /// Take the answer to the question [`Self::drain_attach_queue`] parked on,
+    /// then carry on with the rest of the batch.
+    fn answer_large_attachment(&mut self, attach: bool) -> Result<()> {
+        let Some((path, size)) = self
+            .compose
+            .as_mut()
+            .and_then(|compose| compose.attach.asking.take())
+        else {
+            return Ok(());
+        };
+
+        if attach {
+            self.attach_file_from_path(&path)?;
+        } else if let Some(compose) = self.compose.as_mut() {
+            let name = expand_user_path(&path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or(path);
+            compose.attach.declined += 1;
+            compose.set_status(format!(
+                "Skipped '{name}' ({}).",
+                format_size(size as usize).trim()
+            ));
+        }
+
+        self.drain_attach_queue()
+    }
+
+    /// Report what a batch did, once nothing is left to ask about.
+    ///
+    /// A batch that handled a single file has already said so in its own words,
+    /// naming the file; only a drop of several needs summarising.
+    fn finish_attach_batch(&mut self) {
+        let Some(compose) = self.compose.as_mut() else {
+            return;
+        };
+        let batch = std::mem::take(&mut compose.attach);
+        if batch.attached + batch.declined < 2 {
+            return;
+        }
+
+        let mut status = match batch.attached {
+            0 => String::new(),
+            n => format!("Attached {n} files ({}).", format_size(batch.bytes).trim()),
+        };
+        if batch.declined > 0 {
+            if !status.is_empty() {
+                status.push(' ');
+            }
+            status.push_str(&format!("Skipped {}.", batch.declined));
+        }
+        compose.set_status(status);
+    }
+
+    /// Read `path_text` and add it to the compose attachment list.
+    ///
+    /// Returns whether an attachment was added; failures are reported in the
+    /// compose status line.
+    fn attach_file_from_path(&mut self, path_text: &str) -> Result<bool> {
+        let Some(compose) = self.compose.as_mut() else {
+            return Ok(false);
+        };
+
+        let path = expand_user_path(path_text);
+        let data = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                compose.set_status(format!("Failed to attach '{}': {err}", path.display()));
+                return Ok(false);
+            }
+        };
+
+        let filename = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let mime_type = guess_mime_type(&path);
+        let size = data.len();
+
+        let attachment = OutgoingAttachment {
+            filename: filename.clone(),
+            mime_type,
+            data,
+        };
+        compose.add_attachment(attachment);
+        compose.attach.attached += 1;
+        compose.attach.bytes += size;
+        compose.set_status(format!(
+            "Attached '{filename}' ({}).",
+            format_size(size).trim()
+        ));
+        Ok(true)
+    }
+
+    /// Handle a bracketed-paste payload.
+    ///
+    /// A paste that is really a drag-and-drop of files becomes attachments;
+    /// anything else is typed into whichever text input currently has focus.
+    /// Bracketed paste is enabled terminal-wide, so this is the *only* path by
+    /// which pasted text reaches any field -- dropping it here means the paste
+    /// silently disappears.
+    pub(crate) fn handle_paste_text(&mut self, text: &str) -> Result<()> {
+        // Compose is locked while the backend has the message; see handle_compose_key.
+        if self.outgoing.is_some() {
+            return Ok(());
+        }
+
+        // A question about an oversized file owns the compose view until it is
+        // answered; a paste arriving now has nowhere to go.
+        if self
+            .compose
+            .as_ref()
+            .is_some_and(|compose| compose.is_asking_about_large_attachment())
+        {
+            return Ok(());
+        }
+
+        if self.compose.is_some()
+            && self.save_attachment.is_none()
+            && let Some(paths) = dropped_file_paths(text)
+        {
+            return self.attach_paths(paths);
+        }
+
+        if let Some(dialog) = self.save_attachment.as_mut() {
+            if !dialog.is_busy()
+                && matches!(dialog.focus, SaveAttachmentFocus::Folder)
+                && dialog.folder.insert_str(text)
+            {
+                dialog.clear_status();
+            }
+            return Ok(());
+        }
+
+        if let Some(compose) = self.compose.as_mut() {
+            if let Some(prompt) = compose.attachment_prompt_mut() {
+                prompt.insert_str(text);
+                return Ok(());
+            }
+
+            match compose.focus() {
+                ComposeFocus::Field(field) => {
+                    if compose.field_state_mut(field).insert_str(text) {
+                        compose.clear_status();
+                    }
+                }
+                _ => {
+                    compose.set_status(
+                        "Pasted text goes into the header fields; press Enter on the body to edit it in $EDITOR."
+                            .to_string(),
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        if self.search.as_ref().is_some_and(|search| search.focused) {
+            if let Some(search) = self.search.as_mut() {
+                search.input.insert_str(text);
+            }
+            self.recompute_search_filter();
+        }
+
+        Ok(())
     }
 
     fn edit_compose_body(&mut self) -> Result<()> {
@@ -2828,16 +4023,17 @@ impl App {
 
         let temp_path: PathBuf = temp_file.path().to_path_buf();
 
-        let editor_status = if let Some((program, args)) = argv.split_first() {
-            let mut command = Command::new(program);
-            if !args.is_empty() {
+        let mut command = match argv.split_first() {
+            Some((program, args)) => {
+                let mut command = Command::new(program);
                 command.args(args);
+                command
             }
-            command.arg(&temp_path);
-            command.status()
-        } else {
-            Command::new("vi").arg(&temp_path).status()
+            None => Command::new("vi"),
         };
+        command.arg(&temp_path);
+
+        let editor_status = self.run_editor_command(&mut io::stdout(), &mut command);
 
         let status = match editor_status {
             Ok(status) => status,
@@ -2882,6 +4078,46 @@ impl App {
         Ok(())
     }
 
+    /// Run the editor with the terminal handed over to it, then take it back.
+    ///
+    /// The renderer owns three modes the editor cannot be expected to leave the
+    /// way it found them: raw mode, the alternate screen, and bracketed paste.
+    /// The editor needs a cooked terminal on the main screen to be usable at
+    /// all, and it draws over whatever the renderer had put there.  Bracketed
+    /// paste is the subtle one -- it is a terminal mode rather than a termios
+    /// flag, so restoring raw mode does not bring it back, and vim, neovim and
+    /// emacs all emit the disable sequence when they exit whether or not they
+    /// turned it on themselves.  Losing it means
+    /// [`Event::Paste`](crossterm::event::Event::Paste) never arrives again,
+    /// and [`Self::handle_paste_text`] is the only route by which a terminal
+    /// file drop becomes an attachment.
+    ///
+    /// Every mode has to be restored on every path out, including a child that
+    /// exits non-zero and an editor that never launches at all.  Failures to
+    /// restore go unreported on purpose: the terminal they would be reported on
+    /// is the one that just failed.
+    fn run_editor_command<W: Write>(
+        &mut self,
+        terminal: &mut W,
+        command: &mut Command,
+    ) -> io::Result<ExitStatus> {
+        // Hand over a terminal in the state a child expects to find one:
+        // cooked, on the main screen, with a cursor it can see.
+        let _ = disable_raw_mode();
+        let _ = execute!(terminal, DisableBracketedPaste, LeaveAlternateScreen, Show);
+
+        let status = command.status();
+
+        let _ = enable_raw_mode();
+        let _ = execute!(terminal, EnterAlternateScreen, EnableBracketedPaste);
+
+        // Re-entering the alternate screen clears it, so the renderer's record
+        // of what is on screen is now wrong in every cell.
+        self.needs_full_redraw = true;
+
+        status
+    }
+
     fn cancel_compose(&mut self) {
         if let Some(state) = self.compose.take() {
             let message = if state.is_editing_draft() {
@@ -2893,7 +4129,17 @@ impl App {
         }
     }
 
-    fn send_current_compose(&mut self) -> Result<()> {
+    /// Hand the composed message to the backend on a worker thread.
+    ///
+    /// Uploading a message with attachments can take minutes, which is why this
+    /// never calls into the backend directly: the UI keeps redrawing (and the
+    /// progress line keeps ticking) while the worker runs, and
+    /// [`Self::poll_outgoing_operation`] applies the outcome.
+    fn submit_outgoing(&mut self, kind: OutgoingKind) -> Result<()> {
+        if self.outgoing.is_some() {
+            return Ok(());
+        }
+
         let (draft_id, message) = match self.compose.as_ref() {
             Some(compose) => {
                 let draft_id = compose.draft_id();
@@ -2901,7 +4147,11 @@ impl App {
                     Ok(message) => (draft_id, message),
                     Err(err) => {
                         if let Some(compose) = self.compose.as_mut() {
-                            compose.set_status(format!("Failed to prepare message: {err}"));
+                            let what = match kind {
+                                OutgoingKind::Send => "message",
+                                OutgoingKind::Draft => "draft",
+                            };
+                            compose.set_status(format!("Failed to prepare {what}: {err}"));
                         }
                         return Ok(());
                     }
@@ -2910,65 +4160,84 @@ impl App {
             None => return Ok(()),
         };
 
-        if message.to.is_empty() && message.cc.is_empty() && message.bcc.is_empty() {
+        if kind == OutgoingKind::Send
+            && message.to.is_empty()
+            && message.cc.is_empty()
+            && message.bcc.is_empty()
+        {
             if let Some(compose) = self.compose.as_mut() {
                 compose.set_status("Add at least one recipient.");
             }
             return Ok(());
         }
 
-        match self.backend.send_message(message) {
-            Ok(()) => {
-                let mut status = "Message sent.".to_string();
-                if let Some(id) = draft_id {
-                    self.remove_message_from_mailbox(id);
-                    if let Err(err) = self.submit_actions(vec![Action::new(ActionType::Delete, id)])
-                    {
-                        status = format!("Message sent but failed to remove draft: {err}");
-                    }
-                }
-                self.compose = None;
-                self.mailbox.status_line = Some(status);
-            }
-            Err(err) => {
-                if let Some(compose) = self.compose.as_mut() {
-                    compose.set_status(format!("Failed to send: {err}"));
-                }
-            }
+        let backend = Arc::clone(&self.backend);
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            let result = match kind {
+                OutgoingKind::Send => backend.send_message(message),
+                OutgoingKind::Draft => backend.save_draft(message),
+            };
+            let _ = sender.send(result.map_err(|err| err.to_string()));
+        });
+
+        if let Some(compose) = self.compose.as_mut() {
+            compose.clear_status();
         }
+        self.outgoing = Some(OutgoingOperation {
+            kind,
+            draft_id,
+            receiver,
+            started: Instant::now(),
+        });
+
         Ok(())
     }
 
-    fn save_current_draft(&mut self) -> Result<()> {
-        let (draft_id, message) = match self.compose.as_ref() {
-            Some(compose) => {
-                let draft_id = compose.draft_id();
-                match compose.to_outgoing() {
-                    Ok(message) => (draft_id, message),
-                    Err(err) => {
-                        if let Some(compose) = self.compose.as_mut() {
-                            compose.set_status(format!("Failed to prepare draft: {err}"));
-                        }
-                        return Ok(());
-                    }
+    fn poll_outgoing_operation(&mut self) {
+        let result = {
+            let Some(op) = self.outgoing.as_ref() else {
+                return;
+            };
+            match op.receiver.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    Err("the worker thread exited unexpectedly".to_string())
                 }
             }
-            None => return Ok(()),
         };
 
-        match self.backend.save_draft(message) {
+        let Some(op) = self.outgoing.take() else {
+            return;
+        };
+        self.finish_outgoing(op, result);
+    }
+
+    fn finish_outgoing(&mut self, op: OutgoingOperation, result: Result<(), String>) {
+        match result {
             Ok(()) => {
-                let mut status = if draft_id.is_some() {
-                    "Draft updated.".to_string()
-                } else {
-                    "Draft saved.".to_string()
+                let mut status = match (op.kind, op.draft_id.is_some()) {
+                    (OutgoingKind::Send, _) => "Message sent.".to_string(),
+                    (OutgoingKind::Draft, true) => "Draft updated.".to_string(),
+                    (OutgoingKind::Draft, false) => "Draft saved.".to_string(),
                 };
 
-                if let Some(id) = draft_id {
+                // The stored copy this replaces is only safe to delete now that
+                // the backend has accepted the new one.
+                if let Some(id) = op.draft_id {
                     self.remove_message_from_mailbox(id);
                     if let Err(err) = self.submit_actions(vec![Action::new(ActionType::Delete, id)])
                     {
-                        status = format!("Draft saved but failed to remove previous copy: {err}");
+                        status = match op.kind {
+                            OutgoingKind::Send => {
+                                format!("Message sent but failed to remove draft: {err}")
+                            }
+                            OutgoingKind::Draft => {
+                                format!("Draft saved but failed to remove previous copy: {err}")
+                            }
+                        };
                     }
                 }
 
@@ -2976,18 +4245,29 @@ impl App {
                 self.mailbox.status_line = Some(status);
             }
             Err(err) => {
-                if let Some(compose) = self.compose.as_mut() {
-                    compose.set_status(format!("Failed to save draft: {err}"));
+                let text = match op.kind {
+                    OutgoingKind::Send => format!("Failed to send: {err}"),
+                    OutgoingKind::Draft => format!("Failed to save draft: {err}"),
+                };
+                // Keep the message: compose is still open for a retry.
+                match self.compose.as_mut() {
+                    Some(compose) => compose.set_status(text),
+                    None => self.mailbox.status_line = Some(text),
                 }
             }
+        }
+    }
+
+    fn open_selected_entry(&mut self) -> Result<()> {
+        if !self.try_open_selected_draft()? {
+            self.open_selected_message()?;
         }
         Ok(())
     }
 
     fn try_open_selected_draft(&mut self) -> Result<bool> {
-        let idx = match self.mailbox.selected {
-            Some(idx) => idx,
-            None => return Ok(false),
+        let Some(idx) = self.real_selected_index() else {
+            return Ok(false);
         };
 
         let Some(message) = self.mailbox.messages.get(idx).cloned() else {
@@ -2998,14 +4278,12 @@ impl App {
             return Ok(false);
         }
 
-        let content = self
-            .backend
-            .load_message(message.id)
-            .with_context(|| format!("failed to load draft {}", message.id))?;
+        self.begin_message_load(message, MessageLoadPurpose::Draft, None, None);
+        Ok(true)
+    }
 
-        let body = document_from_message_content(&content);
-
-        let compose = ComposeState::from_draft(
+    fn show_draft_compose(&mut self, message: &Message, body: Document, loaded: LoadedMessage) {
+        let mut compose = ComposeState::from_draft(
             message.id,
             message.recipients.join(", "),
             String::new(),
@@ -3014,10 +4292,13 @@ impl App {
             body,
         );
 
+        // Without this the attachments are dropped on the floor and re-saving
+        // the draft silently discards them.
+        compose.set_attachments(loaded.attachments);
+
         self.compose = Some(compose);
         self.message_view = None;
-        self.mailbox.status_line = Some("Editing draft.".to_string());
-        Ok(true)
+        self.mailbox.status_line = Some(draft_status_line("Editing draft.", loaded.unavailable));
     }
 
     fn is_draft_message(&self, message: &Message) -> bool {
@@ -3588,12 +4869,7 @@ impl App {
             return Ok(());
         }
 
-        let real_idx = match self.real_selected_index() {
-            Some(idx) => idx,
-            None => return Ok(()),
-        };
-
-        let mut message = match self.selected_loaded_message() {
+        let message = match self.selected_loaded_message() {
             Some(msg) => msg.clone(),
             None => {
                 self.mailbox
@@ -3603,18 +4879,55 @@ impl App {
             }
         };
 
-        let content = self
-            .backend
-            .load_message(message.id)
-            .with_context(|| format!("failed to load message {}", message.id))?;
+        self.begin_message_load(message, MessageLoadPurpose::View, None, None);
+        Ok(())
+    }
 
-        let has_attachments = !content.attachments.is_empty();
-        if message.has_attachments != has_attachments {
-            message.has_attachments = has_attachments;
-            if let Some(slot) = self.selected_loaded_message_mut() {
-                slot.has_attachments = has_attachments;
-            }
+    /// Correct the message list's attachment marker from a body we just parsed.
+    ///
+    /// Until a message is opened the marker comes from a backend guess — the
+    /// IMAP BODYSTRUCTURE or JMAP's `hasAttachment` — which can disagree with
+    /// what the parsed MIME tree yields. Every load runs through here, so
+    /// replying to, forwarding, or reopening a draft corrects the list as
+    /// well, not just opening the message.
+    fn sync_attachment_indicator(&mut self, message_id: MessageId, has_attachments: bool) {
+        if let Some(slot) = self
+            .mailbox
+            .messages
+            .iter_mut()
+            .find(|message| message.id == message_id)
+        {
+            slot.has_attachments = has_attachments;
         }
+
+        if let Some(view) = self.message_view.as_mut()
+            && view.message_id == message_id
+        {
+            view.message.has_attachments = has_attachments;
+        }
+    }
+
+    /// Install a body that finished loading in the message viewer.
+    ///
+    /// The mailbox may have moved on while the load ran, so the list entry is
+    /// looked up again by id rather than trusting the index we started with.
+    fn show_loaded_message(&mut self, message_id: MessageId, content: MessageContent) {
+        let found = self
+            .mailbox
+            .messages
+            .iter()
+            .enumerate()
+            .find(|(_, msg)| msg.id == message_id)
+            .map(|(idx, msg)| (idx, msg.clone()));
+
+        let Some((real_idx, mut message)) = found else {
+            self.mailbox.status_line = Some("Message is no longer in this mailbox.".to_string());
+            return;
+        };
+
+        let has_attachments = marks_as_having_attachments(&content);
+        message.has_attachments = has_attachments;
+        self.sync_attachment_indicator(message_id, has_attachments);
 
         let raw_html = content
             .part("text/html")
@@ -3647,8 +4960,6 @@ impl App {
             info_line: None,
             read_at,
         });
-
-        Ok(())
     }
 
     fn open_adjacent_message(&mut self, offset: isize) -> Result<()> {
@@ -3800,6 +5111,403 @@ impl App {
                 self.mailbox.scroll_top = max_top;
             }
         }
+    }
+}
+
+/// Whether a loaded body earns its message the `@` marker in the list.
+///
+/// Inline parts are listed among the attachments so the save dialog can offer
+/// them, but they are not what the marker means: an embedded signature logo
+/// would otherwise mark half the newsletters in a mailbox, and only from the
+/// moment each one was opened. Both places that correct the marker after a load
+/// ask here, so the two cannot drift apart.
+fn marks_as_having_attachments(content: &MessageContent) -> bool {
+    content
+        .attachments
+        .iter()
+        .any(|attachment| !attachment.inline)
+}
+
+/// What base64 turns `raw` bytes into: four characters per three bytes, plus
+/// the line break MIME requires every 76 characters.
+fn base64_size(raw: usize) -> usize {
+    let encoded = raw.div_ceil(3) * 4;
+    encoded + encoded.div_ceil(76) * 2
+}
+
+fn default_download_dir() -> PathBuf {
+    if let Some(value) = env::var_os("XDG_DOWNLOAD_DIR") {
+        let path = PathBuf::from(&value);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
+    if let Some(home) = env::var_os("HOME") {
+        let mut path = PathBuf::from(home);
+        path.push("Downloads");
+        return path;
+    }
+    PathBuf::from("Downloads")
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let trimmed = name.trim().trim_matches(['/', '\\']);
+    let cleaned: String = trimmed
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | '\0' => '_',
+            _ => ch,
+        })
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        String::new()
+    } else {
+        cleaned
+    }
+}
+
+/// Rebuild compose attachments from a stored message's MIME parts.
+///
+/// Returns the attachments plus the number that could not be recovered.
+/// Backends that hand out blob pointers instead of bytes (JMAP) are downloaded
+/// here, one round trip per attachment, so this belongs on a worker thread --
+/// [`App::begin_message_load`] is the only caller outside tests.
+fn restore_compose_attachments(
+    backend: &dyn MailBackend,
+    content: &MessageContent,
+) -> (Vec<OutgoingAttachment>, usize) {
+    let mut restored = Vec::new();
+    let mut unavailable = 0usize;
+
+    // Inline parts stay behind. A forward quotes the body as text, so the
+    // `cid:` references that put them there are gone -- carrying them over
+    // would turn every signature logo into a file attached to the forward.
+    for (idx, attachment) in content
+        .attachments
+        .iter()
+        .filter(|attachment| !attachment.inline)
+        .enumerate()
+    {
+        let data = match attachment.data.clone() {
+            Some(data) => Some(data),
+            None => match attachment.blob_id.as_deref() {
+                Some(blob_id) => backend.fetch_attachment_blob(blob_id).ok(),
+                None => None,
+            },
+        };
+
+        match data {
+            Some(data) => restored.push(OutgoingAttachment {
+                filename: attachment
+                    .filename
+                    .clone()
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| fallback_attachment_name(idx, &attachment.mime_type)),
+                mime_type: attachment.mime_type.clone(),
+                data,
+            }),
+            None => unavailable += 1,
+        }
+    }
+
+    (restored, unavailable)
+}
+
+/// Progress-indicator text for a message load in flight.
+fn message_load_label(purpose: MessageLoadPurpose, message: &Message) -> String {
+    let subject = truncate_label(message.subject.trim(), 40);
+    match purpose {
+        MessageLoadPurpose::View => format!("Loading '{subject}'"),
+        MessageLoadPurpose::Reply { reply_all: false } => format!("Loading '{subject}' to reply"),
+        MessageLoadPurpose::Reply { reply_all: true } => {
+            format!("Loading '{subject}' to reply to all")
+        }
+        MessageLoadPurpose::Forward => format!("Loading '{subject}' to forward"),
+        MessageLoadPurpose::Draft => format!("Opening draft '{subject}'"),
+    }
+}
+
+fn truncate_label(value: &str, max_chars: usize) -> String {
+    if value.is_empty() {
+        return "(no subject)".to_string();
+    }
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut truncated: String = value.chars().take(max_chars.saturating_sub(1)).collect();
+    truncated.push('…');
+    truncated
+}
+
+/// Append a warning to `base` when attachments could not be carried over.
+///
+/// Losing an attachment has to be visible: silently dropping it is how a draft
+/// gets sent without the file it was about.
+fn draft_status_line(base: &str, unavailable: usize) -> String {
+    match unavailable {
+        0 => base.to_string(),
+        1 => format!("{base} 1 attachment could not be loaded and will not be sent."),
+        n => format!("{base} {n} attachments could not be loaded and will not be sent."),
+    }
+}
+
+/// Name to save an attachment under when the MIME part carries no filename.
+///
+/// Inline parts of `multipart/related` messages (embedded images, mostly) have
+/// no filename, so the extension has to come from the content type instead --
+/// saving them all as `.bin` would hide what they actually are.
+fn fallback_attachment_name(index: usize, mime_type: &str) -> String {
+    format!(
+        "attachment-{}.{}",
+        index + 1,
+        extension_for_mime_type(mime_type)
+    )
+}
+
+/// Best-effort file extension for a MIME type, mirroring [`guess_mime_type`].
+///
+/// Deliberately not `mime_guess`'s reverse mapping: that returns every
+/// extension registered for a type in alphabetical order, so the first entry is
+/// arbitrary (`application/octet-stream` starts at `aaf`, `video/x-matroska` at
+/// `mk3d`).  A short table of the types that actually turn up, plus the subtype
+/// when it already reads like an extension, does better.
+fn extension_for_mime_type(mime_type: &str) -> String {
+    let essence = mime_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    let mapped = match essence.as_str() {
+        "text/plain" => Some("txt"),
+        "text/html" => Some("html"),
+        "text/calendar" => Some("ics"),
+        "application/json" => Some("json"),
+        "application/xml" | "text/xml" => Some("xml"),
+        "application/pdf" => Some("pdf"),
+        "application/zip" => Some("zip"),
+        "application/gzip" => Some("gz"),
+        "application/x-tar" => Some("tar"),
+        "application/x-7z-compressed" => Some("7z"),
+        "application/x-xz" => Some("xz"),
+        "application/x-rar-compressed" | "application/vnd.rar" => Some("rar"),
+        "application/rtf" => Some("rtf"),
+        "application/msword" => Some("doc"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => Some("docx"),
+        "application/vnd.ms-excel" => Some("xls"),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => Some("xlsx"),
+        "application/vnd.ms-powerpoint" => Some("ppt"),
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => Some("pptx"),
+        "image/jpeg" => Some("jpg"),
+        "image/svg+xml" => Some("svg"),
+        "image/tiff" => Some("tiff"),
+        "audio/mpeg" => Some("mp3"),
+        "audio/m4a" | "audio/mp4" => Some("m4a"),
+        "video/quicktime" => Some("mov"),
+        "video/x-matroska" => Some("mkv"),
+        "message/rfc822" => Some("eml"),
+        _ => None,
+    };
+
+    if let Some(ext) = mapped {
+        return ext.to_string();
+    }
+
+    // Fall back to the subtype when it reads like an extension already
+    // (image/png, audio/flac, image/webp, ...).
+    let subtype = essence.split('/').nth(1).unwrap_or_default();
+    if !subtype.is_empty()
+        && subtype.len() <= 5
+        && subtype.chars().all(|ch| ch.is_ascii_alphanumeric())
+    {
+        return subtype.to_string();
+    }
+
+    "bin".to_string()
+}
+
+fn unique_path_in(folder: &std::path::Path, name: &str) -> PathBuf {
+    let candidate = folder.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), Some(ext.to_string())),
+        _ => (name.to_string(), None),
+    };
+
+    for counter in 1..=1_000_000 {
+        let candidate_name = match ext.as_deref() {
+            Some(ext) => format!("{stem} ({counter}).{ext}"),
+            None => format!("{stem} ({counter})"),
+        };
+        let candidate = folder.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    folder.join(name)
+}
+
+/// Normalise a path as typed by the user or delivered by a terminal drop.
+///
+/// Handles surrounding quotes, `file://` URLs (percent-encoded), backslash
+/// escapes, and `~`. Unescaping happens *before* tilde expansion so that
+/// `~/My\ File.pdf` resolves -- doing it the other way round leaves the
+/// backslash in the file name.
+fn expand_user_path(raw: &str) -> PathBuf {
+    let trimmed = raw.trim();
+    let unquoted = if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+
+    // A `file://` URL is percent-encoded; a plain path is not and must be left
+    // alone, or a file literally named "100%20" would break.
+    let normalised = match unquoted.strip_prefix("file://") {
+        Some(rest) => {
+            // An empty or `localhost` authority both mean the local machine.
+            let path = rest.strip_prefix("localhost").unwrap_or(rest);
+            percent_decode(path)
+        }
+        None => unescape_path_chars(unquoted),
+    };
+
+    if let Some(rest) = normalised.strip_prefix("~/")
+        && let Some(home) = env::var_os("HOME")
+    {
+        let mut buf = PathBuf::from(home);
+        buf.push(rest);
+        return buf;
+    }
+
+    if normalised == "~"
+        && let Some(home) = env::var_os("HOME")
+    {
+        return PathBuf::from(home);
+    }
+
+    PathBuf::from(normalised)
+}
+
+/// Strip the backslash escapes terminals add when a dropped path contains
+/// characters the shell would otherwise split on.
+fn unescape_path_chars(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\'
+            && let Some(next) = chars.peek()
+            && matches!(next, ' ' | '\t' | '\\' | '\'' | '"' | '(' | ')')
+        {
+            out.push(*next);
+            chars.next();
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Decode `%XX` escapes in a `file://` URL path.
+///
+/// Invalid escapes are passed through verbatim rather than dropped, so a
+/// malformed URL still produces a path the user can recognise in the error
+/// message.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' && idx + 2 < bytes.len() {
+            let hex = &text[idx + 1..idx + 3];
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                idx += 3;
+                continue;
+            }
+        }
+        out.push(bytes[idx]);
+        idx += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Content type to send an attached file as, derived from its extension.
+///
+/// `mime_guess` carries the full extension table -- a hand-written one always
+/// misses whatever the user actually attaches (`.rs`, `.toml`, `.heic`, ...).
+/// Unknown extensions become `application/octet-stream`.  Text types get an
+/// explicit `charset=utf-8`, without which recipients are free to render the
+/// part as Latin-1.
+fn guess_mime_type(path: &std::path::Path) -> String {
+    let guess = mime_guess::from_path(path).first_or_octet_stream();
+    if guess.type_() == mime_guess::mime::TEXT
+        && guess.get_param(mime_guess::mime::CHARSET).is_none()
+    {
+        format!("{}; charset=utf-8", guess.essence_str())
+    } else {
+        guess.essence_str().to_string()
+    }
+}
+
+/// Recognise a paste that is really a drag-and-drop of files.
+///
+/// Terminals deliver dropped files as absolute paths, optionally as `file://`
+/// URLs, quoted, or backslash-escaped. Requiring *every* candidate to be an
+/// absolute path that exists keeps ordinary text pastes out of the attachment
+/// path -- including a paste that happens to name a file in the current
+/// directory, which is why relative paths are rejected here.
+fn dropped_file_paths(text: &str) -> Option<Vec<String>> {
+    let candidates = parse_paste_paths(text);
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let all_files = candidates.iter().all(|candidate| {
+        let path = expand_user_path(candidate);
+        path.is_absolute() && path.is_file()
+    });
+
+    if all_files { Some(candidates) } else { None }
+}
+
+/// Split pasted text into candidate file paths.
+///
+/// Terminals that translate drag-and-drop into a paste may deliver one or
+/// multiple paths separated by whitespace, quoted to protect embedded spaces,
+/// or with literal backslash escapes. This helper returns candidates that
+/// [`expand_user_path`] can subsequently normalise.
+fn parse_paste_paths(text: &str) -> Vec<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    // Fast path: multiple paths separated by newlines.
+    let lines: Vec<&str> = trimmed
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    if lines.len() > 1 {
+        return lines.into_iter().map(str::to_string).collect();
+    }
+
+    // Single-line: shell-split to find the token boundaries of a multi-file
+    // drop. A single token is returned raw so that [`expand_user_path`] stays
+    // the only place that unescapes -- otherwise a path typed as
+    // `/tmp/a\ b.txt` would be unescaped twice, and a path typed with literal
+    // spaces would be split into pieces.
+    match shell_split(trimmed) {
+        Ok(parts) if parts.len() > 1 => parts,
+        _ => vec![trimmed.to_string()],
     }
 }
 
@@ -3999,6 +5707,7 @@ mod tests {
             commit_progress: None,
             mailbox_loader: None,
             mailbox_load_progress: None,
+            message_loader: None,
             scheduled_actions: vec![],
             current_mailbox: MailboxKind::Inbox,
             search: None,
@@ -4012,6 +5721,9 @@ mod tests {
 
             pending_shortcut: None,
             pending_navigation: None,
+            save_attachment: None,
+            outgoing: None,
+            needs_full_redraw: false,
         }
     }
 
@@ -4430,5 +6142,1408 @@ mod tests {
             app.scheduled_actions.iter().map(|a| a.message_id).collect();
         assert!(requeued_ids.contains(&2));
         assert!(requeued_ids.contains(&4));
+    }
+
+    // -- Attachment paths -----------------------------------------------------
+
+    #[test]
+    fn expand_user_path_unescapes_before_expanding_tilde() {
+        let Some(home) = env::var_os("HOME") else {
+            return;
+        };
+        // Escapes have to be stripped first, or the file name keeps the
+        // backslash and the read fails.
+        assert_eq!(
+            expand_user_path("~/My\\ File.pdf"),
+            PathBuf::from(home).join("My File.pdf")
+        );
+    }
+
+    #[test]
+    fn expand_user_path_decodes_file_urls() {
+        assert_eq!(
+            expand_user_path("file:///tmp/My%20File.pdf"),
+            PathBuf::from("/tmp/My File.pdf")
+        );
+        assert_eq!(
+            expand_user_path("file://localhost/tmp/report.pdf"),
+            PathBuf::from("/tmp/report.pdf")
+        );
+    }
+
+    #[test]
+    fn expand_user_path_leaves_plain_paths_percent_encoded() {
+        // Only `file://` URLs are percent-encoded; a real file may be named
+        // "100%20done".
+        assert_eq!(
+            expand_user_path("/tmp/100%20done.txt"),
+            PathBuf::from("/tmp/100%20done.txt")
+        );
+    }
+
+    #[test]
+    fn expand_user_path_strips_quotes() {
+        assert_eq!(
+            expand_user_path("\"/tmp/my file.txt\""),
+            PathBuf::from("/tmp/my file.txt")
+        );
+        assert_eq!(
+            expand_user_path("'/tmp/my file.txt'"),
+            PathBuf::from("/tmp/my file.txt")
+        );
+    }
+
+    #[test]
+    fn parse_paste_paths_keeps_single_path_raw() {
+        // A single token stays escaped so expand_user_path is the only place
+        // that unescapes -- otherwise the value is unescaped twice.
+        assert_eq!(
+            parse_paste_paths("/tmp/a\\ b.txt"),
+            vec!["/tmp/a\\ b.txt".to_string()]
+        );
+        assert_eq!(
+            expand_user_path(&parse_paste_paths("/tmp/a\\ b.txt")[0]),
+            PathBuf::from("/tmp/a b.txt")
+        );
+    }
+
+    #[test]
+    fn unescaped_spaces_in_a_pasted_path_are_not_a_drop() {
+        // Terminals escape or quote spaces when they deliver a drop, so an
+        // unescaped space means this is text: it splits into tokens that are
+        // not all files, and therefore gets typed instead of attached.
+        // (A path typed into the attach prompt never comes through here -- the
+        // prompt hands its raw value straight to attach_file_from_path.)
+        assert!(parse_paste_paths("/tmp/my file.txt").len() > 1);
+        assert_eq!(dropped_file_paths("/tmp/my file.txt"), None);
+    }
+
+    #[test]
+    fn parse_paste_paths_splits_multi_file_drops() {
+        assert_eq!(
+            parse_paste_paths("/tmp/a.txt\n/tmp/b.txt"),
+            vec!["/tmp/a.txt".to_string(), "/tmp/b.txt".to_string()]
+        );
+        assert_eq!(
+            parse_paste_paths("'/tmp/a b.txt' '/tmp/c.txt'"),
+            vec!["/tmp/a b.txt".to_string(), "/tmp/c.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn dropped_file_paths_accepts_existing_absolute_paths() {
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        let path = file.path().to_string_lossy().into_owned();
+        assert_eq!(dropped_file_paths(&path), Some(vec![path.clone()]));
+    }
+
+    #[test]
+    fn dropped_file_paths_rejects_ordinary_text() {
+        assert_eq!(dropped_file_paths("Hello there, please review"), None);
+        assert_eq!(dropped_file_paths(""), None);
+        // Relative paths are rejected even when they exist, so pasting a word
+        // that happens to name a file in the cwd still types as text.
+        assert_eq!(dropped_file_paths("Cargo.toml"), None);
+    }
+
+    #[test]
+    fn dropped_file_paths_requires_every_candidate_to_exist() {
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        let existing = file.path().to_string_lossy().into_owned();
+        let text = format!("{existing}\n/tmp/definitely-not-here-9d3f1a.txt");
+        assert_eq!(dropped_file_paths(&text), None);
+    }
+
+    #[test]
+    fn fallback_attachment_name_uses_mime_extension() {
+        assert_eq!(fallback_attachment_name(0, "image/png"), "attachment-1.png");
+        assert_eq!(
+            fallback_attachment_name(2, "application/pdf"),
+            "attachment-3.pdf"
+        );
+        assert_eq!(
+            fallback_attachment_name(0, "image/jpeg; name=x"),
+            "attachment-1.jpg"
+        );
+        assert_eq!(
+            fallback_attachment_name(0, "application/octet-stream"),
+            "attachment-1.bin"
+        );
+        assert_eq!(
+            fallback_attachment_name(0, "text/plain"),
+            "attachment-1.txt"
+        );
+    }
+
+    #[test]
+    fn guess_mime_type_covers_common_extensions() {
+        let guess = |name: &str| guess_mime_type(std::path::Path::new(name));
+
+        assert_eq!(guess("/tmp/report.pdf"), "application/pdf");
+        assert_eq!(guess("/tmp/photo.HEIC"), "image/heic");
+        assert_eq!(guess("/tmp/clip.mkv"), "video/x-matroska");
+        assert_eq!(guess("/tmp/archive.7z"), "application/x-7z-compressed");
+        assert_eq!(guess("/tmp/song.flac"), "audio/flac");
+        assert_eq!(guess("/tmp/no-extension"), "application/octet-stream");
+        assert_eq!(guess("/tmp/unknown.qqq"), "application/octet-stream");
+    }
+
+    #[test]
+    fn guess_mime_type_marks_text_as_utf8() {
+        let guess = |name: &str| guess_mime_type(std::path::Path::new(name));
+
+        // Without the charset a recipient may decode these as Latin-1.
+        assert_eq!(guess("/tmp/notes.txt"), "text/plain; charset=utf-8");
+        assert_eq!(guess("/tmp/main.rs"), "text/x-rust; charset=utf-8");
+        assert_eq!(guess("/tmp/config.toml"), "text/x-toml; charset=utf-8");
+        assert_eq!(guess("/tmp/data.csv"), "text/csv; charset=utf-8");
+        // Binary types are left alone.
+        assert_eq!(guess("/tmp/logo.png"), "image/png");
+    }
+
+    #[test]
+    fn extension_for_mime_type_prefers_the_explicit_table() {
+        // Ambiguous types come from the table.
+        assert_eq!(extension_for_mime_type("text/plain"), "txt");
+        assert_eq!(extension_for_mime_type("text/plain; charset=utf-8"), "txt");
+        assert_eq!(extension_for_mime_type("image/jpeg"), "jpg");
+        // Prefixed subtypes have no usable subtype, so they are listed too.
+        assert_eq!(extension_for_mime_type("video/x-matroska"), "mkv");
+        assert_eq!(extension_for_mime_type("application/x-7z-compressed"), "7z");
+        // Subtypes that already read like an extension need no entry.
+        assert_eq!(extension_for_mime_type("image/heic"), "heic");
+        assert_eq!(extension_for_mime_type("audio/flac"), "flac");
+        // Unknown types stay generic rather than guessing.
+        assert_eq!(extension_for_mime_type("application/x-made-up"), "bin");
+        assert_eq!(extension_for_mime_type("application/octet-stream"), "bin");
+    }
+
+    #[test]
+    fn sanitize_filename_cannot_escape_the_target_folder() {
+        // A MIME filename is attacker-controlled, so every separator has to
+        // become part of the name instead of a directory step.
+        assert_eq!(sanitize_filename("../../etc/passwd"), ".._.._etc_passwd");
+        assert_eq!(sanitize_filename("/etc/passwd"), "etc_passwd");
+        assert_eq!(
+            sanitize_filename("nested/dir/report.pdf"),
+            "nested_dir_report.pdf"
+        );
+        assert_eq!(sanitize_filename("C:\\Windows\\hosts"), "C:_Windows_hosts");
+        assert_eq!(sanitize_filename("evil\0.txt"), "evil_.txt");
+    }
+
+    #[test]
+    fn sanitize_filename_rejects_names_that_carry_no_content() {
+        // The caller falls back to `attachment-N.ext` on an empty result, so
+        // "." and ".." must not survive as usable names.
+        assert_eq!(sanitize_filename(".."), "");
+        assert_eq!(sanitize_filename("."), "");
+        assert_eq!(sanitize_filename("   "), "");
+        assert_eq!(sanitize_filename("/"), "");
+        assert_eq!(sanitize_filename(""), "");
+        // Leading dots are only a problem on their own.
+        assert_eq!(sanitize_filename("..invoice.pdf"), "..invoice.pdf");
+        assert_eq!(sanitize_filename("  report.pdf  "), "report.pdf");
+    }
+
+    #[test]
+    fn unique_path_in_never_overwrites_an_existing_file() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let folder = dir.path();
+
+        // Nothing there yet: the name is used as is.
+        assert_eq!(
+            unique_path_in(folder, "report.pdf"),
+            folder.join("report.pdf")
+        );
+
+        // The counter goes before the extension, not after it.
+        fs::write(folder.join("report.pdf"), b"first").expect("write");
+        assert_eq!(
+            unique_path_in(folder, "report.pdf"),
+            folder.join("report (1).pdf")
+        );
+
+        // And it keeps counting rather than reusing " (1)".
+        fs::write(folder.join("report (1).pdf"), b"second").expect("write");
+        assert_eq!(
+            unique_path_in(folder, "report.pdf"),
+            folder.join("report (2).pdf")
+        );
+    }
+
+    #[test]
+    fn unique_path_in_handles_names_without_an_extension() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let folder = dir.path();
+
+        fs::write(folder.join("notes"), b"first").expect("write");
+        assert_eq!(unique_path_in(folder, "notes"), folder.join("notes (1)"));
+
+        // A dotfile has no stem, so the leading dot is not an extension either.
+        fs::write(folder.join(".gitignore"), b"first").expect("write");
+        assert_eq!(
+            unique_path_in(folder, ".gitignore"),
+            folder.join(".gitignore (1)")
+        );
+    }
+
+    // -- Compose focus order --------------------------------------------------
+
+    fn outgoing_attachment(filename: &str) -> OutgoingAttachment {
+        OutgoingAttachment {
+            filename: filename.to_string(),
+            mime_type: "application/pdf".to_string(),
+            data: b"%PDF-1.7".to_vec(),
+        }
+    }
+
+    #[test]
+    fn focus_sequence_skips_the_attachment_list_when_there_is_none() {
+        let mut compose = ComposeState::new();
+        assert_eq!(
+            compose.focus_sequence(),
+            vec![
+                ComposeFocus::Field(ComposeField::To),
+                ComposeFocus::Field(ComposeField::Cc),
+                ComposeFocus::Field(ComposeField::Bcc),
+                ComposeFocus::Field(ComposeField::Subject),
+                ComposeFocus::Body,
+                ComposeFocus::Button(ComposeButton::Attach),
+                ComposeFocus::Button(ComposeButton::Cancel),
+                ComposeFocus::Button(ComposeButton::Edit),
+                ComposeFocus::Button(ComposeButton::Draft),
+                ComposeFocus::Button(ComposeButton::Send),
+            ]
+        );
+
+        // Tab from the last header lands on the body, not on an empty list.
+        compose.set_focus(ComposeFocus::Field(ComposeField::Subject));
+        compose.focus_next();
+        assert_eq!(compose.focus(), ComposeFocus::Body);
+
+        // And Shift+Tab from the first field wraps to the last button.
+        compose.set_focus(ComposeFocus::Field(ComposeField::To));
+        compose.focus_prev();
+        assert_eq!(compose.focus(), ComposeFocus::Button(ComposeButton::Send));
+    }
+
+    #[test]
+    fn focus_sequence_includes_the_attachment_list_once_a_file_is_attached() {
+        let mut compose = ComposeState::new();
+        compose.add_attachment(outgoing_attachment("invoice.pdf"));
+
+        assert_eq!(
+            compose.focus_sequence(),
+            vec![
+                ComposeFocus::Field(ComposeField::To),
+                ComposeFocus::Field(ComposeField::Cc),
+                ComposeFocus::Field(ComposeField::Bcc),
+                ComposeFocus::Field(ComposeField::Subject),
+                ComposeFocus::Attachments,
+                ComposeFocus::Body,
+                ComposeFocus::Button(ComposeButton::Attach),
+                ComposeFocus::Button(ComposeButton::Cancel),
+                ComposeFocus::Button(ComposeButton::Edit),
+                ComposeFocus::Button(ComposeButton::Draft),
+                ComposeFocus::Button(ComposeButton::Send),
+            ]
+        );
+
+        // The list sits between the headers and the body in both directions.
+        compose.set_focus(ComposeFocus::Field(ComposeField::Subject));
+        compose.focus_next();
+        assert_eq!(compose.focus(), ComposeFocus::Attachments);
+        compose.focus_next();
+        assert_eq!(compose.focus(), ComposeFocus::Body);
+        compose.focus_prev();
+        assert_eq!(compose.focus(), ComposeFocus::Attachments);
+    }
+
+    // -- Attachment indicator -------------------------------------------------
+
+    #[test]
+    fn the_message_list_marks_messages_that_carry_attachments() {
+        let mut message = make_message(1, MessageStatus::Read);
+        let app = test_app(vec![message.clone()]);
+
+        assert_eq!(
+            app.formatted_message_row(&message, OffsetDateTime::UNIX_EPOCH)
+                .flags,
+            "    ",
+            "no attachments, no marker"
+        );
+
+        message.has_attachments = true;
+        assert_eq!(
+            app.formatted_message_row(&message, OffsetDateTime::UNIX_EPOCH)
+                .flags,
+            "   @"
+        );
+
+        // The marker has its own column, so it survives the other flags.
+        message.status = MessageStatus::New;
+        message.starred = true;
+        message.answered = true;
+        assert_eq!(
+            app.formatted_message_row(&message, OffsetDateTime::UNIX_EPOCH)
+                .flags,
+            "N*↩@"
+        );
+    }
+
+    #[test]
+    fn opening_a_message_corrects_the_attachment_indicator() {
+        let message = make_message(1, MessageStatus::Read);
+        let mut app = test_app(vec![message]);
+
+        // The list said "no attachments" -- the parsed message says otherwise.
+        app.show_loaded_message(
+            1,
+            MessageContent {
+                attachments: vec![attachment(
+                    Some("invoice.pdf"),
+                    "application/pdf",
+                    Some(b"%PDF-1.7"),
+                    None,
+                )],
+                ..Default::default()
+            },
+        );
+
+        assert!(app.mailbox.messages[0].has_attachments);
+        assert!(
+            app.message_view
+                .as_ref()
+                .is_some_and(|view| view.message.has_attachments),
+            "the open viewer has to agree with the list"
+        );
+
+        // And the correction works the other way round, too.
+        app.mailbox.messages[0].has_attachments = true;
+        app.show_loaded_message(1, MessageContent::default());
+        assert!(!app.mailbox.messages[0].has_attachments);
+    }
+
+    #[test]
+    fn forwarding_a_message_corrects_the_attachment_indicator_too() {
+        let message = make_message(1, MessageStatus::Read);
+        let mut app = test_app(vec![message.clone()]);
+
+        // No viewer is involved here: the body was fetched to seed compose.
+        // The list still has to learn what the fetch found.
+        app.deliver_loaded_message(
+            message,
+            MessageLoadPurpose::Forward,
+            None,
+            LoadedMessage {
+                content: MessageContent {
+                    attachments: vec![attachment(
+                        Some("invoice.pdf"),
+                        "application/pdf",
+                        Some(b"%PDF-1.7"),
+                        None,
+                    )],
+                    ..Default::default()
+                },
+                attachments: Vec::new(),
+                unavailable: 0,
+            },
+        );
+
+        assert!(app.compose.is_some(), "forwarding opens compose");
+        assert!(app.mailbox.messages[0].has_attachments);
+    }
+
+    /// Draw the whole UI into a test terminal and return it line by line.
+    fn rendered_screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| crate::ui::render(frame, app))
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_attachment_marker_reaches_the_screen() {
+        let mut with = make_message(1, MessageStatus::Read);
+        with.has_attachments = true;
+        with.subject = "Has an attachment".to_string();
+        let mut without = make_message(2, MessageStatus::Read);
+        without.subject = "Plain text only".to_string();
+
+        let mut app = test_app(vec![with, without]);
+        let screen = rendered_screen(&mut app, 100, 12);
+
+        let marked = screen
+            .iter()
+            .find(|line| line.contains("Has an attachment"))
+            .expect("the message list shows the first message");
+        assert!(
+            marked.contains('@'),
+            "the attachment marker has to be drawn, got {marked:?}"
+        );
+
+        let unmarked = screen
+            .iter()
+            .find(|line| line.contains("Plain text only"))
+            .expect("the message list shows the second message");
+        assert!(
+            !unmarked.contains('@'),
+            "a message without attachments stays unmarked, got {unmarked:?}"
+        );
+    }
+
+    #[test]
+    fn text_field_insert_str_flattens_pasted_text() {
+        let mut field = TextFieldState::default();
+        // Enclosing line breaks (the terminal's) go away; the inner one becomes
+        // a separator rather than gluing the addresses together.
+        assert!(field.insert_str("first@example.com\nsecond@example.com\n"));
+        assert_eq!(field.value, "first@example.com second@example.com");
+        assert_eq!(field.cursor, text_len(&field.value));
+
+        // Inserts at the cursor rather than appending, and keeps a deliberate
+        // trailing space.
+        field.move_home();
+        field.insert_str("zero@example.com, ");
+        assert_eq!(
+            field.value,
+            "zero@example.com, first@example.com second@example.com"
+        );
+        assert_eq!(field.cursor, text_len("zero@example.com, "));
+    }
+
+    #[test]
+    fn draft_status_line_reports_lost_attachments() {
+        assert_eq!(draft_status_line("Editing draft.", 0), "Editing draft.");
+        assert!(draft_status_line("Editing draft.", 1).contains("1 attachment"));
+        assert!(draft_status_line("Editing draft.", 3).contains("3 attachments"));
+    }
+
+    // -- Paste routing --------------------------------------------------------
+
+    #[test]
+    fn pasted_text_reaches_the_focused_compose_field() {
+        let mut app = test_app(vec![]);
+        app.open_compose();
+
+        app.handle_paste_text("someone@example.com").expect("paste");
+
+        let compose = app.compose.as_ref().expect("compose open");
+        assert_eq!(
+            compose.field_data(ComposeField::To).0,
+            "someone@example.com",
+            "bracketed paste is the only route into the field; dropping it loses the paste"
+        );
+        assert!(compose.attachments().is_empty());
+    }
+
+    #[test]
+    fn pasted_text_reaches_the_search_input() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        app.open_search();
+
+        app.handle_paste_text("invoice").expect("paste");
+
+        assert_eq!(
+            app.search.as_ref().expect("search open").input.value,
+            "invoice"
+        );
+    }
+
+    #[test]
+    fn pasted_text_reaches_the_save_attachment_folder_field() {
+        let message = make_message(1, MessageStatus::Read);
+        let mut app = test_app(vec![message.clone()]);
+        app.save_attachment = Some(SaveAttachmentDialog::new(String::new()));
+        if let Some(dialog) = app.save_attachment.as_mut() {
+            dialog.focus = SaveAttachmentFocus::Folder;
+        }
+
+        app.handle_paste_text("/tmp/target-dir").expect("paste");
+
+        let dialog = app.save_attachment.as_ref().expect("dialog open");
+        assert_eq!(dialog.folder_data().0, "/tmp/target-dir");
+    }
+
+    #[test]
+    fn dropping_a_file_while_composing_attaches_it() {
+        use std::io::Write as _;
+
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(b"payload").expect("write");
+        let path = file.path().to_string_lossy().into_owned();
+
+        let mut app = test_app(vec![]);
+        app.open_compose();
+
+        app.handle_paste_text(&path).expect("paste");
+
+        let compose = app.compose.as_ref().expect("compose open");
+        assert_eq!(compose.attachments().len(), 1);
+        assert_eq!(compose.attachments()[0].data, b"payload");
+        assert_eq!(
+            compose.field_data(ComposeField::To).0,
+            "",
+            "a drop must not also type the path into the focused field"
+        );
+    }
+
+    // -- Asking before attaching something big --------------------------------
+
+    /// A file over the threshold, made sparse: the guard reads the length from
+    /// the filesystem, so there is no reason to write ten megabytes to test it.
+    fn oversized_file() -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        file.as_file()
+            .set_len(LARGE_ATTACHMENT_BYTES + 1)
+            .expect("grow file");
+        file
+    }
+
+    fn drop_file(app: &mut App, file: &tempfile::NamedTempFile) {
+        let path = file.path().to_string_lossy().into_owned();
+        app.handle_paste_text(&path).expect("drop");
+    }
+
+    #[test]
+    fn a_large_file_is_not_read_until_the_user_approves_it() {
+        let file = oversized_file();
+        let mut app = test_app(vec![]);
+        app.open_compose();
+
+        drop_file(&mut app, &file);
+
+        let compose = app.compose.as_ref().expect("compose open");
+        assert!(
+            compose.attachments().is_empty(),
+            "the file must not be in the message before the question is answered"
+        );
+        let (name, size, projected) = compose
+            .large_attachment_question()
+            .expect("the user has to be asked");
+        assert_eq!(name, file.path().file_name().unwrap().to_string_lossy());
+        assert_eq!(size as u64, LARGE_ATTACHMENT_BYTES + 1);
+        assert!(
+            projected > size,
+            "the projected message counts the base64 encoding, not the bytes on disk"
+        );
+    }
+
+    #[test]
+    fn approving_a_large_file_attaches_it() {
+        let file = oversized_file();
+        let mut app = test_app(vec![]);
+        app.open_compose();
+        drop_file(&mut app, &file);
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('y')))
+            .expect("approve");
+
+        let compose = app.compose.as_ref().expect("compose open");
+        assert_eq!(compose.attachments().len(), 1);
+        assert_eq!(
+            compose.attachments()[0].size() as u64,
+            LARGE_ATTACHMENT_BYTES + 1
+        );
+        assert!(compose.large_attachment_question().is_none());
+    }
+
+    #[test]
+    fn declining_a_large_file_leaves_the_message_alone() {
+        let file = oversized_file();
+        let mut app = test_app(vec![]);
+        app.open_compose();
+        drop_file(&mut app, &file);
+
+        app.handle_key(KeyEvent::from(KeyCode::Esc)).expect("skip");
+
+        let compose = app
+            .compose
+            .as_ref()
+            .expect("Esc answers the question, it does not cancel compose");
+        assert!(compose.attachments().is_empty());
+        assert!(compose.large_attachment_question().is_none());
+        assert!(
+            compose
+                .status()
+                .is_some_and(|line| line.starts_with("Skipped")),
+            "a file left out has to say so: {:?}",
+            compose.status()
+        );
+    }
+
+    /// The question interrupts a drop part-way through, so the files behind it
+    /// have to survive the wait and still be attached afterwards.
+    #[test]
+    fn a_drop_carries_on_after_the_question_is_answered() {
+        use std::io::Write as _;
+
+        let mut small = tempfile::NamedTempFile::new().expect("temp file");
+        small.write_all(b"first").expect("write");
+        let large = oversized_file();
+        let mut last = tempfile::NamedTempFile::new().expect("temp file");
+        last.write_all(b"third").expect("write");
+
+        let mut app = test_app(vec![]);
+        app.open_compose();
+        app.handle_paste_text(&format!(
+            "{}\n{}\n{}",
+            small.path().display(),
+            large.path().display(),
+            last.path().display()
+        ))
+        .expect("drop");
+
+        {
+            let compose = app.compose.as_ref().expect("compose open");
+            assert_eq!(
+                compose.attachments().len(),
+                1,
+                "the drop stops at the file it has to ask about"
+            );
+            assert!(compose.large_attachment_question().is_some());
+        }
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('n')))
+            .expect("skip the big one");
+
+        let compose = app.compose.as_ref().expect("compose open");
+        let names: Vec<&str> = compose
+            .attachments()
+            .iter()
+            .map(|attachment| attachment.filename.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                small.path().file_name().unwrap().to_str().unwrap(),
+                last.path().file_name().unwrap().to_str().unwrap()
+            ],
+            "the file behind the question still gets attached"
+        );
+        assert_eq!(
+            compose.status(),
+            Some("Attached 2 files (10B). Skipped 1."),
+            "the summary covers the whole drop, not just the part after the answer"
+        );
+    }
+
+    #[test]
+    fn the_message_size_counts_the_body_and_the_encoded_attachments() {
+        use std::io::Write as _;
+
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(&[0u8; 3000]).expect("write");
+
+        let mut app = test_app(vec![]);
+        app.open_compose();
+        let body_only = app.compose.as_ref().expect("compose").message_size();
+
+        drop_file(&mut app, &file);
+
+        let compose = app.compose.as_ref().expect("compose open");
+        assert_eq!(compose.message_size(), body_only + base64_size(3000));
+        assert!(
+            compose.message_size() > body_only + 3000,
+            "base64 costs a third on top of the bytes on disk"
+        );
+    }
+
+    #[test]
+    fn base64_size_counts_the_padding_and_the_line_breaks() {
+        assert_eq!(base64_size(0), 0);
+        // Three bytes are one full quantum: four characters, one line, one CRLF.
+        assert_eq!(base64_size(3), 4 + 2);
+        // One byte still costs a padded quantum.
+        assert_eq!(base64_size(1), 4 + 2);
+        // 57 bytes is exactly one 76-character line.
+        assert_eq!(base64_size(57), 76 + 2);
+        assert_eq!(base64_size(58), 80 + 4);
+    }
+
+    // -- Handing the terminal to the editor and getting it back ---------------
+
+    // These are Unix-only because crossterm may drive a Windows console through
+    // the API instead of writing escape sequences, leaving the sink they assert
+    // on empty.  The behaviour under test is the same on both.
+
+    /// What the editor is given: a cooked terminal on the main screen with a
+    /// visible cursor.  Raw mode is a termios call, so it leaves no bytes here.
+    #[cfg(unix)]
+    const RELEASED: &str = concat!(
+        "\u{1b}[?2004l", // DisableBracketedPaste
+        "\u{1b}[?1049l", // LeaveAlternateScreen
+        "\u{1b}[?25h",   // Show cursor
+    );
+
+    /// What the app takes back once the editor exits.
+    #[cfg(unix)]
+    const RESTORED: &str = concat!(
+        "\u{1b}[?1049h", // EnterAlternateScreen
+        "\u{1b}[?2004h", // EnableBracketedPaste
+    );
+
+    /// Drive the editor helper the way [`App::edit_compose_body`] does.
+    ///
+    /// Raw mode is process-wide and `cargo test` runs with the developer's
+    /// terminal attached, so this puts it back the way it was found before any
+    /// assertion can panic -- leaving it raw would wreck the shell that ran the
+    /// tests.
+    #[cfg(unix)]
+    fn run_editor_in_test(
+        app: &mut App,
+        sink: &mut Vec<u8>,
+        program: &str,
+    ) -> std::io::Result<ExitStatus> {
+        let was_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+        let status = app.run_editor_command(sink, &mut Command::new(program));
+        if !was_raw {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+        status
+    }
+
+    /// The drop-to-attach path above works only while bracketed paste is on,
+    /// and every editor worth the name turns it off on its way out.
+    #[cfg(unix)]
+    #[test]
+    fn the_editor_gets_the_terminal_and_gives_it_back() {
+        let mut app = test_app(vec![]);
+        let mut terminal = Vec::new();
+        let status = run_editor_in_test(&mut app, &mut terminal, "true").expect("run");
+
+        assert!(status.success());
+        assert_eq!(
+            String::from_utf8(terminal).expect("utf-8"),
+            format!("{RELEASED}{RESTORED}"),
+            "the modes are released for the editor and taken back once it exits"
+        );
+        assert!(
+            app.take_full_redraw(),
+            "re-entering the alternate screen clears it, so the next frame cannot be a diff"
+        );
+        assert!(!app.take_full_redraw(), "the request is taken, not latched");
+    }
+
+    /// An editor the user quit without saving exits non-zero -- but it still had
+    /// the terminal, so the restore is just as necessary.
+    #[cfg(unix)]
+    #[test]
+    fn the_terminal_comes_back_from_an_editor_that_failed() {
+        let mut app = test_app(vec![]);
+        let mut terminal = Vec::new();
+        let status = run_editor_in_test(&mut app, &mut terminal, "false").expect("run");
+
+        assert!(!status.success());
+        assert_eq!(
+            String::from_utf8(terminal).expect("utf-8"),
+            format!("{RELEASED}{RESTORED}")
+        );
+        assert!(app.take_full_redraw());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_terminal_comes_back_from_an_editor_that_never_launches() {
+        let mut app = test_app(vec![]);
+        let mut terminal = Vec::new();
+        let result = run_editor_in_test(&mut app, &mut terminal, "elma-no-such-editor");
+
+        assert!(result.is_err(), "a missing editor has to be reported");
+        assert_eq!(
+            String::from_utf8(terminal).expect("utf-8"),
+            format!("{RELEASED}{RESTORED}"),
+            "the early return out of edit_compose_body still leaves a usable terminal"
+        );
+        assert!(app.take_full_redraw());
+    }
+
+    // -- Carrying attachments into compose ------------------------------------
+
+    /// Backend that serves blob downloads, like JMAP does.
+    struct BlobBackend;
+
+    impl MailBackend for BlobBackend {
+        fn load_mailbox(
+            &self,
+            _mailbox: MailboxKind,
+        ) -> anyhow::Result<(MailboxSnapshot, mpsc::Receiver<BackendEvent>)> {
+            let (_tx, rx) = mpsc::channel();
+            Ok((
+                MailboxSnapshot {
+                    total: 0,
+                    messages: vec![],
+                },
+                rx,
+            ))
+        }
+
+        fn load_message(&self, _message_id: MessageId) -> anyhow::Result<MessageContent> {
+            Ok(MessageContent::default())
+        }
+
+        fn apply_actions(
+            &self,
+            _actions: Vec<Action>,
+        ) -> anyhow::Result<mpsc::Receiver<ActionStatus>> {
+            let (_tx, rx) = mpsc::channel();
+            Ok(rx)
+        }
+
+        fn send_message(&self, _message: OutgoingMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn save_draft(&self, _message: OutgoingMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn fetch_attachment_blob(&self, blob_id: &str) -> anyhow::Result<Vec<u8>> {
+            if blob_id == "missing" {
+                anyhow::bail!("no such blob");
+            }
+            Ok(format!("blob:{blob_id}").into_bytes())
+        }
+    }
+
+    fn attachment(
+        filename: Option<&str>,
+        mime_type: &str,
+        data: Option<&[u8]>,
+        blob_id: Option<&str>,
+    ) -> MessageAttachment {
+        MessageAttachment {
+            filename: filename.map(str::to_string),
+            mime_type: mime_type.to_string(),
+            size: data.map_or(0, |d| d.len()),
+            data: data.map(<[u8]>::to_vec),
+            blob_id: blob_id.map(str::to_string),
+            inline: false,
+        }
+    }
+
+    /// The same, but a part the body references as `cid:…`.
+    fn inline_attachment(filename: &str, data: &[u8]) -> MessageAttachment {
+        MessageAttachment {
+            inline: true,
+            ..attachment(Some(filename), "image/png", Some(data), None)
+        }
+    }
+
+    #[test]
+    fn restore_compose_attachments_keeps_inline_bytes() {
+        let app = test_app(vec![]);
+        let content = MessageContent {
+            mailer: String::new(),
+            parts: vec![],
+            attachments: vec![attachment(
+                Some("report.pdf"),
+                "application/pdf",
+                Some(b"%PDF-1.7"),
+                None,
+            )],
+        };
+
+        let (restored, unavailable) = restore_compose_attachments(app.backend.as_ref(), &content);
+        assert_eq!(unavailable, 0);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].filename, "report.pdf");
+        assert_eq!(restored[0].mime_type, "application/pdf");
+        assert_eq!(restored[0].data, b"%PDF-1.7");
+    }
+
+    #[test]
+    fn restore_compose_attachments_downloads_blobs() {
+        let app = test_app_with_backend(vec![], Arc::new(BlobBackend));
+        let content = MessageContent {
+            mailer: String::new(),
+            parts: vec![],
+            attachments: vec![
+                attachment(Some("sheet.xlsx"), "application/pdf", None, Some("b1")),
+                // No filename: the name has to come from the content type.
+                attachment(None, "image/png", None, Some("b2")),
+            ],
+        };
+
+        let (restored, unavailable) = restore_compose_attachments(app.backend.as_ref(), &content);
+        assert_eq!(unavailable, 0);
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].data, b"blob:b1");
+        assert_eq!(restored[1].filename, "attachment-2.png");
+        assert_eq!(restored[1].data, b"blob:b2");
+    }
+
+    #[test]
+    fn restore_compose_attachments_counts_unavailable() {
+        let app = test_app_with_backend(vec![], Arc::new(BlobBackend));
+        let content = MessageContent {
+            mailer: String::new(),
+            parts: vec![],
+            attachments: vec![
+                attachment(Some("ok.txt"), "text/plain", Some(b"hi"), None),
+                // Download fails.
+                attachment(Some("bad.txt"), "text/plain", None, Some("missing")),
+                // Neither bytes nor a blob to fetch.
+                attachment(Some("gone.txt"), "text/plain", None, None),
+            ],
+        };
+
+        let (restored, unavailable) = restore_compose_attachments(app.backend.as_ref(), &content);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].filename, "ok.txt");
+        assert_eq!(
+            unavailable, 2,
+            "attachments that cannot be recovered must be counted, not dropped silently"
+        );
+    }
+
+    /// An embedded image is a file, but it is not something the sender
+    /// attached: a forward quotes the body as text, so carrying the logo over
+    /// would attach it to a message that no longer references it.
+    #[test]
+    fn restore_compose_attachments_leaves_inline_parts_behind() {
+        let app = test_app(vec![]);
+        let content = MessageContent {
+            mailer: String::new(),
+            parts: vec![],
+            attachments: vec![
+                inline_attachment("signature-logo.png", b"PNG"),
+                attachment(Some("report.pdf"), "application/pdf", Some(b"%PDF"), None),
+            ],
+        };
+
+        let (restored, unavailable) = restore_compose_attachments(app.backend.as_ref(), &content);
+        assert_eq!(unavailable, 0, "a part left out on purpose is not a loss");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].filename, "report.pdf");
+    }
+
+    /// The save dialog is the one place inline parts are offered, so the guard
+    /// that refuses to open it has to count them.
+    #[test]
+    fn a_message_with_only_an_inline_image_can_still_be_saved_from() {
+        let message = make_message(1, MessageStatus::Read);
+        let mut app = test_app(vec![message]);
+        app.show_loaded_message(
+            1,
+            MessageContent {
+                mailer: String::new(),
+                parts: vec![],
+                attachments: vec![inline_attachment("signature-logo.png", b"PNG")],
+            },
+        );
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('S')))
+            .expect("open the save dialog");
+
+        assert!(
+            app.save_attachment.is_some(),
+            "an embedded image is still a file the reader can keep"
+        );
+        assert_eq!(app.save_attachment_attachments().len(), 1);
+    }
+
+    /// The whole point of the flag: listed for saving, ignored by the marker.
+    #[test]
+    fn opening_a_message_with_an_inline_image_leaves_the_marker_alone() {
+        let message = make_message(1, MessageStatus::Read);
+        let mut app = test_app(vec![message.clone()]);
+        assert!(!app.mailbox.messages[0].has_attachments);
+
+        app.deliver_loaded_message(
+            message,
+            MessageLoadPurpose::View,
+            None,
+            LoadedMessage {
+                content: MessageContent {
+                    mailer: String::new(),
+                    parts: vec![],
+                    attachments: vec![inline_attachment("signature-logo.png", b"PNG")],
+                },
+                attachments: Vec::new(),
+                unavailable: 0,
+            },
+        );
+
+        assert!(
+            !app.mailbox.messages[0].has_attachments,
+            "an `@` must not appear on a newsletter just because it was opened"
+        );
+    }
+
+    #[test]
+    fn forwarding_carries_the_original_attachments() {
+        let message = make_message(1, MessageStatus::Read);
+        let mut app = test_app_with_backend(vec![message.clone()], Arc::new(BlobBackend));
+
+        app.message_view = Some(MessageViewState {
+            message_id: message.id,
+            message_index: 0,
+            message: message.clone(),
+            content: MessageContent {
+                mailer: String::new(),
+                parts: vec![MessageContentPart {
+                    content_type: "text/plain".to_string(),
+                    content: b"original body".to_vec(),
+                }],
+                attachments: vec![attachment(
+                    Some("invoice.pdf"),
+                    "application/pdf",
+                    Some(b"%PDF-1.7"),
+                    None,
+                )],
+            },
+            document: None,
+            raw_html: None,
+            scroll: 0,
+            unformatted: false,
+            info_line: None,
+            read_at: None,
+        });
+
+        app.open_forward().expect("forward should start loading");
+        pump_until(&mut app, "compose to open", |app| app.compose.is_some());
+
+        let compose = app.compose.as_ref().expect("compose should be open");
+        assert_eq!(
+            compose.attachments().len(),
+            1,
+            "forwarding must not drop the original attachment"
+        );
+        assert_eq!(compose.attachments()[0].filename, "invoice.pdf");
+        assert_eq!(compose.attachments()[0].data, b"%PDF-1.7");
+    }
+
+    // -- Keeping the UI thread free -------------------------------------------
+
+    /// Drive the event loop until `predicate` holds, then return.
+    ///
+    /// Panics rather than hanging when the background work never lands.
+    fn pump_until(app: &mut App, what: &str, mut predicate: impl FnMut(&App) -> bool) {
+        for _ in 0..400 {
+            app.poll_backend_events();
+            if predicate(app) {
+                return;
+            }
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// Backend whose calls block until the test releases them.
+    ///
+    /// Every method the UI must not wait on parks on `gate`, so a test can
+    /// observe the state the UI is left in *while* the backend is busy.
+    struct GatedBackend {
+        gate: Mutex<mpsc::Receiver<()>>,
+        loads: Mutex<usize>,
+        sent: Mutex<Vec<OutgoingMessage>>,
+        drafts: Mutex<Vec<OutgoingMessage>>,
+        fail: bool,
+    }
+
+    impl GatedBackend {
+        /// Returns the backend plus the handle that unblocks it.
+        fn new(fail: bool) -> (Arc<Self>, mpsc::Sender<()>) {
+            let (tx, rx) = mpsc::channel();
+            let backend = Arc::new(Self {
+                gate: Mutex::new(rx),
+                loads: Mutex::new(0),
+                sent: Mutex::new(Vec::new()),
+                drafts: Mutex::new(Vec::new()),
+                fail,
+            });
+            (backend, tx)
+        }
+
+        fn wait(&self) {
+            let _ = self.gate.lock().unwrap().recv();
+        }
+
+        fn result(&self) -> anyhow::Result<()> {
+            if self.fail {
+                anyhow::bail!("backend refused");
+            }
+            Ok(())
+        }
+    }
+
+    impl MailBackend for GatedBackend {
+        fn load_mailbox(
+            &self,
+            _mailbox: MailboxKind,
+        ) -> anyhow::Result<(MailboxSnapshot, mpsc::Receiver<BackendEvent>)> {
+            let (_tx, rx) = mpsc::channel();
+            Ok((
+                MailboxSnapshot {
+                    total: 0,
+                    messages: vec![],
+                },
+                rx,
+            ))
+        }
+
+        fn load_message(&self, _message_id: MessageId) -> anyhow::Result<MessageContent> {
+            *self.loads.lock().unwrap() += 1;
+            self.wait();
+            self.result()?;
+            Ok(MessageContent {
+                mailer: String::new(),
+                parts: vec![MessageContentPart {
+                    content_type: "text/plain".to_string(),
+                    content: b"loaded body".to_vec(),
+                }],
+                attachments: vec![],
+            })
+        }
+
+        fn apply_actions(
+            &self,
+            actions: Vec<Action>,
+        ) -> anyhow::Result<mpsc::Receiver<ActionStatus>> {
+            let (tx, rx) = mpsc::channel();
+            for action in actions {
+                let _ = tx.send(ActionStatus {
+                    action,
+                    result: Ok(()),
+                });
+            }
+            Ok(rx)
+        }
+
+        fn send_message(&self, message: OutgoingMessage) -> anyhow::Result<()> {
+            self.wait();
+            self.result()?;
+            self.sent.lock().unwrap().push(message);
+            Ok(())
+        }
+
+        fn save_draft(&self, message: OutgoingMessage) -> anyhow::Result<()> {
+            self.wait();
+            self.result()?;
+            self.drafts.lock().unwrap().push(message);
+            Ok(())
+        }
+    }
+
+    fn compose_with_recipient(app: &mut App) {
+        let mut compose = ComposeState::new();
+        compose.set_field_text(ComposeField::To, "someone@example.com");
+        compose.set_field_text(ComposeField::Subject, "Hello");
+        app.compose = Some(compose);
+    }
+
+    #[test]
+    fn sending_does_not_block_the_ui_thread() {
+        let (backend, release) = GatedBackend::new(false);
+        let mut app = test_app_with_backend(vec![], backend.clone());
+        compose_with_recipient(&mut app);
+
+        // Returns while the backend is still parked inside send_message.
+        app.submit_outgoing(OutgoingKind::Send).expect("submit");
+
+        assert!(
+            app.pending_outgoing().is_some(),
+            "the send must be reported as in flight"
+        );
+        assert!(
+            app.compose.is_some(),
+            "compose stays open until the backend confirms"
+        );
+        assert!(
+            app.compose_action_bar().contains("Sending message"),
+            "the header has to say what the wait is for, got {:?}",
+            app.compose_action_bar()
+        );
+
+        release.send(()).expect("release the backend");
+        pump_until(&mut app, "the send to finish", |app| app.compose.is_none());
+
+        assert_eq!(backend.sent.lock().unwrap().len(), 1);
+        assert_eq!(app.mailbox.status_line.as_deref(), Some("Message sent."));
+        assert!(app.pending_outgoing().is_none());
+    }
+
+    #[test]
+    fn keys_are_ignored_while_a_send_is_in_flight() {
+        let (backend, _release) = GatedBackend::new(false);
+        let mut app = test_app_with_backend(vec![], backend);
+        compose_with_recipient(&mut app);
+        app.submit_outgoing(OutgoingKind::Send).expect("submit");
+
+        app.handle_key(KeyEvent::from(KeyCode::Esc)).expect("esc");
+        app.handle_key(KeyEvent::from(KeyCode::Char('x')))
+            .expect("typing");
+        app.handle_paste_text("pasted").expect("paste");
+
+        let compose = app
+            .compose
+            .as_ref()
+            .expect("Esc must not discard a message the backend already has");
+        assert_eq!(
+            compose.field_data(ComposeField::Subject).0,
+            "Hello",
+            "the message must not change while it is being sent"
+        );
+    }
+
+    #[test]
+    fn a_failed_send_keeps_the_message_in_compose() {
+        let (backend, release) = GatedBackend::new(true);
+        let mut app = test_app_with_backend(vec![], backend);
+        compose_with_recipient(&mut app);
+        app.submit_outgoing(OutgoingKind::Send).expect("submit");
+        release.send(()).expect("release the backend");
+
+        pump_until(&mut app, "the failure to surface", |app| {
+            app.compose_status_line().is_some()
+        });
+
+        let compose = app.compose.as_ref().expect("compose must stay open");
+        assert_eq!(
+            compose.field_data(ComposeField::To).0,
+            "someone@example.com",
+            "a failed send must not lose the message"
+        );
+        assert!(
+            app.compose_status_line()
+                .is_some_and(|status| status.starts_with("Failed to send:")),
+            "got {:?}",
+            app.compose_status_line()
+        );
+        assert!(app.pending_outgoing().is_none(), "the operation is over");
+    }
+
+    #[test]
+    fn saving_a_draft_runs_in_the_background() {
+        let (backend, release) = GatedBackend::new(false);
+        let mut app = test_app_with_backend(vec![], backend.clone());
+        compose_with_recipient(&mut app);
+
+        app.submit_outgoing(OutgoingKind::Draft).expect("submit");
+        assert!(app.pending_outgoing().is_some());
+
+        release.send(()).expect("release the backend");
+        pump_until(&mut app, "the draft to be stored", |app| {
+            app.compose.is_none()
+        });
+
+        assert_eq!(backend.drafts.lock().unwrap().len(), 1);
+        assert_eq!(app.mailbox.status_line.as_deref(), Some("Draft saved."));
+    }
+
+    #[test]
+    fn opening_a_message_loads_it_in_the_background() {
+        let (backend, release) = GatedBackend::new(false);
+        let message = make_message(1, MessageStatus::New);
+        let mut app = test_app_with_backend(vec![message], backend);
+
+        app.handle_key(KeyEvent::from(KeyCode::Enter))
+            .expect("enter");
+
+        assert!(
+            app.message_view.is_none(),
+            "the viewer must not open before the body arrives"
+        );
+        let (label, _) = app
+            .pending_message_load()
+            .expect("the load must be reported as in flight");
+        assert!(label.contains("Subject 1"), "got {label:?}");
+
+        release.send(()).expect("release the backend");
+        pump_until(&mut app, "the body to arrive", |app| {
+            app.message_view.is_some()
+        });
+
+        let view = app.message_view.as_ref().expect("viewer open");
+        assert_eq!(view.message_id, 1);
+        assert!(app.pending_message_load().is_none());
+    }
+
+    #[test]
+    fn repeating_the_open_key_does_not_start_a_second_load() {
+        let (backend, release) = GatedBackend::new(false);
+        let message = make_message(1, MessageStatus::Read);
+        let mut app = test_app_with_backend(vec![message], backend.clone());
+
+        app.handle_key(KeyEvent::from(KeyCode::Enter))
+            .expect("enter");
+        // Wait for the worker to reach the backend, so a second fetch would show up.
+        for _ in 0..400 {
+            if *backend.loads.lock().unwrap() > 0 {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        app.handle_key(KeyEvent::from(KeyCode::Enter))
+            .expect("enter again");
+        thread::sleep(std::time::Duration::from_millis(50));
+
+        assert_eq!(
+            *backend.loads.lock().unwrap(),
+            1,
+            "a second keypress must not fetch the same body twice"
+        );
+
+        release.send(()).expect("release the backend");
+        pump_until(&mut app, "the body to arrive", |app| {
+            app.message_view.is_some()
+        });
+    }
+
+    #[test]
+    fn a_failed_load_reports_instead_of_aborting() {
+        let (backend, release) = GatedBackend::new(true);
+        let message = make_message(1, MessageStatus::Read);
+        let mut app = test_app_with_backend(vec![message], backend);
+
+        app.handle_key(KeyEvent::from(KeyCode::Enter))
+            .expect("enter");
+        release.send(()).expect("release the backend");
+
+        pump_until(&mut app, "the failure to surface", |app| {
+            app.mailbox.status_line.is_some()
+        });
+
+        assert!(
+            app.mailbox
+                .status_line
+                .as_deref()
+                .is_some_and(|status| status.starts_with("Failed to load message:")),
+            "got {:?}",
+            app.mailbox.status_line
+        );
+        assert!(app.message_view.is_none());
+    }
+
+    #[test]
+    fn forwarding_downloads_blobs_off_the_ui_thread() {
+        let (backend, release) = GatedBackend::new(false);
+        let message = make_message(1, MessageStatus::Read);
+        let mut app = test_app_with_backend(vec![message], backend);
+
+        app.open_forward().expect("forward should start loading");
+
+        assert!(
+            app.compose.is_none(),
+            "compose must wait for the attachments instead of freezing the UI"
+        );
+        assert!(app.pending_message_load().is_some());
+
+        release.send(()).expect("release the backend");
+        pump_until(&mut app, "compose to open", |app| app.compose.is_some());
     }
 }

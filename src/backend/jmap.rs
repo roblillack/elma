@@ -6,7 +6,10 @@
 //! processed on an internal Tokio runtime so the UI thread remains responsive.
 
 use crate::{
-    backend::{ActionStatus, BackendEvent, MailBackend, MailboxSnapshot, OutgoingMessage},
+    backend::{
+        ActionStatus, BackendEvent, LeafPart, MailBackend, MailboxSnapshot, OutgoingMessage,
+        PartRole, build_compose_body,
+    },
     model::{
         Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
         MessageContentPart, MessageId, MessageStatus,
@@ -20,10 +23,7 @@ use jmap_client::{
     identity::Property as IdentityProperty,
     mailbox::{Mailbox as JmapMailbox, Property as MailboxProperty, Role as MailboxRole},
 };
-use lettre::{
-    Message as LettreEmail,
-    message::{Mailbox as LettreMailbox, MultiPart, SinglePart},
-};
+use lettre::{Message as LettreEmail, message::Mailbox as LettreMailbox};
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -169,6 +169,18 @@ impl MailBackend for JmapBackend {
         let runtime = Arc::clone(&self.inner.runtime);
         let inner = Arc::clone(&self.inner);
         runtime.block_on(async move { inner.save_draft(message).await })
+    }
+
+    fn fetch_attachment_blob(&self, blob_id: &str) -> Result<Vec<u8>> {
+        let runtime = Arc::clone(&self.inner.runtime);
+        let client = Arc::clone(&self.inner.client);
+        let blob_id = blob_id.to_string();
+        runtime.block_on(async move {
+            client
+                .download(&blob_id)
+                .await
+                .with_context(|| format!("downloading JMAP blob {blob_id}"))
+        })
     }
 }
 
@@ -923,6 +935,7 @@ impl JmapInner {
             subject,
             text_body,
             html_body,
+            attachments,
         } = outgoing;
 
         if to.is_empty() && cc.is_empty() && bcc.is_empty() {
@@ -962,13 +975,9 @@ impl JmapInner {
 
         builder = builder.subject(subject);
 
-        let multipart = MultiPart::alternative()
-            .singlepart(SinglePart::plain(text_body))
-            .singlepart(SinglePart::html(html_body));
+        let body = build_compose_body(text_body, html_body, attachments)?;
 
-        builder
-            .multipart(multipart)
-            .context("building MIME message")
+        builder.multipart(body).context("building MIME message")
     }
 }
 
@@ -1378,17 +1387,31 @@ fn build_message_content(email: &JmapEmail) -> Result<MessageContent> {
         collect_parts(email, html_parts, &mut parts);
     }
 
+    // `attachments` is everything outside the text and HTML bodies, so it also
+    // holds the images an HTML mail references as `cid:…`.  The server leaves
+    // those out of `hasAttachment`, which is what the message list marker is
+    // built from, so they are kept apart by their `inline` flag rather than
+    // dropped: the marker ignores them, the save dialog does not.
     let attachments = email
         .attachments()
         .unwrap_or_default()
         .iter()
-        .map(|part| MessageAttachment {
-            filename: part.name().map(|name| name.to_string()),
-            mime_type: part
-                .content_type()
-                .unwrap_or("application/octet-stream")
-                .to_string(),
-            size: part.size(),
+        .filter_map(|part| {
+            let role = jmap_part_role(part);
+            if role == PartRole::Body {
+                return None;
+            }
+            Some(MessageAttachment {
+                filename: part.name().map(|name| name.to_string()),
+                mime_type: part
+                    .content_type()
+                    .unwrap_or("application/octet-stream")
+                    .to_string(),
+                size: part.size(),
+                data: None,
+                blob_id: part.blob_id().map(|id| id.to_string()),
+                inline: role == PartRole::Inline,
+            })
         })
         .collect();
 
@@ -1397,6 +1420,22 @@ fn build_message_content(email: &JmapEmail) -> Result<MessageContent> {
         parts,
         attachments,
     })
+}
+
+/// What a JMAP body part is, by the rule every backend shares.
+///
+/// JMAP hands the decision over ready-made: `type`, `disposition` and `cid` are
+/// separate properties, so there is nothing to parse out of a header.
+fn jmap_part_role(part: &EmailBodyPart) -> PartRole {
+    let content_type = part.content_type().unwrap_or("application/octet-stream");
+
+    LeafPart {
+        major_type: content_type.split('/').next().unwrap_or_default(),
+        has_filename: part.name().is_some_and(|name| !name.trim().is_empty()),
+        disposition: part.content_disposition(),
+        has_content_id: part.content_id().is_some_and(|cid| !cid.trim().is_empty()),
+    }
+    .role()
 }
 
 fn collect_parts(
