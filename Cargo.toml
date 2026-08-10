@@ -16,12 +16,18 @@ path = "src/main.rs"
 anyhow = "1"
 crossterm = "0.29"
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
-tdoc = "0.10"
+# `default-features = false` drops tdoc's `remote` feature: we only render
+# documents, and the feature pulls in a second HTTP and TLS stack.
+tdoc = { version = "0.10", default-features = false }
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
-tokio-rustls = "0.26"
-rustls = { version = "0.23", features = ["ring"] }
+# Both crates default to the `aws-lc-rs` provider, which needs a C compiler and
+# cmake to build. `ring` has to be selected on its own: rustls refuses to pick a
+# provider when the features name two of them, and panics on the first
+# handshake. See `tls_config` in src/backend/gmail.rs.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "0.26"
 futures = "0.3"
 jmap-client = "0.4"

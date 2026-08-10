@@ -20,7 +20,6 @@ use async_imap::{
     extensions::idle::IdleResponse,
     types::{Fetch, Flag},
 };
-use tokio_rustls::TlsConnector;
 use futures::TryStreamExt;
 use imap_proto::types::{
     AttributeValue, BodyContentCommon, BodyContentSinglePart, BodyParams, BodyStructure,
@@ -35,7 +34,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     str,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -49,6 +48,7 @@ use tokio::{
     sync::{Mutex as AsyncMutex, oneshot},
     task::JoinHandle,
 };
+use tokio_rustls::TlsConnector;
 
 #[cfg(debug_assertions)]
 mod debug_logging {
@@ -65,9 +65,9 @@ mod debug_logging {
 
     use anyhow::{Context as AnyhowContext, Result};
     use chrono::{Local, Utc};
-    use tokio_rustls::client::TlsStream;
     use tokio::io::ReadBuf;
     use tokio::net::TcpStream;
+    use tokio_rustls::client::TlsStream;
 
     #[derive(Debug)]
     pub struct GmailImapLogger {
@@ -366,10 +366,27 @@ const INITIAL_FETCH_LIMIT: u32 = 100;
 const BACKFILL_BATCH_SIZE: u32 = 100;
 const FETCH_MESSAGE_QUERY: &str = "(FLAGS INTERNALDATE RFC822.SIZE ENVELOPE UID BODYSTRUCTURE)";
 
-fn root_store() -> rustls::RootCertStore {
-    let mut store = rustls::RootCertStore::empty();
-    store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    store
+/// TLS settings shared by every connection to Gmail.
+///
+/// Built once. The trust anchors do not change between connections, and a
+/// dropped IDLE session reconnects often enough that re-parsing them each time
+/// is pure waste.
+///
+/// Trust comes from the `webpki-roots` bundle rather than the operating system,
+/// so a certificate signed by a CA that only the OS knows about — a corporate
+/// TLS-inspecting proxy, an internal CA — is rejected here.
+fn tls_config() -> Arc<rustls::ClientConfig> {
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+
+    Arc::clone(CONFIG.get_or_init(|| {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
+    }))
 }
 
 /// Production backend that communicates with Gmail over IMAP.
@@ -615,10 +632,7 @@ impl GmailInner {
         let tcp = TcpStream::connect((GMAIL_HOST, GMAIL_PORT))
             .await
             .context("connecting to Gmail IMAP server")?;
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store())
-            .with_no_client_auth();
-        let connector = TlsConnector::from(Arc::new(config));
+        let connector = TlsConnector::from(tls_config());
         let server_name = rustls::pki_types::ServerName::try_from(GMAIL_HOST)
             .context("invalid TLS server name")?
             .to_owned();
@@ -2174,6 +2188,14 @@ mod tests {
     use super::*;
     use imap_proto::types::{ContentDisposition, ContentEncoding, ContentType};
     use std::borrow::Cow;
+
+    /// Nothing else in the suite opens a TLS connection, so a dependency that
+    /// quietly switches on a second rustls crypto provider would otherwise get
+    /// past CI and panic on the first handshake instead.
+    #[test]
+    fn the_tls_settings_name_exactly_one_crypto_provider() {
+        let _ = tls_config();
+    }
 
     fn make_message(id: u64, seq: u32) -> StoredMessage {
         let message = Message {

@@ -1122,7 +1122,9 @@ fn document_from_message_content(content: &MessageContent) -> Document {
         }
 
         let mut paragraph = Paragraph::new_text();
-        paragraph.content_mut().push(Span::new_text(text.into_owned()));
+        paragraph
+            .content_mut()
+            .push(Span::new_text(text.into_owned()));
         return Document::new().with_paragraphs(vec![paragraph]);
     }
 
