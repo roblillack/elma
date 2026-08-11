@@ -17,13 +17,13 @@ use crate::{
 use anyhow::{Context, Result, anyhow};
 use async_imap::{
     Session,
-    extensions::idle::IdleResponse,
-    types::{Fetch, Flag},
+    extensions::idle::{Handle as IdleHandle, IdleResponse},
+    types::{Flag, UnsolicitedResponse},
 };
 use futures::TryStreamExt;
 use imap_proto::types::{
     AttributeValue, BodyContentCommon, BodyContentSinglePart, BodyParams, BodyStructure,
-    MailboxDatum, NameAttribute, Response,
+    MailboxDatum, NameAttribute, Response, Status,
 };
 use lettre::{
     Message as LettreEmail, SmtpTransport, Transport, message::Mailbox as LettreMailbox,
@@ -619,6 +619,7 @@ mod debug_logging {
 use debug_logging::{LoggedTlsStream, log_backend_event, register_secret, wrap_stream};
 
 type AsyncSession = Session<LoggedTlsStream>;
+type AsyncIdleHandle = IdleHandle<LoggedTlsStream>;
 
 const GMAIL_HOST: &str = "imap.gmail.com";
 const GMAIL_PORT: u16 = 993;
@@ -633,6 +634,18 @@ const MAX_PART_DEPTH: usize = 5;
 const INITIAL_FETCH_LIMIT: u32 = 100;
 const BACKFILL_BATCH_SIZE: u32 = 100;
 const FETCH_MESSAGE_QUERY: &str = "(FLAGS INTERNALDATE RFC822.SIZE ENVELOPE UID BODYSTRUCTURE)";
+/// Format of the IMAP `INTERNALDATE` attribute (RFC 3501 section 2.3.3).
+const INTERNAL_DATE_FORMAT: &str = "%d-%b-%Y %H:%M:%S %z";
+/// How many times [`GmailInner::drain_exists`] re-enters
+/// [`GmailInner::handle_exists`] before leaving the rest to the IDLE loop.
+const MAX_EXISTS_DRAIN_ROUNDS: usize = 4;
+/// How many times a backfill run redials *without a batch succeeding in
+/// between* before leaving the rest of the mailbox to the next attempt.
+const MAX_BACKFILL_RECONNECTS: u32 = 3;
+/// How long a backfill run may go without asking the server whether new mail
+/// has arrived.  Bounds how late a message shows up while backfill has IDLE
+/// switched off.
+const NEW_MAIL_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// TLS settings shared by every connection to Gmail.
 ///
@@ -684,6 +697,13 @@ struct GmailInner {
     idle_handle: AsyncMutex<Option<JoinHandle<()>>>,
     backfill_handle: AsyncMutex<Option<JoinHandle<()>>>,
     backfill_cancel: AsyncMutex<Option<Arc<AtomicBool>>>,
+    /// Set while a backfill run owns the IMAP session.
+    ///
+    /// Backfill holds IDLE down for its whole run rather than cycling it per
+    /// batch, so anything that would ordinarily restart IDLE afterwards -- an
+    /// action, say -- has to leave it alone until the run is done.  Without
+    /// this the next batch would find the session taken by a fresh IDLE task.
+    backfill_active: AtomicBool,
     /// Serialises action processing so that only one [`process_action`] call
     /// runs at a time.  Without this, concurrent batches (e.g. an immediate
     /// flag-change batch and a regular move batch) can race: one task's
@@ -761,6 +781,7 @@ impl GmailBackend {
                 idle_handle: AsyncMutex::new(None),
                 backfill_handle: AsyncMutex::new(None),
                 backfill_cancel: AsyncMutex::new(None),
+                backfill_active: AtomicBool::new(false),
                 action_lock: AsyncMutex::new(()),
             }),
         })
@@ -793,8 +814,11 @@ impl MailBackend for GmailBackend {
                 let mut current = self.inner.current_mailbox.lock().await;
                 *current = mailbox;
             }
-            self.inner.start_idle_loop().await?;
+            // Backfill first: when it has work it claims the session, and
+            // `start_idle_loop` then declines rather than starting an IDLE the
+            // backfill would immediately have to stop.
             self.inner.start_backfill_if_needed().await?;
+            self.inner.start_idle_loop().await?;
 
             Ok::<_, anyhow::Error>(MailboxSnapshot {
                 total: exists as usize,
@@ -840,13 +864,15 @@ impl MailBackend for GmailBackend {
                 }
             }
 
-            self.inner
+            let label_exists = self
+                .inner
                 .fetch_gmail_labels_command(session, &format!("UID FETCH {uid} (UID X-GM-LABELS)"))
                 .await?;
+            self.inner.drain_exists(session, label_exists).await?;
 
             drop(session_guard);
-            self.inner.start_idle_loop().await?;
             self.inner.start_backfill_if_needed().await?;
+            self.inner.start_idle_loop().await?;
 
             content.ok_or_else(|| anyhow!("message body not returned by server"))
         })
@@ -946,6 +972,9 @@ impl GmailInner {
         if let Some(cancel) = self.backfill_cancel.lock().await.take() {
             cancel.store(true, Ordering::SeqCst);
         }
+        // Cleared here too, not just where the run ends: the task may never
+        // have been spawned, and a stale flag would keep IDLE off for good.
+        self.backfill_active.store(false, Ordering::SeqCst);
         let handle = {
             let mut guard = self.backfill_handle.lock().await;
             guard.take()
@@ -976,6 +1005,10 @@ impl GmailInner {
             *cancel_guard = Some(Arc::clone(&cancel_flag));
         }
 
+        // Set before spawning, so a `start_idle_loop` racing the new task
+        // cannot slip a fresh IDLE in ahead of it.
+        self.backfill_active.store(true, Ordering::SeqCst);
+
         let this = Arc::clone(self);
         let handle = self.runtime.spawn(async move {
             this.backfill_loop(cancel_flag).await;
@@ -987,10 +1020,75 @@ impl GmailInner {
         Ok(())
     }
 
+    /// Work backwards through the mailbox, a batch at a time.
+    ///
+    /// IDLE is stopped once for the whole run instead of around every batch.
+    /// Cycling it per batch cost an IDLE/DONE round trip and roughly 340ms of
+    /// dead time per 100 messages -- on a 16k mailbox that was about half of
+    /// all commands sent, and a fair bet for what provoked Gmail's `* BYE
+    /// System Error`.
+    ///
+    /// Staying out of IDLE means new mail has to be asked for: Gmail does not
+    /// volunteer EXISTS during a FETCH.  See [`Self::poll_for_new_mail`].
     async fn backfill_loop(self: Arc<Self>, cancel: Arc<AtomicBool>) {
+        if let Err(err) = self.pause_idle().await {
+            eprintln!("Gmail backfill could not pause IDLE: {err:?}");
+        }
+
+        self.run_backfill_batches(&cancel).await;
+
+        // Before restarting IDLE, or `start_idle_loop` will decline.
+        self.backfill_active.store(false, Ordering::SeqCst);
+        if let Err(err) = self.start_idle_loop().await {
+            eprintln!("Gmail idle restart error: {err:?}");
+        }
+    }
+
+    /// Ask the server whether anything has arrived.
+    ///
+    /// Gmail does not volunteer EXISTS during a FETCH.  Across a full backfill
+    /// it stayed silent for 76 seconds and some 320 commands with a message
+    /// already waiting, then reported it 264ms after the client entered IDLE
+    /// -- entering IDLE is what flushes the announcement, not time spent
+    /// listening.  So while backfill keeps IDLE off, new mail has to be asked
+    /// for.  NOOP is what RFC 3501 offers (section 6.4.1): "a periodic poll
+    /// for new messages or message status updates during a period of
+    /// inactivity".
+    async fn poll_for_new_mail(&self) -> Result<()> {
+        let mut guard = self.session.lock().await;
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("IMAP session is not available"))?;
+
+        session
+            .noop()
+            .await
+            .context("polling for new mail with NOOP")?;
+
+        // `noop` answers through async-imap's own command path, which parks the
+        // untagged EXISTS in the unsolicited-response channel rather than
+        // handing it back; `drain_exists` reads it out of there.
+        self.drain_exists(session, None).await
+    }
+
+    async fn run_backfill_batches(self: &Arc<Self>, cancel: &Arc<AtomicBool>) {
+        // Counted consecutively and reset by every batch that lands, so the cap
+        // catches a connection that will not stay up rather than a long run
+        // that got unlucky a few times.
+        let mut failed_reconnects = 0;
+        let mut last_poll = tokio_time::Instant::now();
+
         loop {
             if cancel.load(Ordering::SeqCst) {
-                break;
+                return;
+            }
+
+            if last_poll.elapsed() >= NEW_MAIL_POLL_INTERVAL {
+                last_poll = tokio_time::Instant::now();
+                if let Err(err) = self.poll_for_new_mail().await {
+                    // Left for the next batch to trip over and reconnect on.
+                    eprintln!("Gmail backfill new-mail poll error: {err:?}");
+                }
             }
 
             let range = {
@@ -999,12 +1097,34 @@ impl GmailInner {
             };
 
             let Some((start, end)) = range else {
-                break;
+                return;
             };
 
-            if let Err(err) = self.load_backfill_batch(start, end, &cancel).await {
-                eprintln!("Gmail backfill error: {err:?}");
-                break;
+            let err = match self.load_backfill_batch(start, end, cancel).await {
+                Ok(()) => {
+                    failed_reconnects = 0;
+                    continue;
+                }
+                Err(err) => err,
+            };
+
+            eprintln!("Gmail backfill error: {err:?}");
+
+            // Gmail hangs up on long backfills often enough that giving up on
+            // the first one would leave most of the mailbox unread.  Dial
+            // again and retry the same range -- `ensure_connected` re-selects
+            // the mailbox, so the sequence numbers still line up.
+            if !is_connection_lost(&err) || failed_reconnects >= MAX_BACKFILL_RECONNECTS {
+                return;
+            }
+
+            failed_reconnects += 1;
+            eprintln!(
+                "Gmail backfill: reconnecting ({failed_reconnects}/{MAX_BACKFILL_RECONNECTS})"
+            );
+            if let Err(err) = self.ensure_connected().await {
+                eprintln!("Gmail backfill reconnect error: {err:?}");
+                return;
             }
         }
     }
@@ -1019,21 +1139,30 @@ impl GmailInner {
             return Ok(());
         }
 
-        self.pause_idle().await?;
         let mut session_guard = self.session.lock().await;
         let session = session_guard
             .as_mut()
             .ok_or_else(|| anyhow!("IMAP session is not available"))?;
 
-        let stored_messages = match self
+        // Catch up on anything announced while the session was elsewhere before
+        // reaching further back.  Backfill runs continuously, so this is the
+        // last line of defence for every path that still loses an EXISTS to
+        // async-imap's unsolicited-response channel.
+        if let Err(err) = self.drain_exists(session, None).await {
+            eprintln!("Gmail backfill EXISTS handling error: {err:?}");
+        }
+
+        let (stored_messages, fetch_exists) = match self
             .fetch_message_range(session, start, end)
             .await
             .with_context(|| format!("fetching backfill range {start}:{end}"))
         {
-            Ok(messages) => messages,
+            Ok(result) => result,
             Err(err) => {
                 drop(session_guard);
-                let _ = self.start_idle_loop().await;
+                if is_connection_lost(&err) {
+                    self.discard_session().await;
+                }
                 return Err(err);
             }
         };
@@ -1047,6 +1176,7 @@ impl GmailInner {
             }
         }
 
+        let mut label_exists = None;
         if to_emit_ids.is_empty() {
             cancel.store(true, Ordering::SeqCst);
         } else if !cancel.load(Ordering::SeqCst) {
@@ -1055,13 +1185,35 @@ impl GmailInner {
             } else {
                 format!("FETCH {start}:{end} (UID X-GM-LABELS)")
             };
-            if let Err(err) = self.fetch_gmail_labels_command(session, &command).await {
-                eprintln!("Gmail backfill label fetch error: {err:?}");
+            match self.fetch_gmail_labels_command(session, &command).await {
+                Ok(exists) => label_exists = exists,
+                Err(err) => {
+                    eprintln!("Gmail backfill label fetch error: {err:?}");
+                    // Labels are optional; a dead connection is not.  Carrying
+                    // on here is what sent an IDLE into a closed socket.
+                    if is_connection_lost(&err) {
+                        drop(session_guard);
+                        self.discard_session().await;
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        // Process any EXISTS notifications observed during the FETCH commands.
+        if let Err(err) = self
+            .drain_exists(session, max_exists(fetch_exists, label_exists))
+            .await
+        {
+            eprintln!("Gmail backfill EXISTS handling error: {err:?}");
+            if is_connection_lost(&err) {
+                drop(session_guard);
+                self.discard_session().await;
+                return Err(err);
             }
         }
 
         drop(session_guard);
-        let restart_result = self.start_idle_loop().await;
 
         // Re-read messages from state after labels have been applied,
         // so NewMessage events carry up-to-date importance and label data.
@@ -1074,7 +1226,7 @@ impl GmailInner {
             }
         }
 
-        restart_result
+        Ok(())
     }
 
     /// Resolve the IMAP mailbox name for `mailbox`.
@@ -1130,7 +1282,7 @@ impl GmailInner {
                 .as_mut()
                 .ok_or_else(|| anyhow!("IMAP session is not available"))?;
 
-            let stored_messages = self
+            let (stored_messages, fetch_exists) = self
                 .fetch_message_range(session, start, end)
                 .await
                 .context("fetching initial mailbox slice")?;
@@ -1146,14 +1298,21 @@ impl GmailInner {
                 *state_guard = new_state;
             }
 
+            let mut label_exists = None;
             if !message_ids.is_empty() {
                 let command = if start == end {
                     format!("FETCH {start} (UID X-GM-LABELS)")
                 } else {
                     format!("FETCH {start}:{end} (UID X-GM-LABELS)")
                 };
-                self.fetch_gmail_labels_command(session, &command).await?;
+                label_exists = self.fetch_gmail_labels_command(session, &command).await?;
             }
+
+            // Mail that landed while we were reading the initial slice sits
+            // above `exists` and would otherwise stay invisible until the next
+            // reconnect.
+            self.drain_exists(session, max_exists(fetch_exists, label_exists))
+                .await?;
         }
 
         // Re-read messages from state after labels have been applied.
@@ -1175,9 +1334,9 @@ impl GmailInner {
         session: &mut AsyncSession,
         start: u32,
         end: u32,
-    ) -> Result<Vec<StoredMessage>> {
+    ) -> Result<(Vec<StoredMessage>, Option<u32>)> {
         if start == 0 || end == 0 || start > end {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
 
         let range = if start == end {
@@ -1186,16 +1345,49 @@ impl GmailInner {
             format!("{start}:{end}")
         };
 
-        let mut fetch_stream = session.fetch(&range, FETCH_MESSAGE_QUERY).await?;
-        let mut collected = Vec::new();
+        let command = format!("FETCH {range} {FETCH_MESSAGE_QUERY}");
+        let tag = session
+            .run_command(&command)
+            .await
+            .with_context(|| format!("issuing FETCH command for range {range}"))?;
 
-        while let Some(fetch) = fetch_stream.try_next().await? {
-            if let Some(stored) = build_message_from_fetch(&fetch)? {
-                collected.push(stored);
+        let mut collected = Vec::new();
+        let mut highest_exists: Option<u32> = None;
+
+        loop {
+            let Some(response) = session
+                .read_response()
+                .await
+                .context("reading FETCH response")?
+            else {
+                return Err(anyhow!("IMAP connection closed during FETCH"));
+            };
+
+            let parsed = response.parsed();
+            match parsed {
+                Response::Fetch(seq, attrs) => match build_message_from_attrs(*seq, attrs)? {
+                    Some(stored) => collected.push(stored),
+                    None => {
+                        let _ = self.handle_fetch_update(*seq, attrs).await?;
+                    }
+                },
+                Response::Expunge(seq) => {
+                    self.handle_expunge(*seq).await;
+                }
+                Response::MailboxData(MailboxDatum::Exists(count)) => {
+                    highest_exists =
+                        Some(highest_exists.map_or(*count, |prev: u32| prev.max(*count)));
+                }
+                Response::Done { tag: done_tag, .. } if done_tag == &tag => break,
+                Response::Data {
+                    status: Status::Bye,
+                    ..
+                } => return Err(ConnectionLost.into()),
+                _ => {}
             }
         }
 
-        Ok(collected)
+        Ok((collected, highest_exists))
     }
 
     /// Discover the Gmail archive and trash mailboxes so we can move messages later.
@@ -1293,12 +1485,14 @@ impl GmailInner {
         &self,
         session: &mut AsyncSession,
         command: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<u32>> {
         let command_text = command.to_string();
         let tag = session
             .run_command(&command_text)
             .await
             .with_context(|| format!("issuing command `{command_text}`"))?;
+
+        let mut highest_exists: Option<u32> = None;
 
         loop {
             let Some(response) = session
@@ -1321,14 +1515,18 @@ impl GmailInner {
                     self.handle_expunge(*seq).await;
                 }
                 Response::MailboxData(MailboxDatum::Exists(count)) => {
-                    let mut state = self.state.lock().await;
-                    state.set_expected_exists(*count);
+                    highest_exists =
+                        Some(highest_exists.map_or(*count, |prev: u32| prev.max(*count)));
                 }
+                Response::Data {
+                    status: Status::Bye,
+                    ..
+                } => return Err(ConnectionLost.into()),
                 _ => {}
             }
         }
 
-        Ok(())
+        Ok(highest_exists)
     }
 
     async fn send_via_smtp(self: Arc<Self>, outgoing: OutgoingMessage) -> Result<()> {
@@ -1449,6 +1647,13 @@ impl GmailInner {
 
     /// Spawn the IDLE task that listens for new Gmail events.
     async fn start_idle_loop(self: &Arc<Self>) -> Result<()> {
+        // A backfill run owns the session until it finishes and restarts IDLE
+        // itself.  Starting one here would take the session out from under the
+        // next batch.
+        if self.backfill_active.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
         let mut handle_guard = self.idle_handle.lock().await;
         if handle_guard.is_some() {
             return Ok(());
@@ -1533,7 +1738,26 @@ impl GmailInner {
             let result = tokio::select! {
                 _ = &mut stop_rx => {
                     drop(stopper);
-                    if let Ok(sess) = idle_handle.done().await {
+
+                    // A notification may already have arrived: the server can
+                    // send EXISTS between `+ idling` and the stop signal, and
+                    // during backfill `pause_idle` fires on every batch, so the
+                    // two race constantly.  `select!` picks a ready branch at
+                    // random, so roughly half of those races land here.
+                    //
+                    // Whatever is pending has to be collected *now*.
+                    // `Handle::done` reads through to the tagged OK and hands
+                    // everything it passes to async-imap's unsolicited-response
+                    // channel, which nothing drains -- so an EXISTS left for
+                    // `done` to find is gone, and the mail it announced stays
+                    // invisible until the next reconnect.
+                    let mut exists = Vec::new();
+                    let mut label_refresh = Vec::new();
+                    self.collect_pending_idle(&mut idle_handle, &mut exists, &mut label_refresh)
+                        .await;
+
+                    if let Ok(mut sess) = idle_handle.done().await {
+                        self.apply_idle_updates(&mut sess, exists, label_refresh).await;
                         self.reinsert_session(sess).await;
                     }
                     break;
@@ -1545,6 +1769,13 @@ impl GmailInner {
                 Ok(IdleResponse::Timeout) | Ok(IdleResponse::ManualInterrupt) => {
                     if let Ok(mut sess) = idle_handle.done().await {
                         let _ = sess.noop().await;
+                        // NOOP is how the server reports anything it has been
+                        // holding back, but async-imap answers it through
+                        // `run_command_and_check_ok`, which parks untagged
+                        // responses out of reach.  Pick them up.
+                        if let Err(err) = self.drain_exists(&mut sess, None).await {
+                            eprintln!("Gmail idle EXISTS handling error: {err:?}");
+                        }
                         self.reinsert_session(sess).await;
                     }
                 }
@@ -1560,34 +1791,8 @@ impl GmailInner {
                         eprintln!("Gmail idle processing error: {err:?}");
                     }
 
-                    loop {
-                        let (next_wait, next_stopper) =
-                            idle_handle.wait_with_timeout(Duration::from_millis(0));
-                        match next_wait.await {
-                            Ok(IdleResponse::NewData(resp)) => {
-                                if let Err(err) = self
-                                    .process_idle_response(
-                                        resp.parsed(),
-                                        &mut exists,
-                                        &mut label_refresh,
-                                    )
-                                    .await
-                                {
-                                    eprintln!("Gmail idle processing error: {err:?}");
-                                }
-                                drop(next_stopper);
-                            }
-                            Ok(IdleResponse::Timeout) | Ok(IdleResponse::ManualInterrupt) => {
-                                drop(next_stopper);
-                                break;
-                            }
-                            Err(err) => {
-                                drop(next_stopper);
-                                eprintln!("Gmail idle additional wait error: {err:?}");
-                                break;
-                            }
-                        }
-                    }
+                    self.collect_pending_idle(&mut idle_handle, &mut exists, &mut label_refresh)
+                        .await;
 
                     if exists.is_empty() && label_refresh.is_empty() {
                         continue;
@@ -1595,26 +1800,8 @@ impl GmailInner {
 
                     match idle_handle.done().await {
                         Ok(mut sess) => {
-                            for count in exists {
-                                if let Err(err) = self.handle_exists(&mut sess, count).await {
-                                    eprintln!("Gmail idle EXISTS handling error: {err:?}");
-                                }
-                            }
-                            if !label_refresh.is_empty() {
-                                label_refresh.sort_unstable();
-                                label_refresh.dedup();
-                                let uid_set = label_refresh
-                                    .iter()
-                                    .map(|uid| uid.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(",");
-                                let command = format!("UID FETCH {uid_set} (UID X-GM-LABELS)");
-                                if let Err(err) =
-                                    self.fetch_gmail_labels_command(&mut sess, &command).await
-                                {
-                                    eprintln!("Gmail label refresh error: {err:?}");
-                                }
-                            }
+                            self.apply_idle_updates(&mut sess, exists, label_refresh)
+                                .await;
                             self.reinsert_session(sess).await;
                         }
                         Err(err) => {
@@ -1630,6 +1817,73 @@ impl GmailInner {
                     tokio_time::sleep(Duration::from_secs(5)).await;
                 }
             }
+        }
+    }
+
+    /// Pick up IDLE notifications that have already arrived, without waiting
+    /// for new ones.
+    async fn collect_pending_idle(
+        &self,
+        idle_handle: &mut AsyncIdleHandle,
+        exists: &mut Vec<u32>,
+        label_refresh: &mut Vec<u32>,
+    ) {
+        loop {
+            let (next_wait, next_stopper) = idle_handle.wait_with_timeout(Duration::from_millis(0));
+            let outcome = next_wait.await;
+            drop(next_stopper);
+
+            match outcome {
+                Ok(IdleResponse::NewData(resp)) => {
+                    if let Err(err) = self
+                        .process_idle_response(resp.parsed(), exists, label_refresh)
+                        .await
+                    {
+                        eprintln!("Gmail idle processing error: {err:?}");
+                    }
+                }
+                Ok(IdleResponse::Timeout) | Ok(IdleResponse::ManualInterrupt) => break,
+                Err(err) => {
+                    eprintln!("Gmail idle additional wait error: {err:?}");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Act on the notifications gathered while IDLE was running, now that the
+    /// session is usable again.
+    async fn apply_idle_updates(
+        &self,
+        session: &mut AsyncSession,
+        exists: Vec<u32>,
+        mut label_refresh: Vec<u32>,
+    ) {
+        for count in exists {
+            if let Err(err) = self.drain_exists(session, Some(count)).await {
+                eprintln!("Gmail idle EXISTS handling error: {err:?}");
+            }
+        }
+
+        if label_refresh.is_empty() {
+            return;
+        }
+
+        label_refresh.sort_unstable();
+        label_refresh.dedup();
+        let uid_set = label_refresh
+            .iter()
+            .map(|uid| uid.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let command = format!("UID FETCH {uid_set} (UID X-GM-LABELS)");
+        match self.fetch_gmail_labels_command(session, &command).await {
+            Ok(label_exists) => {
+                if let Err(err) = self.drain_exists(session, label_exists).await {
+                    eprintln!("Gmail idle EXISTS handling error: {err:?}");
+                }
+            }
+            Err(err) => eprintln!("Gmail label refresh error: {err:?}"),
         }
     }
 
@@ -1661,25 +1915,53 @@ impl GmailInner {
         Ok(())
     }
 
-    async fn handle_exists(&self, session: &mut AsyncSession, remote_count: u32) -> Result<()> {
-        if let Some(range) = self.collect_new_messages(session, remote_count).await? {
-            let command = format!("FETCH {range} (UID X-GM-LABELS)");
-            self.fetch_gmail_labels_command(session, &command).await?;
+    /// Fetch the messages announced by `initial`, then keep going for as long
+    /// as doing so turns up further announcements.
+    ///
+    /// Every FETCH issued along the way can itself carry an untagged EXISTS, so
+    /// one pass is not enough on a busy mailbox.  The round cap stops a server
+    /// that announces another message on every pass from pinning us here; what
+    /// is left over is picked up by the next IDLE cycle.
+    async fn drain_exists(&self, session: &mut AsyncSession, initial: Option<u32>) -> Result<()> {
+        let mut pending = max_exists(initial, take_unsolicited_exists(session));
+        for _ in 0..MAX_EXISTS_DRAIN_ROUNDS {
+            let Some(count) = pending else {
+                break;
+            };
+            pending = self.handle_exists(session, count).await?;
         }
         Ok(())
     }
 
+    /// Returns the highest EXISTS observed while fetching, if any.
+    async fn handle_exists(
+        &self,
+        session: &mut AsyncSession,
+        remote_count: u32,
+    ) -> Result<Option<u32>> {
+        let (range, fetch_exists) = self.collect_new_messages(session, remote_count).await?;
+        let Some(range) = range else {
+            return Ok(fetch_exists);
+        };
+
+        let command = format!("FETCH {range} (UID X-GM-LABELS)");
+        let label_exists = self.fetch_gmail_labels_command(session, &command).await?;
+        Ok(max_exists(fetch_exists, label_exists))
+    }
+
+    /// Returns the range that was fetched, plus the highest EXISTS seen while
+    /// fetching it.
     async fn collect_new_messages(
         &self,
         session: &mut AsyncSession,
         remote_count: u32,
-    ) -> Result<Option<String>> {
+    ) -> Result<(Option<String>, Option<u32>)> {
         let start = {
             let mut state = self.state.lock().await;
             let expected = state.expected_exists();
             if remote_count <= expected {
                 state.set_expected_exists(remote_count);
-                return Ok(None);
+                return Ok((None, None));
             }
             let start = expected + 1;
             state.set_expected_exists(remote_count);
@@ -1687,7 +1969,7 @@ impl GmailInner {
         };
 
         if start > remote_count {
-            return Ok(None);
+            return Ok((None, None));
         }
 
         let range = if start == remote_count {
@@ -1696,13 +1978,13 @@ impl GmailInner {
             format!("{start}:{remote_count}")
         };
 
-        let stored_messages = self
+        let (stored_messages, fetch_exists) = self
             .fetch_message_range(session, start, remote_count)
             .await
             .with_context(|| format!("fetching new message range {range}"))?;
 
         if stored_messages.is_empty() {
-            return Ok(None);
+            return Ok((None, fetch_exists));
         }
 
         let mut to_emit = Vec::with_capacity(stored_messages.len());
@@ -1719,7 +2001,7 @@ impl GmailInner {
             self.emit_event(BackendEvent::NewMessage(message));
         }
 
-        Ok(Some(range))
+        Ok((Some(range), fetch_exists))
     }
 
     async fn handle_fetch_update(
@@ -1957,10 +2239,22 @@ impl GmailInner {
             let session = guard
                 .as_mut()
                 .ok_or_else(|| anyhow!("IMAP session is not available"))?;
-            self.fetch_gmail_labels_command(session, &command).await?;
+            let label_exists = self.fetch_gmail_labels_command(session, &command).await?;
+            self.drain_exists(session, label_exists).await?;
         }
 
         Ok(())
+    }
+
+    /// Retire a session the server has hung up on.
+    ///
+    /// Leaving it in place is worse than having none: `ensure_connected` only
+    /// dials when the slot is empty, so the next task to pick the session up
+    /// sends its command into a closed socket, fails, and only reconnects
+    /// after that -- five seconds and two confusing errors later.
+    async fn discard_session(&self) {
+        let mut guard = self.session.lock().await;
+        *guard = None;
     }
 
     async fn reinsert_session(&self, session: AsyncSession) {
@@ -2108,40 +2402,51 @@ fn has_important_attribute(attrs: &[NameAttribute<'_>]) -> bool {
     })
 }
 
-fn build_message_from_fetch(fetch: &Fetch) -> Result<Option<StoredMessage>> {
-    let uid = fetch
-        .uid
-        .ok_or_else(|| anyhow!("missing UID in fetch response"))?;
-    let seq = fetch.message;
+fn build_message_from_attrs(
+    seq: u32,
+    attrs: &[AttributeValue<'_>],
+) -> Result<Option<StoredMessage>> {
+    let mut uid = None;
+    let mut envelope = None;
+    let mut flags_raw: Option<&Vec<std::borrow::Cow<'_, str>>> = None;
+    let mut internal_date_str: Option<&str> = None;
+    let mut size = 0u32;
+    let mut body_structure: Option<&BodyStructure<'_>> = None;
 
-    let envelope = match fetch.envelope() {
-        Some(env) => env,
-        None => return Ok(None),
+    for attr in attrs {
+        match attr {
+            AttributeValue::Uid(u) => uid = Some(*u),
+            AttributeValue::Envelope(env) => envelope = Some(env.as_ref()),
+            AttributeValue::Flags(f) => flags_raw = Some(f),
+            AttributeValue::InternalDate(d) => internal_date_str = Some(d.as_ref()),
+            AttributeValue::Rfc822Size(s) => size = *s,
+            AttributeValue::BodyStructure(bs) => body_structure = Some(bs),
+            _ => {}
+        }
+    }
+
+    // An unsolicited FETCH announcing a flag change carries neither ENVELOPE
+    // nor UID (`* 5 FETCH (FLAGS (\Seen))`).  Report it as "not a message" so
+    // the caller can route it to `handle_fetch_update` instead of failing the
+    // whole command.
+    let (Some(uid), Some(envelope)) = (uid, envelope) else {
+        return Ok(None);
     };
 
     let sent = parse_envelope_date(envelope)
-        .or_else(|| fetch.internal_date().and_then(convert_internal_date))
+        .or_else(|| internal_date_str.and_then(parse_internal_date))
         .unwrap_or_else(OffsetDateTime::now_utc);
 
     let sender = extract_sender(envelope);
     let recipients = extract_recipients(envelope);
     let subject = decode_header(envelope.subject.as_ref(), "Subject");
-    let size = fetch.size.unwrap_or_default() as usize;
-    let flags: Vec<_> = fetch.flags().collect();
 
-    let status = if flags.iter().any(|flag| matches!(flag, Flag::Seen)) {
-        MessageStatus::Read
-    } else {
-        MessageStatus::New
+    let (status, starred, answered, forwarded, important) = match flags_raw {
+        Some(flags) => summarize_flags_from_names(flags.iter().map(|s| s.as_ref())),
+        None => (MessageStatus::New, false, false, false, false),
     };
-    let starred = flags.iter().any(|flag| matches!(flag, Flag::Flagged));
-    let answered = flags.iter().any(|flag| matches!(flag, Flag::Answered));
-    let forwarded = flags.iter().any(|flag| matches!(flag, Flag::Custom(name) if name.eq_ignore_ascii_case("\\Forwarded") || name.eq_ignore_ascii_case("$Forwarded")));
-    let important = flags
-        .iter()
-        .any(|flag| matches!(flag, Flag::Custom(name) if name.eq_ignore_ascii_case("\\Important")));
-    let has_attachments = fetch
-        .bodystructure()
+
+    let has_attachments = body_structure
         .map(body_contains_attachment)
         .unwrap_or(false);
 
@@ -2151,7 +2456,7 @@ fn build_message_from_fetch(fetch: &Fetch) -> Result<Option<StoredMessage>> {
         sender,
         recipients,
         subject,
-        size,
+        size: size as usize,
         starred,
         important,
         answered,
@@ -2311,8 +2616,69 @@ fn parse_envelope_date(envelope: &imap_proto::types::Envelope<'_>) -> Option<Off
     })
 }
 
-fn convert_internal_date(dt: chrono::DateTime<chrono::FixedOffset>) -> Option<OffsetDateTime> {
-    OffsetDateTime::from_unix_timestamp(dt.timestamp()).ok()
+/// The server hung up on us -- it sent `* BYE`, or the socket closed.
+///
+/// Carried as its own error type so callers can tell "this session is dead"
+/// apart from "this command failed", and retire the session rather than hand
+/// the corpse to the next task.
+#[derive(Debug)]
+struct ConnectionLost;
+
+impl std::fmt::Display for ConnectionLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the IMAP server closed the connection")
+    }
+}
+
+impl std::error::Error for ConnectionLost {}
+
+/// Does this error mean the session is gone rather than the command failed?
+fn is_connection_lost(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.is::<ConnectionLost>() || cause.downcast_ref::<std::io::Error>().is_some()
+    })
+}
+
+/// Take any EXISTS async-imap parked in its unsolicited-response channel.
+///
+/// Several async-imap entry points -- `Handle::done`, `noop`, the `fetch` and
+/// `list` streams -- do not surface untagged responses they were not asked
+/// for.  They push them into `Session::unsolicited_responses` instead, a
+/// bounded channel nothing in this backend reads, so an EXISTS that lands
+/// there is dropped and the mail it announces stays invisible until the next
+/// reconnect.  This is the backstop for the paths that still go through those
+/// entry points.
+///
+/// Only EXISTS is replayed.  An EXPUNGE arriving this way has lost its
+/// position relative to the FETCH responses it came in with, and applying it
+/// out of order would renumber the wrong messages -- worse than missing it.
+fn take_unsolicited_exists(session: &AsyncSession) -> Option<u32> {
+    let mut highest = None;
+    while let Ok(response) = session.unsolicited_responses.try_recv() {
+        if let UnsolicitedResponse::Exists(count) = response {
+            highest = max_exists(highest, Some(count));
+        }
+    }
+    highest
+}
+
+/// The higher of two observed EXISTS counts, if either is present.
+fn max_exists(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Parse an IMAP `INTERNALDATE` such as `25-Feb-2026 06:52:06 +0100`.
+///
+/// This is *not* an RFC 2822 date — the day and month are joined by dashes and
+/// there is no weekday — so `mailparse::dateparse`, which handles the envelope
+/// `Date:` header in [`parse_envelope_date`], rejects it outright.  Use the
+/// same format string async-imap applies in `Fetch::internal_date`.
+fn parse_internal_date(raw: &str) -> Option<OffsetDateTime> {
+    let parsed = chrono::DateTime::parse_from_str(raw, INTERNAL_DATE_FORMAT).ok()?;
+    OffsetDateTime::from_unix_timestamp(parsed.timestamp()).ok()
 }
 
 fn decode_header(value: Option<&std::borrow::Cow<'_, [u8]>>, field_name: &str) -> String {
@@ -3157,5 +3523,186 @@ mod tests {
         let (start, end) = state.next_backfill_range(10).unwrap();
         assert_eq!(end, 49);
         assert_eq!(start, 40);
+    }
+
+    // ---------------------------------------------------------------
+    //  EXISTS bookkeeping
+    // ---------------------------------------------------------------
+
+    // ---------------------------------------------------------------
+    //  Connection loss
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn a_bye_is_recognised_through_the_context_chain() {
+        // The read loops return `ConnectionLost` bare, but every caller adds
+        // context on the way up, so the check has to walk the chain.
+        let err = anyhow::Error::from(ConnectionLost)
+            .context("reading Gmail label response")
+            .context("fetching backfill range 100:200");
+
+        assert!(is_connection_lost(&err));
+    }
+
+    #[test]
+    fn a_socket_error_counts_as_connection_loss() {
+        // What a mid-command hangup actually looks like: rustls reports the
+        // missing close_notify as an io::Error.
+        let io = std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify",
+        );
+        let err = anyhow::Error::from(io).context("reading FETCH response");
+
+        assert!(is_connection_lost(&err));
+    }
+
+    #[test]
+    fn an_ordinary_failure_is_not_connection_loss() {
+        // A command the server rejected must not cost us the session.
+        let err = anyhow!("missing UID in fetch response").context("fetching backfill range 1:100");
+
+        assert!(!is_connection_lost(&err));
+    }
+
+    #[test]
+    fn max_exists_keeps_the_higher_announcement() {
+        assert_eq!(max_exists(None, None), None);
+        assert_eq!(max_exists(Some(7), None), Some(7));
+        assert_eq!(max_exists(None, Some(7)), Some(7));
+        assert_eq!(max_exists(Some(4), Some(9)), Some(9));
+        assert_eq!(max_exists(Some(9), Some(4)), Some(9));
+    }
+
+    // ---------------------------------------------------------------
+    //  build_message_from_attrs
+    // ---------------------------------------------------------------
+
+    /// Parse one untagged FETCH line the way the session loop sees it.
+    fn fetch_line(line: &[u8]) -> (u32, Vec<AttributeValue<'_>>) {
+        let (rest, response) =
+            imap_proto::parser::parse_response(line).expect("the fixture has to parse");
+        assert!(rest.is_empty(), "the whole line has to be consumed");
+        match response {
+            Response::Fetch(seq, attrs) => (seq, attrs),
+            other => panic!("expected a FETCH response, got {other:?}"),
+        }
+    }
+
+    /// A full FETCH response to [`FETCH_MESSAGE_QUERY`].  `date` goes into the
+    /// ENVELOPE's date field verbatim, so a test can pass `NIL` to drop it.
+    fn message_fetch_line(date: &str) -> Vec<u8> {
+        format!(
+            concat!(
+                r#"* 3 FETCH (FLAGS (\Seen) INTERNALDATE "25-Feb-2026 06:52:06 +0100" "#,
+                "RFC822.SIZE 4242 ENVELOPE ({date} \"Hello there\" ",
+                "((\"Ada\" NIL \"ada\" \"example.com\")) NIL NIL ",
+                "((\"Bob\" NIL \"bob\" \"example.org\")) NIL NIL NIL ",
+                "\"<id@example.com>\") UID 77 ",
+                "BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 12 1))",
+                "\r\n"
+            ),
+            date = date
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_full_fetch_response_becomes_a_message() {
+        let line = message_fetch_line("\"Wed, 25 Feb 2026 07:00:00 +0000\"");
+        let (seq, attrs) = fetch_line(&line);
+
+        let stored = build_message_from_attrs(seq, &attrs)
+            .expect("building the message")
+            .expect("a full FETCH response is a message");
+
+        assert_eq!(stored.uid, 77);
+        assert_eq!(stored.seq, 3);
+        assert_eq!(stored.message.id, 77);
+        assert_eq!(stored.message.subject, "Hello there");
+        assert_eq!(stored.message.sender, "Ada");
+        assert_eq!(stored.message.recipients, vec!["Bob"]);
+        assert_eq!(stored.message.size, 4242);
+        assert_eq!(stored.message.status, MessageStatus::Read);
+        assert!(!stored.message.starred);
+        assert!(!stored.message.has_attachments);
+        // The envelope's own Date header wins over INTERNALDATE.
+        assert_eq!(stored.message.sent.unix_timestamp(), 1_772_002_800);
+    }
+
+    #[test]
+    fn a_missing_envelope_date_falls_back_to_internaldate() {
+        // INTERNALDATE is `25-Feb-2026 06:52:06 +0100`, which is not an RFC 2822
+        // date: dashes join the day and month and there is no weekday.  Parsing
+        // it with mailparse fails, which silently backdated every such message
+        // to "now" instead.
+        let line = message_fetch_line("NIL");
+        let (seq, attrs) = fetch_line(&line);
+
+        let stored = build_message_from_attrs(seq, &attrs)
+            .expect("building the message")
+            .expect("a full FETCH response is a message");
+
+        assert_eq!(stored.message.sent.unix_timestamp(), 1_771_998_726);
+    }
+
+    #[test]
+    fn parse_internal_date_reads_the_imap_format() {
+        assert_eq!(
+            parse_internal_date("25-Feb-2026 06:52:06 +0100").map(|d| d.unix_timestamp()),
+            Some(1_771_998_726)
+        );
+        assert_eq!(parse_internal_date("Wed, 25 Feb 2026 06:52:06 +0100"), None);
+        assert_eq!(parse_internal_date("nonsense"), None);
+    }
+
+    #[test]
+    fn an_unsolicited_flag_update_is_not_a_message() {
+        // Gmail may announce a flag change at any point during a FETCH.  Such a
+        // response carries neither UID nor ENVELOPE, and treating the missing
+        // UID as an error used to abort the whole backfill batch.
+        let line = b"* 5 FETCH (FLAGS (\\Seen))\r\n";
+        let (seq, attrs) = fetch_line(line);
+
+        assert!(
+            build_message_from_attrs(seq, &attrs)
+                .expect("a flag update is not an error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_fetch_response_without_an_envelope_is_not_a_message() {
+        let line = b"* 5 FETCH (UID 77 FLAGS (\\Seen))\r\n";
+        let (seq, attrs) = fetch_line(line);
+
+        assert!(
+            build_message_from_attrs(seq, &attrs)
+                .expect("a flag update is not an error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_attachment_in_the_bodystructure_reaches_the_message() {
+        let line = concat!(
+            r#"* 3 FETCH (FLAGS () INTERNALDATE "25-Feb-2026 06:52:06 +0100" "#,
+            "RFC822.SIZE 4242 ENVELOPE (NIL \"Hello there\" ",
+            "((\"Ada\" NIL \"ada\" \"example.com\")) NIL NIL ",
+            "((\"Bob\" NIL \"bob\" \"example.org\")) NIL NIL NIL ",
+            "\"<id@example.com>\") UID 77 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" ",
+            "(\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 12 1)(\"APPLICATION\" \"PDF\" ",
+            "(\"NAME\" \"report.pdf\") NIL NIL \"BASE64\" 5000) \"MIXED\"))",
+            "\r\n"
+        )
+        .as_bytes();
+        let (seq, attrs) = fetch_line(line);
+
+        let stored = build_message_from_attrs(seq, &attrs)
+            .expect("building the message")
+            .expect("a full FETCH response is a message");
+
+        assert!(stored.message.has_attachments);
+        assert_eq!(stored.message.status, MessageStatus::New);
     }
 }
