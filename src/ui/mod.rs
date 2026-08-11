@@ -5,10 +5,11 @@
 //! [`crate::app`] remains agnostic of the terminal representation.
 
 use crate::app::{
-    ActiveView, App, ComposeButton, ComposeField, ComposeFocus, ComposeState, MessageViewState,
-    ProgressMode, SaveAttachmentDialog, SaveAttachmentFocus, ShortcutMenu, byte_index_for,
+    ActiveView, App, ComposeButton, ComposeField, ComposeFocus, ComposeState, LoadPhase,
+    LoadingState, MessageViewState, ProgressMode, SaveAttachmentDialog, SaveAttachmentFocus,
+    ShortcutMenu, byte_index_for,
 };
-use crate::model::{MessageAttachment, MessageStatus, format_size};
+use crate::model::{MailboxKind, MessageAttachment, MessageStatus, format_size};
 use crate::viewer;
 use ratatui::{
     Frame,
@@ -214,6 +215,10 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
         render_search_popup(frame, message_area, app);
     }
 
+    if let Some((account, mailbox, state)) = app.loading_overlay() {
+        render_loading_overlay(frame, message_area, account, mailbox, state);
+    }
+
     let mut info_text = app.inbox_info_bar();
     // A load in flight outranks the last status: it is what the user is waiting for.
     if let Some((label, elapsed)) = app.pending_message_load() {
@@ -236,6 +241,111 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
             frame.set_cursor_position((x, y));
         }
     }
+}
+
+/// Explain the wait while a mailbox has nothing to show yet.
+///
+/// Shown on the cold start, when switching accounts and when switching
+/// mailboxes -- anywhere the list is empty because a load is still running.  It
+/// takes no keys: the app stays usable underneath, and the overlay disappears by
+/// itself as soon as the first messages land.
+fn render_loading_overlay(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    account: &str,
+    mailbox: MailboxKind,
+    state: &LoadingState,
+) {
+    let (headline, detail) = match &state.phase {
+        LoadPhase::Connecting => (
+            "Connecting to the mail server".to_string(),
+            "Signing in and opening the mailbox...".to_string(),
+        ),
+        LoadPhase::Receiving { loaded, total } => (
+            "Receiving messages".to_string(),
+            format!("{loaded} of {total} headers"),
+        ),
+        LoadPhase::Failed(reason) => ("Could not open this mailbox".to_string(), reason.clone()),
+    };
+
+    let failed = matches!(state.phase, LoadPhase::Failed(_));
+    let accent = if failed { Color::Red } else { Color::Cyan };
+
+    let title = format!("{account} • {mailbox}");
+    let elapsed = state.elapsed();
+    // A failure is not still running, so it gets neither throbber nor timer.
+    let status = if failed {
+        headline
+    } else {
+        format!(
+            "{} {} ({:.1}s)",
+            spinner_frame(elapsed),
+            headline,
+            elapsed.as_secs_f32()
+        )
+    };
+
+    // Wide enough for the longest line, but never wider than the space there is.
+    let content_width = [title.as_str(), status.as_str(), detail.as_str()]
+        .iter()
+        .map(|line| text_width(line))
+        .max()
+        .unwrap_or(0) as u16;
+    let width = (content_width + 4).clamp(24, 72).min(area.width);
+    if area.width < 24 {
+        return;
+    }
+
+    // A backend error is a sentence, not a label, so the box grows to however
+    // many rows it wraps to rather than clipping the half that says why.
+    let text_width_available = width.saturating_sub(4).max(1) as usize;
+    let detail_rows = text_width(&detail).div_ceil(text_width_available).max(1) as u16;
+    let height = (4 + detail_rows).min(area.height);
+    if height < 5 {
+        return;
+    }
+
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let popup = Rect::new(x, y, width, height);
+
+    // Same surface as every other popup: the frame carries the black background
+    // rather than letting the message list show through it.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(POPUP_STYLE)
+        .border_style(POPUP_STYLE)
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(popup);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // With the frame plain, the accent is what marks a failure as one.
+    let status_style = if failed {
+        Style::default().fg(accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            title,
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(status, status_style)),
+        Line::from(Span::styled(detail, Style::default().fg(Color::Gray))),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(POPUP_STYLE)
+            .wrap(Wrap { trim: true }),
+        inner,
+    );
 }
 
 fn render_search_panel(frame: &mut Frame<'_>, area: Rect, app: &App) -> Option<(u16, u16)> {
@@ -1755,7 +1865,7 @@ fn plain_text(content: &crate::model::MessageContent) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::text_field_view;
+    use super::{LoadPhase, LoadingState, MailboxKind, text_field_view};
 
     #[test]
     fn text_field_view_shows_the_whole_value_when_it_fits() {
@@ -1861,6 +1971,111 @@ mod tests {
                         24_000_000,
                         33_000_000,
                     );
+                })
+                .expect("draw");
+        }
+    }
+
+    /// Draw the overlay in `phase` and return what landed on the screen.
+    fn loading_screen(phase: LoadPhase) -> String {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let state = LoadingState::in_phase(phase);
+        let mut terminal = Terminal::new(TestBackend::new(70, 16)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                super::render_loading_overlay(frame, area, "Work", MailboxKind::Inbox, &state);
+            })
+            .expect("draw");
+
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn the_loading_overlay_names_the_account_it_is_waiting_on() {
+        let screen = loading_screen(LoadPhase::Connecting);
+        // With four accounts configured, which one this is matters.
+        assert!(screen.contains("Work"), "{screen}");
+        assert!(screen.contains("Inbox"), "{screen}");
+        assert!(screen.contains("Connecting to the mail server"), "{screen}");
+    }
+
+    /// The overlay has to sit in the middle of the list and read as a popup,
+    /// not as a box floating over whatever the terminal's background happens to
+    /// be.
+    #[test]
+    fn the_loading_overlay_is_centred_on_the_usual_popup_surface() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let state = LoadingState::in_phase(LoadPhase::Connecting);
+        let mut terminal = Terminal::new(TestBackend::new(70, 15)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                super::render_loading_overlay(frame, area, "Vizzlo", MailboxKind::Inbox, &state);
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+
+        let drawn =
+            |row: u16| (0..buf.area.width).any(|col| buf.cell((col, row)).unwrap().symbol() != " ");
+        let top = (0..buf.area.height).find(|&row| drawn(row)).expect("drawn");
+        let bottom = (0..buf.area.height)
+            .rev()
+            .find(|&row| drawn(row))
+            .expect("drawn");
+        assert_eq!(
+            top,
+            buf.area.height - 1 - bottom,
+            "the same number of rows has to be clear above and below"
+        );
+
+        let border_col = (0..buf.area.width)
+            .find(|&col| buf.cell((col, top)).unwrap().symbol() != " ")
+            .expect("a border cell");
+        let border = buf.cell((border_col, top)).unwrap();
+        assert_eq!(border.fg, super::Color::White);
+        assert_eq!(border.bg, super::Color::Black);
+    }
+
+    #[test]
+    fn the_loading_overlay_counts_messages_once_they_arrive() {
+        let screen = loading_screen(LoadPhase::Receiving {
+            loaded: 24,
+            total: 100,
+        });
+        assert!(screen.contains("Receiving messages"), "{screen}");
+        assert!(screen.contains("24 of 100 headers"), "{screen}");
+    }
+
+    #[test]
+    fn a_failure_reaches_the_screen_in_full() {
+        let screen = loading_screen(LoadPhase::Failed(
+            "logging in to Gmail: authentication failed".to_string(),
+        ));
+        assert!(screen.contains("Could not open this mailbox"), "{screen}");
+        assert!(screen.contains("authentication failed"), "{screen}");
+    }
+
+    /// A terminal too small for the overlay must skip it, not panic.
+    #[test]
+    fn the_loading_overlay_gives_up_on_a_tiny_screen() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let state = LoadingState::in_phase(LoadPhase::Connecting);
+        for (width, height) in [(70u16, 4u16), (10, 16), (1, 1)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    super::render_loading_overlay(frame, area, "Work", MailboxKind::Inbox, &state);
                 })
                 .expect("draw");
         }
