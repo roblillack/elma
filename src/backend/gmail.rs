@@ -629,6 +629,11 @@ const MAX_PART_DEPTH: usize = 5;
 const INITIAL_FETCH_LIMIT: u32 = 100;
 const BACKFILL_BATCH_SIZE: u32 = 100;
 const FETCH_MESSAGE_QUERY: &str = "(FLAGS INTERNALDATE RFC822.SIZE ENVELOPE UID BODYSTRUCTURE)";
+/// Format of the IMAP `INTERNALDATE` attribute (RFC 3501 section 2.3.3).
+const INTERNAL_DATE_FORMAT: &str = "%d-%b-%Y %H:%M:%S %z";
+/// How many times [`GmailInner::drain_exists`] re-enters
+/// [`GmailInner::handle_exists`] before leaving the rest to the IDLE loop.
+const MAX_EXISTS_DRAIN_ROUNDS: usize = 4;
 
 /// TLS settings shared by every connection to Gmail.
 ///
@@ -836,10 +841,11 @@ impl MailBackend for GmailBackend {
                 }
             }
 
-            let _ = self
+            let label_exists = self
                 .inner
                 .fetch_gmail_labels_command(session, &format!("UID FETCH {uid} (UID X-GM-LABELS)"))
                 .await?;
+            self.inner.drain_exists(session, label_exists).await?;
 
             drop(session_guard);
             self.inner.start_idle_loop().await?;
@@ -1060,12 +1066,9 @@ impl GmailInner {
         }
 
         // Process any EXISTS notifications observed during the FETCH commands.
-        let highest_exists = match (fetch_exists, label_exists) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (a, b) => a.or(b),
-        };
-        if let Some(count) = highest_exists
-            && let Err(err) = self.handle_exists(session, count).await
+        if let Err(err) = self
+            .drain_exists(session, max_exists(fetch_exists, label_exists))
+            .await
         {
             eprintln!("Gmail backfill EXISTS handling error: {err:?}");
         }
@@ -1140,7 +1143,7 @@ impl GmailInner {
                 .as_mut()
                 .ok_or_else(|| anyhow!("IMAP session is not available"))?;
 
-            let (stored_messages, _) = self
+            let (stored_messages, fetch_exists) = self
                 .fetch_message_range(session, start, end)
                 .await
                 .context("fetching initial mailbox slice")?;
@@ -1156,14 +1159,21 @@ impl GmailInner {
                 *state_guard = new_state;
             }
 
+            let mut label_exists = None;
             if !message_ids.is_empty() {
                 let command = if start == end {
                     format!("FETCH {start} (UID X-GM-LABELS)")
                 } else {
                     format!("FETCH {start}:{end} (UID X-GM-LABELS)")
                 };
-                let _ = self.fetch_gmail_labels_command(session, &command).await?;
+                label_exists = self.fetch_gmail_labels_command(session, &command).await?;
             }
+
+            // Mail that landed while we were reading the initial slice sits
+            // above `exists` and would otherwise stay invisible until the next
+            // reconnect.
+            self.drain_exists(session, max_exists(fetch_exists, label_exists))
+                .await?;
         }
 
         // Re-read messages from state after labels have been applied.
@@ -1637,7 +1647,7 @@ impl GmailInner {
                     match idle_handle.done().await {
                         Ok(mut sess) => {
                             for count in exists {
-                                if let Err(err) = self.handle_exists(&mut sess, count).await {
+                                if let Err(err) = self.drain_exists(&mut sess, Some(count)).await {
                                     eprintln!("Gmail idle EXISTS handling error: {err:?}");
                                 }
                             }
@@ -1650,10 +1660,15 @@ impl GmailInner {
                                     .collect::<Vec<_>>()
                                     .join(",");
                                 let command = format!("UID FETCH {uid_set} (UID X-GM-LABELS)");
-                                if let Err(err) =
-                                    self.fetch_gmail_labels_command(&mut sess, &command).await
-                                {
-                                    eprintln!("Gmail label refresh error: {err:?}");
+                                match self.fetch_gmail_labels_command(&mut sess, &command).await {
+                                    Ok(label_exists) => {
+                                        if let Err(err) =
+                                            self.drain_exists(&mut sess, label_exists).await
+                                        {
+                                            eprintln!("Gmail idle EXISTS handling error: {err:?}");
+                                        }
+                                    }
+                                    Err(err) => eprintln!("Gmail label refresh error: {err:?}"),
                                 }
                             }
                             self.reinsert_session(sess).await;
@@ -1702,25 +1717,53 @@ impl GmailInner {
         Ok(())
     }
 
-    async fn handle_exists(&self, session: &mut AsyncSession, remote_count: u32) -> Result<()> {
-        if let Some(range) = self.collect_new_messages(session, remote_count).await? {
-            let command = format!("FETCH {range} (UID X-GM-LABELS)");
-            let _ = self.fetch_gmail_labels_command(session, &command).await?;
+    /// Fetch the messages announced by `initial`, then keep going for as long
+    /// as doing so turns up further announcements.
+    ///
+    /// Every FETCH issued along the way can itself carry an untagged EXISTS, so
+    /// one pass is not enough on a busy mailbox.  The round cap stops a server
+    /// that announces another message on every pass from pinning us here; what
+    /// is left over is picked up by the next IDLE cycle.
+    async fn drain_exists(&self, session: &mut AsyncSession, initial: Option<u32>) -> Result<()> {
+        let mut pending = initial;
+        for _ in 0..MAX_EXISTS_DRAIN_ROUNDS {
+            let Some(count) = pending else {
+                break;
+            };
+            pending = self.handle_exists(session, count).await?;
         }
         Ok(())
     }
 
+    /// Returns the highest EXISTS observed while fetching, if any.
+    async fn handle_exists(
+        &self,
+        session: &mut AsyncSession,
+        remote_count: u32,
+    ) -> Result<Option<u32>> {
+        let (range, fetch_exists) = self.collect_new_messages(session, remote_count).await?;
+        let Some(range) = range else {
+            return Ok(fetch_exists);
+        };
+
+        let command = format!("FETCH {range} (UID X-GM-LABELS)");
+        let label_exists = self.fetch_gmail_labels_command(session, &command).await?;
+        Ok(max_exists(fetch_exists, label_exists))
+    }
+
+    /// Returns the range that was fetched, plus the highest EXISTS seen while
+    /// fetching it.
     async fn collect_new_messages(
         &self,
         session: &mut AsyncSession,
         remote_count: u32,
-    ) -> Result<Option<String>> {
+    ) -> Result<(Option<String>, Option<u32>)> {
         let start = {
             let mut state = self.state.lock().await;
             let expected = state.expected_exists();
             if remote_count <= expected {
                 state.set_expected_exists(remote_count);
-                return Ok(None);
+                return Ok((None, None));
             }
             let start = expected + 1;
             state.set_expected_exists(remote_count);
@@ -1728,7 +1771,7 @@ impl GmailInner {
         };
 
         if start > remote_count {
-            return Ok(None);
+            return Ok((None, None));
         }
 
         let range = if start == remote_count {
@@ -1737,13 +1780,13 @@ impl GmailInner {
             format!("{start}:{remote_count}")
         };
 
-        let (stored_messages, _) = self
+        let (stored_messages, fetch_exists) = self
             .fetch_message_range(session, start, remote_count)
             .await
             .with_context(|| format!("fetching new message range {range}"))?;
 
         if stored_messages.is_empty() {
-            return Ok(None);
+            return Ok((None, fetch_exists));
         }
 
         let mut to_emit = Vec::with_capacity(stored_messages.len());
@@ -1760,7 +1803,7 @@ impl GmailInner {
             self.emit_event(BackendEvent::NewMessage(message));
         }
 
-        Ok(Some(range))
+        Ok((Some(range), fetch_exists))
     }
 
     async fn handle_fetch_update(
@@ -1998,7 +2041,8 @@ impl GmailInner {
             let session = guard
                 .as_mut()
                 .ok_or_else(|| anyhow!("IMAP session is not available"))?;
-            self.fetch_gmail_labels_command(session, &command).await?;
+            let label_exists = self.fetch_gmail_labels_command(session, &command).await?;
+            self.drain_exists(session, label_exists).await?;
         }
 
         Ok(())
@@ -2172,21 +2216,16 @@ fn build_message_from_attrs(
         }
     }
 
-    let uid = uid.ok_or_else(|| anyhow!("missing UID in fetch response"))?;
-
-    let envelope = match envelope {
-        Some(env) => env,
-        None => return Ok(None),
+    // An unsolicited FETCH announcing a flag change carries neither ENVELOPE
+    // nor UID (`* 5 FETCH (FLAGS (\Seen))`).  Report it as "not a message" so
+    // the caller can route it to `handle_fetch_update` instead of failing the
+    // whole command.
+    let (Some(uid), Some(envelope)) = (uid, envelope) else {
+        return Ok(None);
     };
 
     let sent = parse_envelope_date(envelope)
-        .or_else(|| {
-            internal_date_str.and_then(|s| {
-                mailparse::dateparse(s)
-                    .ok()
-                    .and_then(|ts| OffsetDateTime::from_unix_timestamp(ts).ok())
-            })
-        })
+        .or_else(|| internal_date_str.and_then(parse_internal_date))
         .unwrap_or_else(OffsetDateTime::now_utc);
 
     let sender = extract_sender(envelope);
@@ -2366,6 +2405,25 @@ fn parse_envelope_date(envelope: &imap_proto::types::Envelope<'_>) -> Option<Off
         let ts = mailparse::dateparse(text).ok()?;
         OffsetDateTime::from_unix_timestamp(ts).ok()
     })
+}
+
+/// The higher of two observed EXISTS counts, if either is present.
+fn max_exists(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Parse an IMAP `INTERNALDATE` such as `25-Feb-2026 06:52:06 +0100`.
+///
+/// This is *not* an RFC 2822 date — the day and month are joined by dashes and
+/// there is no weekday — so `mailparse::dateparse`, which handles the envelope
+/// `Date:` header in [`parse_envelope_date`], rejects it outright.  Use the
+/// same format string async-imap applies in `Fetch::internal_date`.
+fn parse_internal_date(raw: &str) -> Option<OffsetDateTime> {
+    let parsed = chrono::DateTime::parse_from_str(raw, INTERNAL_DATE_FORMAT).ok()?;
+    OffsetDateTime::from_unix_timestamp(parsed.timestamp()).ok()
 }
 
 fn decode_header(value: Option<&std::borrow::Cow<'_, [u8]>>, field_name: &str) -> String {
@@ -3210,5 +3268,150 @@ mod tests {
         let (start, end) = state.next_backfill_range(10).unwrap();
         assert_eq!(end, 49);
         assert_eq!(start, 40);
+    }
+
+    // ---------------------------------------------------------------
+    //  EXISTS bookkeeping
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn max_exists_keeps_the_higher_announcement() {
+        assert_eq!(max_exists(None, None), None);
+        assert_eq!(max_exists(Some(7), None), Some(7));
+        assert_eq!(max_exists(None, Some(7)), Some(7));
+        assert_eq!(max_exists(Some(4), Some(9)), Some(9));
+        assert_eq!(max_exists(Some(9), Some(4)), Some(9));
+    }
+
+    // ---------------------------------------------------------------
+    //  build_message_from_attrs
+    // ---------------------------------------------------------------
+
+    /// Parse one untagged FETCH line the way the session loop sees it.
+    fn fetch_line(line: &[u8]) -> (u32, Vec<AttributeValue<'_>>) {
+        let (rest, response) =
+            imap_proto::parser::parse_response(line).expect("the fixture has to parse");
+        assert!(rest.is_empty(), "the whole line has to be consumed");
+        match response {
+            Response::Fetch(seq, attrs) => (seq, attrs),
+            other => panic!("expected a FETCH response, got {other:?}"),
+        }
+    }
+
+    /// A full FETCH response to [`FETCH_MESSAGE_QUERY`].  `date` goes into the
+    /// ENVELOPE's date field verbatim, so a test can pass `NIL` to drop it.
+    fn message_fetch_line(date: &str) -> Vec<u8> {
+        format!(
+            concat!(
+                r#"* 3 FETCH (FLAGS (\Seen) INTERNALDATE "25-Feb-2026 06:52:06 +0100" "#,
+                "RFC822.SIZE 4242 ENVELOPE ({date} \"Hello there\" ",
+                "((\"Ada\" NIL \"ada\" \"example.com\")) NIL NIL ",
+                "((\"Bob\" NIL \"bob\" \"example.org\")) NIL NIL NIL ",
+                "\"<id@example.com>\") UID 77 ",
+                "BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 12 1))",
+                "\r\n"
+            ),
+            date = date
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_full_fetch_response_becomes_a_message() {
+        let line = message_fetch_line("\"Wed, 25 Feb 2026 07:00:00 +0000\"");
+        let (seq, attrs) = fetch_line(&line);
+
+        let stored = build_message_from_attrs(seq, &attrs)
+            .expect("building the message")
+            .expect("a full FETCH response is a message");
+
+        assert_eq!(stored.uid, 77);
+        assert_eq!(stored.seq, 3);
+        assert_eq!(stored.message.id, 77);
+        assert_eq!(stored.message.subject, "Hello there");
+        assert_eq!(stored.message.sender, "Ada");
+        assert_eq!(stored.message.recipients, vec!["Bob"]);
+        assert_eq!(stored.message.size, 4242);
+        assert_eq!(stored.message.status, MessageStatus::Read);
+        assert!(!stored.message.starred);
+        assert!(!stored.message.has_attachments);
+        // The envelope's own Date header wins over INTERNALDATE.
+        assert_eq!(stored.message.sent.unix_timestamp(), 1_772_002_800);
+    }
+
+    #[test]
+    fn a_missing_envelope_date_falls_back_to_internaldate() {
+        // INTERNALDATE is `25-Feb-2026 06:52:06 +0100`, which is not an RFC 2822
+        // date: dashes join the day and month and there is no weekday.  Parsing
+        // it with mailparse fails, which silently backdated every such message
+        // to "now" instead.
+        let line = message_fetch_line("NIL");
+        let (seq, attrs) = fetch_line(&line);
+
+        let stored = build_message_from_attrs(seq, &attrs)
+            .expect("building the message")
+            .expect("a full FETCH response is a message");
+
+        assert_eq!(stored.message.sent.unix_timestamp(), 1_771_998_726);
+    }
+
+    #[test]
+    fn parse_internal_date_reads_the_imap_format() {
+        assert_eq!(
+            parse_internal_date("25-Feb-2026 06:52:06 +0100").map(|d| d.unix_timestamp()),
+            Some(1_771_998_726)
+        );
+        assert_eq!(parse_internal_date("Wed, 25 Feb 2026 06:52:06 +0100"), None);
+        assert_eq!(parse_internal_date("nonsense"), None);
+    }
+
+    #[test]
+    fn an_unsolicited_flag_update_is_not_a_message() {
+        // Gmail may announce a flag change at any point during a FETCH.  Such a
+        // response carries neither UID nor ENVELOPE, and treating the missing
+        // UID as an error used to abort the whole backfill batch.
+        let line = b"* 5 FETCH (FLAGS (\\Seen))\r\n";
+        let (seq, attrs) = fetch_line(line);
+
+        assert!(
+            build_message_from_attrs(seq, &attrs)
+                .expect("a flag update is not an error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_fetch_response_without_an_envelope_is_not_a_message() {
+        let line = b"* 5 FETCH (UID 77 FLAGS (\\Seen))\r\n";
+        let (seq, attrs) = fetch_line(line);
+
+        assert!(
+            build_message_from_attrs(seq, &attrs)
+                .expect("a flag update is not an error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_attachment_in_the_bodystructure_reaches_the_message() {
+        let line = concat!(
+            r#"* 3 FETCH (FLAGS () INTERNALDATE "25-Feb-2026 06:52:06 +0100" "#,
+            "RFC822.SIZE 4242 ENVELOPE (NIL \"Hello there\" ",
+            "((\"Ada\" NIL \"ada\" \"example.com\")) NIL NIL ",
+            "((\"Bob\" NIL \"bob\" \"example.org\")) NIL NIL NIL ",
+            "\"<id@example.com>\") UID 77 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" ",
+            "(\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 12 1)(\"APPLICATION\" \"PDF\" ",
+            "(\"NAME\" \"report.pdf\") NIL NIL \"BASE64\" 5000) \"MIXED\"))",
+            "\r\n"
+        )
+        .as_bytes();
+        let (seq, attrs) = fetch_line(line);
+
+        let stored = build_message_from_attrs(seq, &attrs)
+            .expect("building the message")
+            .expect("a full FETCH response is a message");
+
+        assert!(stored.message.has_attachments);
+        assert_eq!(stored.message.status, MessageStatus::New);
     }
 }
