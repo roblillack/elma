@@ -250,7 +250,7 @@ struct Config {
     accounts: Option<Vec<AccountConfig>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct AccountConfig {
     name: Option<String>,
     r#type: String,
@@ -261,6 +261,24 @@ struct AccountConfig {
     url: Option<String>,
     #[serde(alias = "redirect_hosts")]
     redirect_hosts: Option<Vec<String>>,
+}
+
+/// Written out by hand rather than derived, so that formatting an account --
+/// in an error context, a panic message, a debug print -- cannot spill the
+/// password or token it carries.
+impl std::fmt::Debug for AccountConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountConfig")
+            .field("name", &self.name)
+            .field("type", &self.r#type)
+            .field("email", &self.email)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .field("username", &self.username)
+            .field("token", &self.token.as_ref().map(|_| "***"))
+            .field("url", &self.url)
+            .field("redirect_hosts", &self.redirect_hosts)
+            .finish()
+    }
 }
 
 fn url_host(url: &str) -> Option<&str> {
