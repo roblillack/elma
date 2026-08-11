@@ -8,7 +8,7 @@
 use crate::{
     backend::{
         ActionStatus, BackendEvent, LeafPart, MailBackend, MailboxSnapshot, OutgoingMessage,
-        PartRole, build_compose_body,
+        PartRole, build_compose_body, oauth::OAuthCredential,
     },
     model::{
         Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
@@ -204,23 +204,37 @@ mod debug_logging {
 /// Authentication parameters for connecting to a JMAP server.
 #[derive(Clone)]
 pub enum JmapAuth {
-    Basic { username: String, password: String },
-    Bearer { token: String },
+    Basic {
+        username: String,
+        password: String,
+    },
+    Bearer {
+        token: String,
+    },
+    /// A sign-in held outside the configuration file, which hands out access
+    /// tokens and renews them as they run out.
+    OAuth(Arc<OAuthCredential>),
 }
 
 impl JmapAuth {
-    fn credentials(&self) -> Credentials {
-        match self {
-            JmapAuth::Basic { username, password } => Credentials::basic(username, password),
-            JmapAuth::Bearer { token } => Credentials::bearer(token),
-        }
+    /// The secret to send right now.
+    ///
+    /// This is where an OAuth account notices its access token has aged out and
+    /// trades the refresh token for a new one, so every path that reaches the
+    /// server goes through here rather than around it.
+    async fn secret_now(&self) -> Result<String> {
+        Ok(match self {
+            JmapAuth::Basic { password, .. } => password.clone(),
+            JmapAuth::Bearer { token } => token.clone(),
+            JmapAuth::OAuth(credential) => credential.access_token().await?,
+        })
     }
 
-    /// The secret itself, for handing to the debug log's scrubber.
-    fn secret(&self) -> &str {
+    /// The header for `secret`, which must have come from [`Self::secret_now`].
+    fn credentials_with(&self, secret: &str) -> Credentials {
         match self {
-            JmapAuth::Basic { password, .. } => password,
-            JmapAuth::Bearer { token } => token,
+            JmapAuth::Basic { username, .. } => Credentials::basic(username, secret),
+            JmapAuth::Bearer { .. } | JmapAuth::OAuth(_) => Credentials::bearer(secret),
         }
     }
 
@@ -229,6 +243,9 @@ impl JmapAuth {
         match self {
             JmapAuth::Basic { username, .. } => format!("password for {username}"),
             JmapAuth::Bearer { .. } => "API token".to_string(),
+            JmapAuth::OAuth(credential) => {
+                format!("access token signed in for {}", credential.username())
+            }
         }
     }
 
@@ -241,6 +258,10 @@ impl JmapAuth {
             JmapAuth::Bearer { .. } => {
                 "if the server expects a password instead, configure it as `password = \"...\"`"
             }
+            JmapAuth::OAuth(_) => {
+                "the sign-in may have been revoked or had its access withdrawn -- \
+                 sign in again with `elma --login`"
+            }
         }
     }
 }
@@ -252,6 +273,9 @@ impl std::fmt::Debug for JmapAuth {
         match self {
             JmapAuth::Basic { username, .. } => write!(f, "Basic {{ username: {username:?} }}"),
             JmapAuth::Bearer { .. } => write!(f, "Bearer"),
+            JmapAuth::OAuth(credential) => {
+                write!(f, "OAuth {{ username: {:?} }}", credential.username())
+            }
         }
     }
 }
@@ -261,6 +285,7 @@ impl std::fmt::Display for JmapAuth {
         match self {
             JmapAuth::Basic { username, .. } => write!(f, "Basic ({username})"),
             JmapAuth::Bearer { .. } => write!(f, "Bearer"),
+            JmapAuth::OAuth(credential) => write!(f, "OAuth ({})", credential.username()),
         }
     }
 }
@@ -281,6 +306,14 @@ fn connect_error(err: jmap_client::Error, auth: &JmapAuth, base_url: &str) -> an
         ),
         _ => anyhow!("connecting to JMAP server at {url}: {err}"),
     }
+}
+
+/// Whether `err` is the server refusing the credential rather than anything
+/// else that can go wrong on the way to it.
+fn credential_was_refused(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<jmap_client::Error>())
+        .any(|err| matches!(http_status(err), Some(401 | 403)))
 }
 
 /// The HTTP status behind a `jmap-client` error, for the errors that carry one.
@@ -345,8 +378,24 @@ impl JmapBackend {
     /// one session rather than two; the loser waits and gets the same one.
     fn inner(&self) -> Result<Arc<JmapInner>> {
         let mut guard = self.inner.lock().unwrap();
+
+        // Asked for before the cache is consulted, because for an OAuth account
+        // this is what renews an access token that has run out -- and a renewed
+        // token is precisely the case where the cached session has to go.
+        let secret = self.runtime.block_on(self.config.auth.secret_now())?;
+        debug_logging::register_secret(&secret);
+
         if let Some(inner) = guard.as_ref() {
-            return Ok(Arc::clone(inner));
+            if inner.authorized_with == secret && !inner.session_rejected() {
+                return Ok(Arc::clone(inner));
+            }
+            // Either the credential has moved on or the server stopped accepting
+            // this one.  The session cannot be re-authorized in place -- the
+            // library fixes the header when it connects -- so it is torn down,
+            // background tasks and all, and built again below.
+            debug_logging::log_session("credential changed, rebuilding the JMAP session");
+            self.runtime.block_on(inner.shutdown());
+            *guard = None;
         }
 
         // No context is added here: everything [`JmapInner::initialize`] can
@@ -355,6 +404,7 @@ impl JmapBackend {
         let inner = self.runtime.block_on(JmapInner::initialize(
             Arc::clone(&self.runtime),
             self.config.clone(),
+            secret,
         ))?;
         *guard = Some(Arc::clone(&inner));
         Ok(inner)
@@ -473,6 +523,14 @@ impl MailBackend for JmapBackend {
 struct JmapInner {
     runtime: Arc<Runtime>,
     client: Arc<Client>,
+    /// The secret this session's `Authorization` header was built from.  An
+    /// access token that has since been refreshed no longer matches, which is
+    /// how [`JmapBackend::inner`] knows to build a new session.
+    authorized_with: String,
+    /// Set when the server turned this session's credential down, so the next
+    /// call reconnects instead of retrying with something it has stopped
+    /// accepting.
+    rejected: AtomicBool,
     mailboxes: AsyncMutex<MailboxCache>,
     state: AsyncMutex<JmapState>,
     identity: IdentityInfo,
@@ -487,18 +545,18 @@ struct JmapInner {
 }
 
 impl JmapInner {
-    async fn initialize(runtime: Arc<Runtime>, config: JmapConfig) -> Result<Arc<Self>> {
+    async fn initialize(
+        runtime: Arc<Runtime>,
+        config: JmapConfig,
+        secret: String,
+    ) -> Result<Arc<Self>> {
         let JmapConfig {
             base_url,
             auth,
             trusted_hosts,
         } = config;
 
-        // Registered before the first trace line is written, so the debug log
-        // can scrub the account's secret out of everything that follows.
-        debug_logging::register_secret(auth.secret());
-
-        let mut builder = Client::new().credentials(auth.credentials());
+        let mut builder = Client::new().credentials(auth.credentials_with(&secret));
         if !trusted_hosts.is_empty() {
             builder = builder.follow_redirects(trusted_hosts);
         }
@@ -525,6 +583,8 @@ impl JmapInner {
         Ok(Arc::new(Self {
             runtime,
             client,
+            authorized_with: secret,
+            rejected: AtomicBool::new(false),
             mailboxes: AsyncMutex::new(mailboxes),
             state: AsyncMutex::new(JmapState::default()),
             identity,
@@ -535,6 +595,30 @@ impl JmapInner {
             backfill_handle: AsyncMutex::new(None),
             backfill_cancel: AsyncMutex::new(None),
         }))
+    }
+
+    /// Whether the server has refused this session's credential.
+    fn session_rejected(&self) -> bool {
+        self.rejected.load(AtomicOrdering::SeqCst)
+    }
+
+    /// Stop everything running on behalf of this session.
+    ///
+    /// The background tasks hold their own handle on the session, so dropping
+    /// the last outside reference would not end them -- they have to be told.
+    async fn shutdown(&self) {
+        self.stop_backfill().await;
+        self.stop_event_loop().await;
+    }
+
+    async fn stop_event_loop(&self) {
+        if let Some(cancel) = self.event_cancel.lock().await.take() {
+            cancel.store(true, AtomicOrdering::SeqCst);
+        }
+        if let Some(handle) = self.event_handle.lock().await.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 
     fn set_current_mailbox(&self, mailbox: MailboxKind) {
@@ -913,6 +997,18 @@ impl JmapInner {
                 let _ = poll_interval.tick().await;
                 if let Err(err) = self.refresh_current_mailbox().await {
                     debug_logging::log_session(format_args!("background refresh failed: {err:?}"));
+                    // A credential the server has stopped accepting -- most
+                    // often an access token that ran out while the mailbox sat
+                    // idle -- will not start working on a retry.  The session is
+                    // marked instead, so the next thing the user does rebuilds
+                    // it with a fresh credential rather than polling in vain.
+                    if credential_was_refused(&err) {
+                        self.rejected.store(true, AtomicOrdering::SeqCst);
+                        debug_logging::log_session(
+                            "server refused the credential; the session will be rebuilt on the next call",
+                        );
+                        return;
+                    }
                     eprintln!("JMAP background refresh error: {err:?}");
                     break;
                 }

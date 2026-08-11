@@ -61,17 +61,16 @@ every few seconds to keep the inbox active.
 
 ### JMAP accounts
 
-A JMAP account authenticates with either a password or an API token, and reads
-its session object from `url` — which defaults to Fastmail's endpoint:
+A JMAP account signs in one of three ways, and reads its session object from
+`url` — which defaults to Fastmail's endpoint:
 
 ```toml
 [[accounts]]
 name = "Fastmail"
 backend = "jmap"
 username = "user@fastmail.com"
-# Fastmail's JMAP API takes API tokens only, not passwords. Create one under
-# Settings → Privacy & Security → Manage API tokens, with the "Mail" scope.
-token = "api-token"
+# No credential here: `elma --login Fastmail` signs in through the browser and
+# keeps the token in ~/.elma/oauth.toml.
 
 [[accounts]]
 name = "Work"
@@ -80,24 +79,76 @@ username = "user@example.com"
 # Sent as HTTP Basic, for a server that asks for a password.
 password = "password"
 url = "https://mail.example.com"
+
+[[accounts]]
+name = "Scripted"
+backend = "jmap"
+username = "user@fastmail.com"
+# Sent as a bearer token, for a server that issues them. On Fastmail:
+# Settings → Privacy & Security → Manage API tokens, with the "Mail" scope.
+token = "api-token"
 ```
+
+Which one is used follows from what the entry contains: a `token` is sent as a
+bearer token, a `password` as HTTP Basic, and an entry with neither signs in
+through the browser. `auth = "oauth"`, `"password"` or `"token"` says so
+outright, for an entry that carries more than one.
 
 `url` may name either the session object itself or the host that serves
 `/.well-known/jmap`. Should the server redirect the session fetch elsewhere, the
 target host has to be listed in `redirect_hosts` for the redirect to be
 followed; the host in `url` — plus Fastmail's own hosts, for a Fastmail URL — is
-trusted already. Configuring both credentials uses the token.
+trusted already.
+
+#### Signing in through the browser
+
+```console
+$ elma --login Fastmail
+```
+
+This runs the whole OAuth flow on your machine — there is no server of Elma's in
+the middle, and the token never passes through one:
+
+- The endpoint is asked who authorizes access to it: an unauthenticated request
+  answers with a `WWW-Authenticate` challenge naming its metadata
+  ([RFC 9728][rfc9728]), which names the authorization server, whose own
+  metadata ([RFC 8414][rfc8414]) gives the endpoints and scopes.
+- Elma registers itself as a client on the spot
+  ([RFC 7591][rfc7591]) — no client ID is shipped in the binary or held anywhere
+  else — as a public client with no secret to keep.
+- The browser opens at the provider's own sign-in page. The URL is printed too,
+  for a machine where opening a browser is not on the cards.
+- The authorization code comes back to a listener on `127.0.0.1` and is
+  redeemed with PKCE ([RFC 7636][rfc7636]), which is what makes a code
+  intercepted on the way back useless to anyone else.
+- The tokens land in `~/.elma/oauth.toml` (mode `0600`), not in `~/.elmarc`. A
+  refresh token, where the server issues one, means this is a one-off: access
+  tokens are renewed as they expire.
+
+None of this is Fastmail-specific — any JMAP server publishing the same metadata
+works the same way, and `scopes = ["..."]` names the scope to ask for if Elma
+cannot recognise one on offer. A server that does not offer registration or PKCE
+is reported as such, and the account can use a password or a token instead.
+
+If the sign-in is revoked, the status line says so and names the command to run
+again. Signing in again from inside the TUI is not wired up yet: today it is
+`elma --login`, from a shell.
+
+[rfc9728]: https://www.rfc-editor.org/rfc/rfc9728
+[rfc8414]: https://www.rfc-editor.org/rfc/rfc8414
+[rfc7591]: https://www.rfc-editor.org/rfc/rfc7591
+[rfc7636]: https://www.rfc-editor.org/rfc/rfc7636
 
 #### Fastmail and app-specific passwords
 
 Fastmail's app-specific passwords cover IMAP, POP, SMTP, CalDAV and CardDAV, but
 **not** JMAP: its JMAP endpoints answer any Basic credential with `401 Invalid
 Authorization header, not bearer`, and advertise bearer tokens as the only method
-they accept. So a Fastmail account over JMAP needs an API token
-(Settings → Privacy & Security → Manage API tokens), and Elma says as much at
-startup rather than letting the login fail later. An app-specific password is
-still the credential to use for Fastmail over IMAP — a backend Elma does not
-offer yet, since `gmail` is fixed to Google's servers.
+they accept. So a Fastmail account over JMAP either signs in through the browser
+(above) or uses an API token, and Elma says as much at startup rather than
+letting the login fail later. An app-specific password is still the credential to
+use for Fastmail over IMAP — a backend Elma does not offer yet, since `gmail` is
+fixed to Google's servers.
 
 ### Server certificates
 

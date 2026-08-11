@@ -10,6 +10,7 @@ use crate::backend::{
     gmail::GmailBackend,
     jmap::{JmapAuth, JmapBackend, JmapConfig},
     mock::MockBackend,
+    oauth::{self, OAuthCredential},
 };
 use anyhow::{Context, Result, anyhow};
 use crossterm::{
@@ -29,12 +30,19 @@ const TICK_RATE: Duration = Duration::from_millis(100);
 const DEFAULT_JMAP_SESSION_URL: &str = "https://api.fastmail.com/jmap/session";
 
 fn main() -> Result<()> {
-    let args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
     let mut demo_mode = false;
+    let mut login: Option<Option<String>> = None;
 
-    for arg in args {
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "-D" | "--demo" => demo_mode = true,
+            "-L" | "--login" => {
+                // The account is optional: with a single OAuth account there is
+                // nothing to disambiguate.
+                let named = args.peek().is_some_and(|next| !next.starts_with('-'));
+                login = Some(if named { args.next() } else { None });
+            }
             "-h" | "--help" => {
                 print_usage();
                 return Ok(());
@@ -45,6 +53,12 @@ fn main() -> Result<()> {
                 return Ok(());
             }
         }
+    }
+
+    // Sign-in runs with the terminal to itself, before the alternate screen is
+    // entered: it has a URL to show and a browser to wait for.
+    if let Some(account) = login {
+        return sign_in_to_account(account.as_deref());
     }
 
     let accounts = load_accounts(demo_mode)?;
@@ -118,8 +132,10 @@ fn print_usage() {
     println!("    elma-rs [OPTIONS]");
     println!();
     println!("OPTIONS:");
-    println!("    -D, --demo    Run with the built-in mock backend (default)");
-    println!("    -h, --help    Show this help message");
+    println!("    -D, --demo             Run with the built-in mock backend (default)");
+    println!("    -L, --login [ACCOUNT]  Sign in to a JMAP account in the browser and");
+    println!("                           store the token, then exit");
+    println!("    -h, --help             Show this help message");
 }
 
 fn load_accounts(demo_mode: bool) -> Result<Vec<AccountDescriptor>> {
@@ -153,7 +169,8 @@ fn load_accounts(demo_mode: bool) -> Result<Vec<AccountDescriptor>> {
     }
 }
 
-fn load_accounts_from_config() -> Result<Option<Vec<AccountDescriptor>>> {
+/// The parsed `~/.elmarc`, or `None` when there is not one.
+fn read_config() -> Result<Option<Config>> {
     let path = match config_path() {
         Some(path) => path,
         None => return Ok(None),
@@ -165,8 +182,16 @@ fn load_accounts_from_config() -> Result<Option<Vec<AccountDescriptor>>> {
 
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("unable to read configuration file {}", path.display()))?;
-    let config: Config = toml::from_str(&raw)
-        .with_context(|| format!("unable to parse configuration file {}", path.display()))?;
+    toml::from_str(&raw)
+        .map(Some)
+        .with_context(|| format!("unable to parse configuration file {}", path.display()))
+}
+
+fn load_accounts_from_config() -> Result<Option<Vec<AccountDescriptor>>> {
+    let config = match read_config()? {
+        Some(config) => config,
+        None => return Ok(None),
+    };
 
     if let Some(entries) = config.accounts {
         let mut accounts = Vec::new();
@@ -225,16 +250,47 @@ struct JmapSetup {
     config: JmapConfig,
 }
 
-/// Translate an `[[accounts]]` entry into the parameters the JMAP backend takes.
+/// Which credential an account signs in with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthKind {
+    /// A sign-in kept outside the configuration file, renewed as it expires.
+    OAuth,
+    /// A password, sent as HTTP Basic.
+    Password,
+    /// An API token, sent as a bearer token.
+    Token,
+}
+
+/// What `auth` says, or -- when it says nothing -- what the entry implies.
 ///
-/// Kept apart from [`build_account_from_config`] so the mapping -- which
-/// endpoint, which credentials, which hosts a redirect may go to -- is testable
-/// without building a backend or touching the network.
+/// An entry carrying no credential at all is read as OAuth: a configuration file
+/// with no secret in it is the normal shape of an account that signs in through
+/// the browser.
+fn auth_kind(config: &AccountConfig, index: usize) -> Result<AuthKind> {
+    match config
+        .auth
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("oauth" | "oauth2") => Ok(AuthKind::OAuth),
+        Some("password" | "basic") => Ok(AuthKind::Password),
+        Some("token" | "bearer") => Ok(AuthKind::Token),
+        Some(other) => Err(anyhow!(
+            "accounts[{index}].auth: unknown value '{other}' (expected \"oauth\", \"password\" \
+             or \"token\")"
+        )),
+        None if config.token.is_some() => Ok(AuthKind::Token),
+        None if config.password.is_some() => Ok(AuthKind::Password),
+        None => Ok(AuthKind::OAuth),
+    }
+}
+
+/// The endpoint and account name a JMAP entry points at.
 ///
-/// Either credential works: `token` is sent as a bearer token, `password` as
-/// HTTP Basic.  A token wins if both are configured, since a server that issues
-/// tokens is the one that wants them.
-fn jmap_setup_from_config(config: &mut AccountConfig, index: usize) -> Result<JmapSetup> {
+/// Shared by the account builder and `--login`, so a sign-in is stored under the
+/// same endpoint the backend will later look for it under.
+fn jmap_endpoint(config: &mut AccountConfig, index: usize) -> Result<(String, String)> {
     let username = config
         .username
         .take()
@@ -246,36 +302,68 @@ fn jmap_setup_from_config(config: &mut AccountConfig, index: usize) -> Result<Jm
         .take()
         .unwrap_or_else(|| DEFAULT_JMAP_SESSION_URL.to_string());
     normalize_fastmail_url(&mut base_url);
-    let host_is_fastmail = url_host(&base_url).is_some_and(is_fastmail_host);
+    Ok((base_url, username))
+}
 
-    let auth = if let Some(token) = config.token.take() {
-        JmapAuth::Bearer { token }
-    } else if let Some(password) = config.password.take() {
-        // FastMail's app-specific passwords cover IMAP, POP, SMTP, CalDAV and
-        // CardDAV, but not JMAP: every JMAP endpoint answers a Basic header with
-        // `401 Invalid Authorization header, not bearer` before it ever looks at
-        // the credentials, and advertises bearer as the only method it accepts
-        // (`.well-known/oauth-protected-resource/jmap/session`).  Letting the
-        // account through would trade this explanation for that bare 401 on the
-        // first folder load, so say it here instead.  Should FastMail start
-        // accepting Basic, this is the check to drop.
-        if host_is_fastmail {
-            return Err(anyhow!(
-                "accounts[{index}]: {base_url} is FastMail's JMAP API, which accepts API tokens \
-                 only, not passwords. App-specific passwords work for IMAP, POP, SMTP, CalDAV \
-                 and CardDAV, but not for JMAP. Create a token with the \"Mail\" scope under \
-                 Settings -> Privacy & Security -> Manage API tokens and configure it as \
-                 `token = \"...\"` in place of `password = \"...\"`."
-            ));
+/// Translate an `[[accounts]]` entry into the parameters the JMAP backend takes.
+///
+/// Kept apart from [`build_account_from_config`] so the mapping -- which
+/// endpoint, which credentials, which hosts a redirect may go to -- is testable
+/// without building a backend or touching the network.
+///
+/// Any of the three credentials works: a browser sign-in (the default), a
+/// `password` sent as HTTP Basic, or a `token` sent as a bearer token.
+fn jmap_setup_from_config(config: &mut AccountConfig, index: usize) -> Result<JmapSetup> {
+    let kind = auth_kind(config, index)?;
+    let (base_url, username) = jmap_endpoint(config, index)?;
+    let host_is_fastmail = url_host(&base_url).is_some_and(is_fastmail_host);
+    // How the account is addressed on the command line, and in the message that
+    // asks the user to sign in.
+    let label = config.name.clone().unwrap_or_else(|| username.clone());
+
+    let auth = match kind {
+        AuthKind::OAuth => {
+            let store = oauth::TokenStore::at_default_path()?;
+            // Looking the sign-in up is left to the first request: an account
+            // nobody has signed into yet should not stop the others from
+            // starting, it should say what to do when its mailbox is opened.
+            JmapAuth::OAuth(Arc::new(OAuthCredential::new(
+                store, &base_url, &username, &label,
+            )))
         }
-        JmapAuth::Basic {
-            username: username.clone(),
-            password,
+        AuthKind::Token => JmapAuth::Bearer {
+            token: config
+                .token
+                .take()
+                .ok_or_else(|| anyhow!("accounts[{index}].token missing for a token sign-in"))?,
+        },
+        AuthKind::Password => {
+            let password = config.password.take().ok_or_else(|| {
+                anyhow!("accounts[{index}].password missing for a password sign-in")
+            })?;
+            // FastMail's app-specific passwords cover IMAP, POP, SMTP, CalDAV and
+            // CardDAV, but not JMAP: every JMAP endpoint answers a Basic header
+            // with `401 Invalid Authorization header, not bearer` before it ever
+            // looks at the credentials, and advertises bearer as the only method
+            // it accepts (`.well-known/oauth-protected-resource/jmap/session`).
+            // Letting the account through would trade this explanation for that
+            // bare 401 on the first folder load, so say it here instead.  Should
+            // FastMail start accepting Basic, this is the check to drop.
+            if host_is_fastmail {
+                return Err(anyhow!(
+                    "accounts[{index}]: {base_url} is FastMail's JMAP API, which does not accept \
+                     passwords -- app-specific passwords work for IMAP, POP, SMTP, CalDAV and \
+                     CardDAV, but not for JMAP. Drop `password` and run `elma --login {label}` to \
+                     sign in through the browser, or create an API token with the \"Mail\" scope \
+                     under Settings -> Privacy & Security -> Manage API tokens and configure it \
+                     as `token = \"...\"`."
+                ));
+            }
+            JmapAuth::Basic {
+                username: username.clone(),
+                password,
+            }
         }
-    } else {
-        return Err(anyhow!(
-            "accounts[{index}].password or token missing for JMAP backend"
-        ));
     };
 
     let mut trusted_hosts = config.redirect_hosts.take().unwrap_or_default();
@@ -301,6 +389,114 @@ fn jmap_setup_from_config(config: &mut AccountConfig, index: usize) -> Result<Jm
     })
 }
 
+/// Sign in to one JMAP account in the browser and keep the result.
+///
+/// Runs instead of the application rather than inside it: the flow has a URL to
+/// show, a browser to wait for, and nothing to draw.
+fn sign_in_to_account(requested: Option<&str>) -> Result<()> {
+    let entries = read_config()?
+        .and_then(|config| config.accounts)
+        .unwrap_or_default();
+    let mut candidates: Vec<(usize, AccountConfig)> = entries
+        .into_iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.backend.eq_ignore_ascii_case("jmap"))
+        .collect();
+
+    if candidates.is_empty() {
+        let path = config_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "~/.elmarc".to_string());
+        return Err(anyhow!(
+            "no JMAP account is configured in {path}, so there is nothing to sign in to"
+        ));
+    }
+
+    let (index, mut config) = match requested {
+        Some(requested) => {
+            let position = candidates
+                .iter()
+                .position(|(_, entry)| account_matches(entry, requested))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no JMAP account called '{requested}'. Configured: {}",
+                        account_names(&candidates)
+                    )
+                })?;
+            candidates.remove(position)
+        }
+        None if candidates.len() == 1 => candidates.remove(0),
+        None => {
+            return Err(anyhow!(
+                "more than one JMAP account is configured; name the one to sign in to: {}",
+                account_names(&candidates)
+            ));
+        }
+    };
+
+    if auth_kind(&config, index)? != AuthKind::OAuth {
+        eprintln!(
+            "Note: this account is configured with a password or token; signing in stores a \
+             token but the account will keep using what is in the configuration file until \
+             `auth = \"oauth\"` is set, or the password and token are removed."
+        );
+    }
+
+    let scopes = config.scopes.clone();
+    let (endpoint, username) = jmap_endpoint(&mut config, index)?;
+    let store = oauth::TokenStore::at_default_path()?;
+
+    println!("Signing in to {endpoint} as {username}.");
+    let signed_in = oauth::sign_in_blocking(&endpoint, &username, scopes.as_deref())?;
+    store.save(&signed_in.credential)?;
+
+    println!();
+    println!(
+        "Signed in as {username}. Token stored in {}.",
+        store.path().display()
+    );
+    if let Some(expires_in) = signed_in.expires_in {
+        println!("The access token is good for {} minutes.", expires_in / 60);
+    }
+    if signed_in.credential.refresh_token.is_some() {
+        println!("It will be renewed automatically; there is no need to run this again.");
+    } else {
+        println!(
+            "The server issued no refresh token, so this has to be repeated once the access \
+             token runs out."
+        );
+    }
+    Ok(())
+}
+
+/// Whether `name` addresses this account, by its name or its address.
+fn account_matches(config: &AccountConfig, name: &str) -> bool {
+    let candidates = [
+        config.name.as_deref(),
+        config.username.as_deref(),
+        config.email.as_deref(),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .any(|candidate| candidate.eq_ignore_ascii_case(name))
+}
+
+fn account_names(candidates: &[(usize, AccountConfig)]) -> String {
+    candidates
+        .iter()
+        .map(|(index, entry)| {
+            entry
+                .name
+                .clone()
+                .or_else(|| entry.username.clone())
+                .or_else(|| entry.email.clone())
+                .unwrap_or_else(|| format!("accounts[{index}]"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn config_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".elmarc"))
 }
@@ -324,6 +520,11 @@ struct AccountConfig {
     username: Option<String>,
     token: Option<String>,
     url: Option<String>,
+    /// Which credential to use: `"oauth"`, `"password"` or `"token"`.  Left out,
+    /// the entry's own contents decide -- see [`auth_kind`].
+    auth: Option<String>,
+    /// OAuth scopes to ask for, for a server whose names Elma cannot guess.
+    scopes: Option<Vec<String>>,
     #[serde(alias = "redirect_hosts")]
     redirect_hosts: Option<Vec<String>>,
 }
@@ -341,6 +542,8 @@ impl std::fmt::Debug for AccountConfig {
             .field("username", &self.username)
             .field("token", &self.token.as_ref().map(|_| "***"))
             .field("url", &self.url)
+            .field("auth", &self.auth)
+            .field("scopes", &self.scopes)
             .field("redirect_hosts", &self.redirect_hosts)
             .finish()
     }
@@ -504,21 +707,95 @@ mod tests {
         assert_eq!(format!("{:?}", setup.config.auth), "Bearer");
     }
 
+    /// A configuration file with no secret in it is the normal shape of an
+    /// account that signs in through the browser.
     #[test]
-    fn jmap_without_a_credential_is_rejected() {
-        let error = jmap_setup(
+    fn jmap_without_a_credential_signs_in_with_oauth() {
+        let setup = jmap_setup(
             r#"
             [[accounts]]
             backend = "jmap"
             username = "rob@example.com"
             "#,
         )
-        .expect_err("an account without a credential cannot connect");
+        .expect("an account with no credential should sign in interactively");
+
+        assert_eq!(
+            format!("{:?}", setup.config.auth),
+            r#"OAuth { username: "rob@example.com" }"#
+        );
+    }
+
+    #[test]
+    fn an_explicit_auth_setting_decides() {
+        let setup = jmap_setup(
+            r#"
+            [[accounts]]
+            backend = "jmap"
+            username = "rob@example.com"
+            password = "s3cret"
+            url = "https://mail.example.com"
+            auth = "oauth"
+            "#,
+        )
+        .expect("`auth` should be taken at its word");
 
         assert!(
-            error.to_string().contains("password or token missing"),
+            format!("{:?}", setup.config.auth).starts_with("OAuth"),
+            "a password in the file does not override `auth = \"oauth\"`"
+        );
+    }
+
+    #[test]
+    fn an_auth_setting_without_its_credential_says_which_is_missing() {
+        let error = jmap_setup(
+            r#"
+            [[accounts]]
+            backend = "jmap"
+            username = "rob@example.com"
+            auth = "password"
+            "#,
+        )
+        .expect_err("a password sign-in needs a password");
+        assert!(
+            error.to_string().contains("password missing"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn an_unknown_auth_setting_lists_the_choices() {
+        let error = jmap_setup(
+            r#"
+            [[accounts]]
+            backend = "jmap"
+            username = "rob@example.com"
+            auth = "kerberos"
+            "#,
+        )
+        .expect_err("only three ways of signing in are understood");
+        let message = error.to_string();
+        assert!(message.contains("kerberos"), "{message}");
+        assert!(message.contains("\"oauth\""), "{message}");
+    }
+
+    #[test]
+    fn an_account_is_addressed_by_name_or_by_address() {
+        let entry = account(
+            r#"
+            [[accounts]]
+            name = "Work"
+            backend = "jmap"
+            username = "rob@example.com"
+            "#,
+        );
+        assert!(account_matches(&entry, "Work"));
+        assert!(
+            account_matches(&entry, "work"),
+            "names are not case-sensitive"
+        );
+        assert!(account_matches(&entry, "rob@example.com"));
+        assert!(!account_matches(&entry, "Private"));
     }
 
     /// FastMail's JMAP API only accepts bearer tokens, so an account configured
@@ -542,6 +819,10 @@ mod tests {
             let error = jmap_setup(&source)
                 .expect_err("FastMail cannot be reached over JMAP with a password");
             let message = error.to_string();
+            assert!(
+                message.contains("elma --login"),
+                "the browser sign-in is the way through: {message}"
+            );
             assert!(
                 message.contains("API token") && message.contains("token = "),
                 "unexpected error for {url:?}: {message}"
