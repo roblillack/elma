@@ -15,7 +15,11 @@ use crate::{
     },
 };
 use anyhow::{Context, Result, anyhow};
-use async_imap::{Session, extensions::idle::IdleResponse, types::Flag};
+use async_imap::{
+    Session,
+    extensions::idle::{Handle as IdleHandle, IdleResponse},
+    types::{Flag, UnsolicitedResponse},
+};
 use futures::TryStreamExt;
 use imap_proto::types::{
     AttributeValue, BodyContentCommon, BodyContentSinglePart, BodyParams, BodyStructure,
@@ -615,6 +619,7 @@ mod debug_logging {
 use debug_logging::{LoggedTlsStream, log_backend_event, register_secret, wrap_stream};
 
 type AsyncSession = Session<LoggedTlsStream>;
+type AsyncIdleHandle = IdleHandle<LoggedTlsStream>;
 
 const GMAIL_HOST: &str = "imap.gmail.com";
 const GMAIL_PORT: u16 = 993;
@@ -1027,6 +1032,14 @@ impl GmailInner {
         let session = session_guard
             .as_mut()
             .ok_or_else(|| anyhow!("IMAP session is not available"))?;
+
+        // Catch up on anything announced while the session was elsewhere before
+        // reaching further back.  Backfill runs continuously, so this is the
+        // last line of defence for every path that still loses an EXISTS to
+        // async-imap's unsolicited-response channel.
+        if let Err(err) = self.drain_exists(session, None).await {
+            eprintln!("Gmail backfill EXISTS handling error: {err:?}");
+        }
 
         let (stored_messages, fetch_exists) = match self
             .fetch_message_range(session, start, end)
@@ -1584,7 +1597,26 @@ impl GmailInner {
             let result = tokio::select! {
                 _ = &mut stop_rx => {
                     drop(stopper);
-                    if let Ok(sess) = idle_handle.done().await {
+
+                    // A notification may already have arrived: the server can
+                    // send EXISTS between `+ idling` and the stop signal, and
+                    // during backfill `pause_idle` fires on every batch, so the
+                    // two race constantly.  `select!` picks a ready branch at
+                    // random, so roughly half of those races land here.
+                    //
+                    // Whatever is pending has to be collected *now*.
+                    // `Handle::done` reads through to the tagged OK and hands
+                    // everything it passes to async-imap's unsolicited-response
+                    // channel, which nothing drains -- so an EXISTS left for
+                    // `done` to find is gone, and the mail it announced stays
+                    // invisible until the next reconnect.
+                    let mut exists = Vec::new();
+                    let mut label_refresh = Vec::new();
+                    self.collect_pending_idle(&mut idle_handle, &mut exists, &mut label_refresh)
+                        .await;
+
+                    if let Ok(mut sess) = idle_handle.done().await {
+                        self.apply_idle_updates(&mut sess, exists, label_refresh).await;
                         self.reinsert_session(sess).await;
                     }
                     break;
@@ -1596,6 +1628,13 @@ impl GmailInner {
                 Ok(IdleResponse::Timeout) | Ok(IdleResponse::ManualInterrupt) => {
                     if let Ok(mut sess) = idle_handle.done().await {
                         let _ = sess.noop().await;
+                        // NOOP is how the server reports anything it has been
+                        // holding back, but async-imap answers it through
+                        // `run_command_and_check_ok`, which parks untagged
+                        // responses out of reach.  Pick them up.
+                        if let Err(err) = self.drain_exists(&mut sess, None).await {
+                            eprintln!("Gmail idle EXISTS handling error: {err:?}");
+                        }
                         self.reinsert_session(sess).await;
                     }
                 }
@@ -1611,34 +1650,8 @@ impl GmailInner {
                         eprintln!("Gmail idle processing error: {err:?}");
                     }
 
-                    loop {
-                        let (next_wait, next_stopper) =
-                            idle_handle.wait_with_timeout(Duration::from_millis(0));
-                        match next_wait.await {
-                            Ok(IdleResponse::NewData(resp)) => {
-                                if let Err(err) = self
-                                    .process_idle_response(
-                                        resp.parsed(),
-                                        &mut exists,
-                                        &mut label_refresh,
-                                    )
-                                    .await
-                                {
-                                    eprintln!("Gmail idle processing error: {err:?}");
-                                }
-                                drop(next_stopper);
-                            }
-                            Ok(IdleResponse::Timeout) | Ok(IdleResponse::ManualInterrupt) => {
-                                drop(next_stopper);
-                                break;
-                            }
-                            Err(err) => {
-                                drop(next_stopper);
-                                eprintln!("Gmail idle additional wait error: {err:?}");
-                                break;
-                            }
-                        }
-                    }
+                    self.collect_pending_idle(&mut idle_handle, &mut exists, &mut label_refresh)
+                        .await;
 
                     if exists.is_empty() && label_refresh.is_empty() {
                         continue;
@@ -1646,31 +1659,8 @@ impl GmailInner {
 
                     match idle_handle.done().await {
                         Ok(mut sess) => {
-                            for count in exists {
-                                if let Err(err) = self.drain_exists(&mut sess, Some(count)).await {
-                                    eprintln!("Gmail idle EXISTS handling error: {err:?}");
-                                }
-                            }
-                            if !label_refresh.is_empty() {
-                                label_refresh.sort_unstable();
-                                label_refresh.dedup();
-                                let uid_set = label_refresh
-                                    .iter()
-                                    .map(|uid| uid.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(",");
-                                let command = format!("UID FETCH {uid_set} (UID X-GM-LABELS)");
-                                match self.fetch_gmail_labels_command(&mut sess, &command).await {
-                                    Ok(label_exists) => {
-                                        if let Err(err) =
-                                            self.drain_exists(&mut sess, label_exists).await
-                                        {
-                                            eprintln!("Gmail idle EXISTS handling error: {err:?}");
-                                        }
-                                    }
-                                    Err(err) => eprintln!("Gmail label refresh error: {err:?}"),
-                                }
-                            }
+                            self.apply_idle_updates(&mut sess, exists, label_refresh)
+                                .await;
                             self.reinsert_session(sess).await;
                         }
                         Err(err) => {
@@ -1686,6 +1676,73 @@ impl GmailInner {
                     tokio_time::sleep(Duration::from_secs(5)).await;
                 }
             }
+        }
+    }
+
+    /// Pick up IDLE notifications that have already arrived, without waiting
+    /// for new ones.
+    async fn collect_pending_idle(
+        &self,
+        idle_handle: &mut AsyncIdleHandle,
+        exists: &mut Vec<u32>,
+        label_refresh: &mut Vec<u32>,
+    ) {
+        loop {
+            let (next_wait, next_stopper) = idle_handle.wait_with_timeout(Duration::from_millis(0));
+            let outcome = next_wait.await;
+            drop(next_stopper);
+
+            match outcome {
+                Ok(IdleResponse::NewData(resp)) => {
+                    if let Err(err) = self
+                        .process_idle_response(resp.parsed(), exists, label_refresh)
+                        .await
+                    {
+                        eprintln!("Gmail idle processing error: {err:?}");
+                    }
+                }
+                Ok(IdleResponse::Timeout) | Ok(IdleResponse::ManualInterrupt) => break,
+                Err(err) => {
+                    eprintln!("Gmail idle additional wait error: {err:?}");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Act on the notifications gathered while IDLE was running, now that the
+    /// session is usable again.
+    async fn apply_idle_updates(
+        &self,
+        session: &mut AsyncSession,
+        exists: Vec<u32>,
+        mut label_refresh: Vec<u32>,
+    ) {
+        for count in exists {
+            if let Err(err) = self.drain_exists(session, Some(count)).await {
+                eprintln!("Gmail idle EXISTS handling error: {err:?}");
+            }
+        }
+
+        if label_refresh.is_empty() {
+            return;
+        }
+
+        label_refresh.sort_unstable();
+        label_refresh.dedup();
+        let uid_set = label_refresh
+            .iter()
+            .map(|uid| uid.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let command = format!("UID FETCH {uid_set} (UID X-GM-LABELS)");
+        match self.fetch_gmail_labels_command(session, &command).await {
+            Ok(label_exists) => {
+                if let Err(err) = self.drain_exists(session, label_exists).await {
+                    eprintln!("Gmail idle EXISTS handling error: {err:?}");
+                }
+            }
+            Err(err) => eprintln!("Gmail label refresh error: {err:?}"),
         }
     }
 
@@ -1725,7 +1782,7 @@ impl GmailInner {
     /// that announces another message on every pass from pinning us here; what
     /// is left over is picked up by the next IDLE cycle.
     async fn drain_exists(&self, session: &mut AsyncSession, initial: Option<u32>) -> Result<()> {
-        let mut pending = initial;
+        let mut pending = max_exists(initial, take_unsolicited_exists(session));
         for _ in 0..MAX_EXISTS_DRAIN_ROUNDS {
             let Some(count) = pending else {
                 break;
@@ -2405,6 +2462,29 @@ fn parse_envelope_date(envelope: &imap_proto::types::Envelope<'_>) -> Option<Off
         let ts = mailparse::dateparse(text).ok()?;
         OffsetDateTime::from_unix_timestamp(ts).ok()
     })
+}
+
+/// Take any EXISTS async-imap parked in its unsolicited-response channel.
+///
+/// Several async-imap entry points -- `Handle::done`, `noop`, the `fetch` and
+/// `list` streams -- do not surface untagged responses they were not asked
+/// for.  They push them into `Session::unsolicited_responses` instead, a
+/// bounded channel nothing in this backend reads, so an EXISTS that lands
+/// there is dropped and the mail it announces stays invisible until the next
+/// reconnect.  This is the backstop for the paths that still go through those
+/// entry points.
+///
+/// Only EXISTS is replayed.  An EXPUNGE arriving this way has lost its
+/// position relative to the FETCH responses it came in with, and applying it
+/// out of order would renumber the wrong messages -- worse than missing it.
+fn take_unsolicited_exists(session: &AsyncSession) -> Option<u32> {
+    let mut highest = None;
+    while let Ok(response) = session.unsolicited_responses.try_recv() {
+        if let UnsolicitedResponse::Exists(count) = response {
+            highest = max_exists(highest, Some(count));
+        }
+    }
+    highest
 }
 
 /// The higher of two observed EXISTS counts, if either is present.
