@@ -1,6 +1,7 @@
 /target
 
-# Debug builds write an IMAP protocol trace into the working directory.
+# Debug builds write a protocol trace into the working directory.
 gmail-log-*.log
+jmap-log-*.log
 
 .DS_Store

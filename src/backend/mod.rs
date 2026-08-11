@@ -13,6 +13,8 @@ use lettre::message::{
 };
 use std::sync::mpsc::Receiver;
 
+#[cfg(debug_assertions)]
+mod debug_log;
 pub mod gmail;
 pub mod jmap;
 pub mod mock;

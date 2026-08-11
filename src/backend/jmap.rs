@@ -42,8 +42,167 @@ const MAX_BODY_VALUE_BYTES: usize = 512 * 1024;
 const EVENT_IDLE_POLL: Duration = Duration::from_secs(45);
 const EVENT_RETRY_DELAY: Duration = Duration::from_secs(10);
 
+/// Debug builds trace the JMAP conversation into `jmap-log-<stamp>-<pid>.log`,
+/// the counterpart of the IMAP trace the Gmail backend writes.
+///
+/// jmap-client owns the HTTP layer and offers no hook to observe it, so the
+/// trace is written around the calls rather than underneath them: a `C->S` line
+/// with the JMAP method and its arguments, and an `S->C` line with what came
+/// back.  The credentials ride in the `Authorization` header, which never
+/// reaches the trace -- headers are not logged at all.  The two ways one could
+/// still slip through are covered explicitly: URLs are stripped of any userinfo
+/// they carry, and the account's secret is registered with the log, so a
+/// payload that contains it comes out redacted whatever produced it.
+#[cfg(debug_assertions)]
+mod debug_logging {
+    use crate::backend::debug_log::{DebugLog, LogKind, REDACTED};
+    use std::{fmt::Display, sync::Arc};
+
+    /// Scope for lines that belong to the account rather than to one request.
+    const SESSION_SCOPE: &str = "req#000";
+
+    fn logger() -> Option<Arc<DebugLog>> {
+        DebugLog::global(LogKind::Jmap).ok()
+    }
+
+    /// Register the account's password or token so it can never reach the
+    /// trace, whichever payload it might turn up in.
+    pub fn register_secret(secret: &str) {
+        if let Some(logger) = logger() {
+            logger.register_secret(secret);
+        }
+    }
+
+    /// Note something that is not tied to a single request.
+    pub fn log_session(payload: impl Display) {
+        if let Some(logger) = logger() {
+            logger.log_event(SESSION_SCOPE, "INFO", &payload.to_string());
+        }
+    }
+
+    /// Start tracing one JMAP method call.
+    pub fn request(method: &str, arguments: impl Display) -> JmapRequest {
+        let logger = logger();
+        let scope = match &logger {
+            Some(logger) => format!("req#{:03}", logger.allocate_connection_id()),
+            None => SESSION_SCOPE.to_owned(),
+        };
+        if let Some(logger) = &logger {
+            logger.log_event(&scope, "C->S", &format!("{method} {arguments}"));
+        }
+        JmapRequest {
+            logger,
+            scope,
+            method: method.to_owned(),
+        }
+    }
+
+    /// A JMAP method call in flight.
+    pub struct JmapRequest {
+        logger: Option<Arc<DebugLog>>,
+        scope: String,
+        method: String,
+    }
+
+    impl JmapRequest {
+        /// Record what the server made of the request, handing `result` back
+        /// untouched so call sites keep their usual error handling.
+        pub fn response<T, E: Display>(
+            &self,
+            result: Result<T, E>,
+            summary: impl FnOnce(&T) -> String,
+        ) -> Result<T, E> {
+            if let Some(logger) = &self.logger {
+                let payload = match &result {
+                    Ok(value) => format!("{} -> {}", self.method, summary(value)),
+                    Err(err) => format!("{} -> ERROR: {err}", self.method),
+                };
+                logger.log_event(&self.scope, "S->C", &payload);
+            }
+            result
+        }
+    }
+
+    /// Strip the credentials a URL may carry in its userinfo
+    /// (`https://user:password@host/...`) before it reaches the trace.
+    pub fn redact_url(url: &str) -> String {
+        let Some((scheme, rest)) = url.split_once("://") else {
+            return url.to_owned();
+        };
+        let (authority, path) = match rest.find('/') {
+            Some(index) => rest.split_at(index),
+            None => (rest, ""),
+        };
+        match authority.rsplit_once('@') {
+            Some((_, host)) => format!("{scheme}://{REDACTED}@{host}{path}"),
+            None => url.to_owned(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn redact_url_drops_userinfo() {
+            assert_eq!(
+                redact_url("https://user:s3cret@api.example.com/jmap/session"),
+                "https://***@api.example.com/jmap/session"
+            );
+        }
+
+        #[test]
+        fn redact_url_keeps_urls_without_credentials() {
+            let url = "https://api.fastmail.com/jmap/session";
+            assert_eq!(redact_url(url), url);
+        }
+
+        #[test]
+        fn redact_url_handles_userinfo_without_a_path() {
+            assert_eq!(
+                redact_url("https://user:s3cret@api.example.com"),
+                "https://***@api.example.com"
+            );
+        }
+
+        #[test]
+        fn redact_url_leaves_non_urls_alone() {
+            assert_eq!(redact_url("api.example.com"), "api.example.com");
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+mod debug_logging {
+    use std::fmt::Display;
+
+    pub struct JmapRequest;
+
+    pub fn register_secret(_secret: &str) {}
+
+    pub fn log_session(_payload: impl Display) {}
+
+    pub fn request(_method: &str, _arguments: impl Display) -> JmapRequest {
+        JmapRequest
+    }
+
+    impl JmapRequest {
+        pub fn response<T, E: Display>(
+            &self,
+            result: Result<T, E>,
+            _summary: impl FnOnce(&T) -> String,
+        ) -> Result<T, E> {
+            result
+        }
+    }
+
+    pub fn redact_url(url: &str) -> String {
+        url.to_owned()
+    }
+}
+
 /// Authentication parameters for connecting to a JMAP server.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum JmapAuth {
     Basic { username: String, password: String },
     Bearer { token: String },
@@ -54,6 +213,34 @@ impl JmapAuth {
         match self {
             JmapAuth::Basic { username, password } => Credentials::basic(username, password),
             JmapAuth::Bearer { token } => Credentials::bearer(token),
+        }
+    }
+
+    /// The secret itself, for handing to the debug log's scrubber.
+    fn secret(&self) -> &str {
+        match self {
+            JmapAuth::Basic { password, .. } => password,
+            JmapAuth::Bearer { token } => token,
+        }
+    }
+}
+
+/// Written out by hand rather than derived: the derived version would put the
+/// password or token into whatever is being formatted.
+impl std::fmt::Debug for JmapAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JmapAuth::Basic { username, .. } => write!(f, "Basic {{ username: {username:?} }}"),
+            JmapAuth::Bearer { .. } => write!(f, "Bearer"),
+        }
+    }
+}
+
+impl std::fmt::Display for JmapAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JmapAuth::Basic { username, .. } => write!(f, "Basic ({username})"),
+            JmapAuth::Bearer { .. } => write!(f, "Bearer"),
         }
     }
 }
@@ -191,6 +378,7 @@ impl MailBackend for JmapBackend {
             }
 
             if refresh_needed && let Err(err) = inner.refresh_current_mailbox().await {
+                debug_logging::log_session(format_args!("refresh after actions failed: {err:?}"));
                 eprintln!("JMAP refresh error after actions: {err:?}");
             }
         });
@@ -216,9 +404,11 @@ impl MailBackend for JmapBackend {
         let client = Arc::clone(&inner.client);
         let blob_id = blob_id.to_string();
         runtime.block_on(async move {
-            client
-                .download(&blob_id)
-                .await
+            let trace = debug_logging::request("Blob/download", format_args!("blobId={blob_id}"));
+            trace
+                .response(client.download(&blob_id).await, |blob| {
+                    format!("bytes={}", blob.len())
+                })
                 .with_context(|| format!("downloading JMAP blob {blob_id}"))
         })
     }
@@ -248,14 +438,27 @@ impl JmapInner {
             trusted_hosts,
         } = config;
 
+        // Registered before the first trace line is written, so the debug log
+        // can scrub the account's secret out of everything that follows.
+        debug_logging::register_secret(auth.secret());
+
         let mut builder = Client::new().credentials(auth.credentials());
         if !trusted_hosts.is_empty() {
             builder = builder.follow_redirects(trusted_hosts);
         }
 
-        let client = builder
-            .connect(&base_url)
-            .await
+        let trace = debug_logging::request(
+            "Session/get",
+            format_args!("url={} auth={auth}", debug_logging::redact_url(&base_url)),
+        );
+        let client = trace
+            .response(builder.connect(&base_url).await, |client| {
+                format!(
+                    "account={} api={}",
+                    client.default_account_id(),
+                    debug_logging::redact_url(client.session().api_url())
+                )
+            })
             .with_context(|| format!("connecting to JMAP server at {}", base_url))?;
 
         let client = Arc::new(client);
@@ -425,9 +628,14 @@ impl JmapInner {
                 .max_body_value_bytes(MAX_BODY_VALUE_BYTES);
         }
 
-        let mut response = request
-            .send_get_email()
-            .await
+        let trace = debug_logging::request(
+            "Email/get",
+            format_args!("id={jmap_id} properties=body maxBodyValueBytes={MAX_BODY_VALUE_BYTES}"),
+        );
+        let mut response = trace
+            .response(request.send_get_email().await, |response| {
+                format!("emails={}", response.list().len())
+            })
             .context("fetching message body")?;
 
         let email = response
@@ -501,25 +709,39 @@ impl JmapInner {
             .cloned();
 
         let draft_id = if let Some(drafts_id) = drafts_id {
-            let created = self
-                .client
-                .email_import(raw.clone(), [drafts_id.clone()], Some(["$draft"]), None)
-                .await
+            let trace = debug_logging::request(
+                "Email/import",
+                format_args!(
+                    "bytes={} mailboxIds=[{drafts_id}] keywords=[$draft]",
+                    raw.len()
+                ),
+            );
+            let created = trace
+                .response(
+                    self.client
+                        .email_import(raw.clone(), [drafts_id.clone()], Some(["$draft"]), None)
+                        .await,
+                    |email| format!("id={:?}", email.id()),
+                )
                 .context("importing draft for submission")?;
             created
                 .id()
                 .map(|id| id.to_string())
                 .ok_or_else(|| anyhow!("email import did not return an identifier"))?
         } else {
-            let created = self
-                .client
-                .email_import(
-                    raw.clone(),
-                    std::iter::empty::<String>(),
-                    None::<Vec<&str>>,
-                    None,
+            let trace = debug_logging::request("Email/import", format_args!("bytes={}", raw.len()));
+            let created = trace
+                .response(
+                    self.client
+                        .email_import(
+                            raw.clone(),
+                            std::iter::empty::<String>(),
+                            None::<Vec<&str>>,
+                            None,
+                        )
+                        .await,
+                    |email| format!("id={:?}", email.id()),
                 )
-                .await
                 .context("importing message for submission")?;
             created
                 .id()
@@ -527,23 +749,42 @@ impl JmapInner {
                 .ok_or_else(|| anyhow!("email import did not return an identifier"))?
         };
 
-        self.client
-            .email_submission_create(draft_id.clone(), self.identity.id.clone())
-            .await
+        let trace = debug_logging::request(
+            "EmailSubmission/set",
+            format_args!("create emailId={draft_id} identityId={}", self.identity.id),
+        );
+        trace
+            .response(
+                self.client
+                    .email_submission_create(draft_id.clone(), self.identity.id.clone())
+                    .await,
+                |_| "submitted".to_owned(),
+            )
             .context("creating JMAP email submission")?;
 
         if let Some(sent_id) = sent_id {
-            let _ = self
-                .client
-                .email_set_mailboxes(&draft_id, [sent_id])
-                .await
+            let trace = debug_logging::request(
+                "Email/set",
+                format_args!("update id={draft_id} mailboxIds=[{sent_id}] (Sent)"),
+            );
+            let _ = trace
+                .response(
+                    self.client.email_set_mailboxes(&draft_id, [sent_id]).await,
+                    |_| "updated".to_owned(),
+                )
                 .context("moving submitted message to Sent mailbox")?;
         }
 
-        let _ = self
-            .client
-            .email_set_keyword(&draft_id, "$draft", false)
-            .await;
+        let trace = debug_logging::request(
+            "Email/set",
+            format_args!("update id={draft_id} keywords/$draft=false"),
+        );
+        let _ = trace.response(
+            self.client
+                .email_set_keyword(&draft_id, "$draft", false)
+                .await,
+            |_| "updated".to_owned(),
+        );
 
         Ok(())
     }
@@ -562,9 +803,20 @@ impl JmapInner {
             .context("building draft message")?;
         let raw = email.formatted();
 
-        self.client
-            .email_import(raw, [drafts_id], Some(["$draft"]), None)
-            .await
+        let trace = debug_logging::request(
+            "Email/import",
+            format_args!(
+                "bytes={} mailboxIds=[{drafts_id}] keywords=[$draft]",
+                raw.len()
+            ),
+        );
+        trace
+            .response(
+                self.client
+                    .email_import(raw, [drafts_id], Some(["$draft"]), None)
+                    .await,
+                |email| format!("id={:?}", email.id()),
+            )
             .context("importing draft message")?;
 
         Ok(())
@@ -604,6 +856,7 @@ impl JmapInner {
                 }
                 let _ = poll_interval.tick().await;
                 if let Err(err) = self.refresh_current_mailbox().await {
+                    debug_logging::log_session(format_args!("background refresh failed: {err:?}"));
                     eprintln!("JMAP background refresh error: {err:?}");
                     break;
                 }
@@ -657,9 +910,15 @@ impl JmapInner {
 
         let jmap_id = self.lookup_message(message_id).await?;
 
-        self.client
-            .email_set_mailboxes(&jmap_id, [target_id])
-            .await
+        let trace = debug_logging::request(
+            "Email/set",
+            format_args!("update id={jmap_id} mailboxIds=[{target_id}] ({target})"),
+        );
+        trace
+            .response(
+                self.client.email_set_mailboxes(&jmap_id, [target_id]).await,
+                |_| "updated".to_owned(),
+            )
             .context("updating mailbox assignment")?;
 
         Ok(())
@@ -667,9 +926,17 @@ impl JmapInner {
 
     async fn set_keyword(&self, message_id: MessageId, keyword: &str, value: bool) -> Result<()> {
         let jmap_id = self.lookup_message(message_id).await?;
-        self.client
-            .email_set_keyword(&jmap_id, keyword, value)
-            .await
+        let trace = debug_logging::request(
+            "Email/set",
+            format_args!("update id={jmap_id} keywords/{keyword}={value}"),
+        );
+        trace
+            .response(
+                self.client
+                    .email_set_keyword(&jmap_id, keyword, value)
+                    .await,
+                |_| "updated".to_owned(),
+            )
             .with_context(|| format!("updating keyword {keyword}"))?;
         Ok(())
     }
@@ -887,9 +1154,14 @@ impl JmapInner {
         if position > 0 {
             query.position(position as i32);
         }
-        let mut query_response = request
-            .send_query_email()
-            .await
+        let trace = debug_logging::request(
+            "Email/query",
+            format_args!("mailbox={mailbox} position={position} limit={limit}"),
+        );
+        let mut query_response = trace
+            .response(request.send_query_email().await, |response| {
+                format!("total={:?} ids={}", response.total(), response.ids().len())
+            })
             .context("querying mailbox messages")?;
         let total = query_response
             .total()
@@ -920,9 +1192,14 @@ impl JmapInner {
             EmailProperty::Keywords,
             EmailProperty::HasAttachment,
         ]);
-        let mut response = request
-            .send_get_email()
-            .await
+        let trace = debug_logging::request(
+            "Email/get",
+            format_args!("mailbox={mailbox} ids={} properties=envelope", ids.len()),
+        );
+        let mut response = trace
+            .response(request.send_get_email().await, |response| {
+                format!("emails={}", response.list().len())
+            })
             .context("fetching mailbox messages")?;
 
         let mut email_map: HashMap<String, FetchedEmail> = response
@@ -959,9 +1236,14 @@ impl JmapInner {
             MailboxProperty::Role,
             MailboxProperty::TotalEmails,
         ]);
-        let mut response = request
-            .send_get_mailbox()
-            .await
+        let trace = debug_logging::request(
+            "Mailbox/get",
+            format_args!("properties=[id,name,role,totalEmails]"),
+        );
+        let mut response = trace
+            .response(request.send_get_mailbox().await, |response| {
+                format!("mailboxes={}", response.list().len())
+            })
             .context("fetching available mailboxes")?;
         let mailboxes = response.take_list();
         Ok(MailboxCache::from_mailboxes(mailboxes))
@@ -976,9 +1258,12 @@ impl JmapInner {
             IdentityProperty::Email,
             IdentityProperty::Name,
         ]);
-        let mut response = request
-            .send_get_identity()
-            .await
+        let trace =
+            debug_logging::request("Identity/get", format_args!("properties=[id,email,name]"));
+        let mut response = trace
+            .response(request.send_get_identity().await, |response| {
+                format!("identities={}", response.list().len())
+            })
             .context("fetching account identity")?;
         if let Some(identity) = response.take_list().into_iter().next() {
             let id = identity

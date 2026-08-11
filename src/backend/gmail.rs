@@ -53,186 +53,300 @@ use tokio_rustls::TlsConnector;
 
 #[cfg(debug_assertions)]
 mod debug_logging {
+    use crate::backend::debug_log::{DebugLog, LogKind, REDACTED};
     use std::{
-        fs::OpenOptions,
-        io::{self, BufWriter, IoSlice, Write},
+        borrow::Cow,
+        io::{self, IoSlice},
         pin::Pin,
-        sync::{
-            Arc, Mutex, OnceLock,
-            atomic::{AtomicUsize, Ordering},
-        },
+        sync::Arc,
         task::{Context, Poll},
     };
 
-    use anyhow::{Context as AnyhowContext, Result};
-    use chrono::{Local, Utc};
+    use anyhow::Result;
     use tokio::io::ReadBuf;
     use tokio::net::TcpStream;
     use tokio_rustls::client::TlsStream;
 
-    #[derive(Debug)]
-    pub struct GmailImapLogger {
-        file: Mutex<BufWriter<std::fs::File>>,
-        next_id: AtomicUsize,
+    /// How many bytes one direction may buffer before an unterminated line is
+    /// written out anyway.  Only a server that never sends a newline gets near
+    /// this; the cap is here to keep the buffer bounded.
+    const MAX_PENDING_BYTES: usize = 64 * 1024;
+
+    fn logger() -> Result<Arc<DebugLog>> {
+        DebugLog::global(LogKind::GmailImap)
     }
 
-    impl GmailImapLogger {
-        fn init() -> Result<Self> {
-            let now = Local::now();
-            let stamp = now.format("%Y-%m-%d-%H%M").to_string();
-            let pid = std::process::id();
-            let filename = format!("gmail-log-{stamp}-{pid}.log");
-            let path = std::env::current_dir()
-                .context("determining current directory for Gmail log file")?
-                .join(filename);
-
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .with_context(|| format!("opening Gmail debug log file at {}", path.display()))?;
-
-            let mut writer = BufWriter::new(file);
-            let header_time = now.format("%Y-%m-%d %H:%M:%S");
-            writeln!(
-                writer,
-                "# Gmail IMAP debug log started {header_time} local, pid {pid}"
-            )
-            .ok();
-
-            Ok(Self {
-                file: Mutex::new(writer),
-                next_id: AtomicUsize::new(1),
-            })
+    /// Register the account password so it can never reach the trace, no matter
+    /// which shape the protocol gives it.
+    pub fn register_secret(secret: &str) {
+        if let Ok(logger) = logger() {
+            logger.register_secret(secret);
         }
+    }
 
-        pub fn global() -> Result<Arc<Self>> {
-            static LOGGER: OnceLock<Arc<GmailImapLogger>> = OnceLock::new();
-            if let Some(logger) = LOGGER.get() {
-                return Ok(Arc::clone(logger));
+    pub fn log_backend_event(label: &str, payload: &str) {
+        if let Ok(logger) = logger() {
+            logger.log_event("conn#00", label, payload);
+        }
+    }
+
+    fn log_line(
+        logger: &DebugLog,
+        connection_id: usize,
+        direction: &str,
+        line: &str,
+        terminated: bool,
+    ) {
+        let scope = format!("conn#{connection_id:02}");
+        if terminated {
+            logger.log_event(&scope, direction, &format!("{line} <CRLF>"));
+        } else {
+            logger.log_event(&scope, direction, line);
+        }
+    }
+
+    /// Reassembles the byte chunks of one direction into protocol lines.
+    ///
+    /// A single write is not a protocol line: async-imap sends a command as
+    /// several writes -- the tag, a space, the command, the terminating CRLF --
+    /// and incoming TLS records break wherever they like.  Redaction that
+    /// inspects one chunk in isolation therefore never sees a complete `LOGIN`
+    /// command, which is exactly how passwords used to reach the trace in
+    /// clear text.  Buffering until the newline arrives hands the redactor
+    /// whole lines, and makes the log easier to read as a bonus.
+    #[derive(Debug, Default)]
+    struct LineAssembler {
+        pending: Vec<u8>,
+    }
+
+    impl LineAssembler {
+        /// Feed `data`, invoking `sink` once per line that is now complete.
+        fn push(&mut self, data: &[u8], mut sink: impl FnMut(&str, bool)) {
+            self.pending.extend_from_slice(data);
+            while let Some(index) = self.pending.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = self.pending.drain(..=index).collect();
+                let text = String::from_utf8_lossy(&line);
+                sink(text.trim_end_matches(['\r', '\n']), true);
             }
-
-            let logger = Arc::new(Self::init()?);
-            match LOGGER.set(Arc::clone(&logger)) {
-                Ok(()) => Ok(logger),
-                Err(_) => Ok(Arc::clone(
-                    LOGGER
-                        .get()
-                        .expect("Gmail IMAP logger should be present after set"),
-                )),
-            }
-        }
-
-        fn allocate_connection_id(&self) -> usize {
-            self.next_id.fetch_add(1, Ordering::AcqRel)
-        }
-
-        fn log_event(&self, connection_id: usize, label: &str, payload: &str) {
-            let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ");
-            if let Ok(mut writer) = self.file.lock() {
-                let _ = writeln!(
-                    writer,
-                    "{timestamp} conn#{connection_id:02} {label}: {payload}"
-                );
-                let _ = writer.flush();
+            if self.pending.len() >= MAX_PENDING_BYTES {
+                self.flush(sink);
             }
         }
 
-        fn log_data(&self, connection_id: usize, direction: &str, data: &[u8]) {
-            // Convert to UTF-8-friendly string, replacing invalid bytes.
-            let text = String::from_utf8_lossy(data);
-            for segment in text.split_inclusive('\n') {
-                let trimmed = segment.trim_end_matches(['\r', '\n']);
-                let redacted = Self::redact_credentials(trimmed);
-                let line = redacted.as_deref().unwrap_or(trimmed);
-                if segment.ends_with('\n') {
-                    let mut owned = line.to_owned();
-                    owned.push_str(" <CRLF>");
-                    self.log_event(connection_id, direction, &owned);
+        /// Write out whatever is buffered, e.g. when the connection is closing.
+        fn flush(&mut self, mut sink: impl FnMut(&str, bool)) {
+            if self.pending.is_empty() {
+                return;
+            }
+            let line = std::mem::take(&mut self.pending);
+            sink(&String::from_utf8_lossy(&line), false);
+        }
+    }
+
+    /// Tracks which parts of the IMAP conversation carry credentials.
+    ///
+    /// Mostly that is a per-line decision, but both ways of authenticating
+    /// spill onto the lines that follow: a `LOGIN` argument may be sent as a
+    /// literal, so its value arrives on the next line, and `AUTHENTICATE`
+    /// starts a SASL exchange in which the client's responses are bare base64
+    /// lines.
+    #[derive(Debug, Default)]
+    struct ImapRedactor {
+        /// Client lines still to be swallowed whole because a `LOGIN` literal
+        /// announced them.
+        pending_literal_lines: usize,
+        /// A SASL exchange is in progress: everything the client sends until
+        /// the server's tagged response is credential material.
+        sasl_active: bool,
+    }
+
+    impl ImapRedactor {
+        /// Redact one line the client sent.
+        fn client_line<'a>(&mut self, line: &'a str) -> Cow<'a, str> {
+            if self.pending_literal_lines > 0 {
+                self.pending_literal_lines -= 1;
+                // The continuation may end in another literal: `LOGIN {5+}`
+                // puts the user name on the next line, and the password can
+                // follow it as a second literal.
+                if ends_with_literal(line) {
+                    self.pending_literal_lines += 1;
+                }
+                return Cow::Borrowed(REDACTED);
+            }
+
+            if self.sasl_active {
+                // "*" aborts the exchange; anything else is a SASL response.
+                return if line.trim() == "*" {
+                    Cow::Borrowed(line)
                 } else {
-                    self.log_event(connection_id, direction, line);
+                    Cow::Borrowed(REDACTED)
+                };
+            }
+
+            match split_command(line) {
+                Some((command, args_start)) if command.eq_ignore_ascii_case("LOGIN") => {
+                    Cow::Owned(self.redact_login(line, args_start))
                 }
+                Some((command, args_start)) if command.eq_ignore_ascii_case("AUTHENTICATE") => {
+                    self.sasl_active = true;
+                    Cow::Owned(redact_authenticate(line, args_start))
+                }
+                _ => Cow::Borrowed(line),
             }
         }
 
-        /// Redact passwords from IMAP LOGIN commands.
-        pub(crate) fn redact_credentials(line: &str) -> Option<String> {
-            // IMAP LOGIN format: <tag> LOGIN <username> <password>
-            // The password is the last token — either a quoted string or a literal.
-            let upper = line.to_ascii_uppercase();
-            // Find "LOGIN " after the tag (first whitespace-delimited token).
-            let after_tag = upper.find(' ').map(|i| &upper[i + 1..])?;
-            if !after_tag.starts_with("LOGIN ") {
-                return None;
+        /// Follow the server side; only the end of a SASL exchange matters.
+        fn server_line(&mut self, line: &str) {
+            // A continuation ("+ ...") keeps the exchange going, every other
+            // response ends it.
+            if self.sasl_active && !line.starts_with('+') {
+                self.sasl_active = false;
             }
-            // Find the start of the LOGIN arguments in the original line.
-            let tag_end = line.find(' ')? + 1;
-            let args_start = tag_end + "LOGIN ".len();
-            let args = line.get(args_start..)?;
-            // Skip past the username (quoted or unquoted) to find the password.
-            let password_start = Self::skip_imap_token(args)?;
-            let prefix = &line[..args_start + password_start];
-            Some(format!("{prefix}\"***\""))
         }
 
-        /// Skip one IMAP token (quoted string or atom) and trailing whitespace.
-        /// Returns the byte offset where the next token begins.
-        fn skip_imap_token(s: &str) -> Option<usize> {
-            let trimmed = s.trim_start();
-            let leading = s.len() - trimmed.len();
-            if let Some(inner) = trimmed.strip_prefix('"') {
-                // Quoted string: find the closing quote (skipping escaped chars).
-                let mut chars = inner.char_indices();
-                loop {
-                    match chars.next() {
-                        Some((_, '\\')) => {
-                            chars.next();
-                        }
-                        Some((i, '"')) => {
-                            let token_end = 1 + i + 1;
-                            let trailing = trimmed[token_end..].len()
-                                - trimmed[token_end..].trim_start().len();
-                            return Some(leading + token_end + trailing);
-                        }
-                        Some(_) => {}
-                        None => return None,
+        /// Redact the arguments of `<tag> LOGIN <user> <password>`.
+        fn redact_login(&mut self, line: &str, args_start: usize) -> String {
+            let args = &line[args_start..];
+            // A literal moves the value onto the following line, so hide the
+            // rest of this one and swallow that line whole.
+            if ends_with_literal(args) {
+                self.pending_literal_lines = 1;
+                return format!("{}{REDACTED}", &line[..args_start]);
+            }
+            match skip_imap_token(args) {
+                // Everything after the user name is the password.
+                Some(password_start) => {
+                    format!("{}\"{REDACTED}\"", &line[..args_start + password_start])
+                }
+                // Unparseable arguments: drop all of them rather than gamble on
+                // where the password starts.
+                None => format!("{}{REDACTED}", &line[..args_start]),
+            }
+        }
+    }
+
+    /// Split `<tag> <command> <arguments>` into the command and the offset its
+    /// arguments start at.
+    fn split_command(line: &str) -> Option<(&str, usize)> {
+        let tag_end = line.find(' ')?;
+        let rest = &line[tag_end + 1..];
+        let command_end = rest.find(' ')?;
+        Some((&rest[..command_end], tag_end + 1 + command_end + 1))
+    }
+
+    /// `<tag> AUTHENTICATE <mechanism> [<initial response>]`: keep the
+    /// mechanism, drop the credentials that may ride along with it.
+    fn redact_authenticate(line: &str, args_start: usize) -> String {
+        let args = &line[args_start..];
+        match args.find(' ') {
+            Some(mechanism_end) => {
+                format!("{}{REDACTED}", &line[..args_start + mechanism_end + 1])
+            }
+            None => line.to_owned(),
+        }
+    }
+
+    /// Does the line end in a literal announcement (`{42}` or `{42+}`), meaning
+    /// the value itself arrives on the next line?
+    fn ends_with_literal(line: &str) -> bool {
+        let trimmed = line.trim_end();
+        let Some(inner) = trimmed.strip_suffix('}') else {
+            return false;
+        };
+        let Some(brace) = inner.rfind('{') else {
+            return false;
+        };
+        let digits = inner[brace + 1..].trim_end_matches('+');
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    }
+
+    /// Skip one IMAP token (quoted string or atom) and trailing whitespace.
+    /// Returns the byte offset where the next token begins.
+    fn skip_imap_token(s: &str) -> Option<usize> {
+        let trimmed = s.trim_start();
+        let leading = s.len() - trimmed.len();
+        if let Some(inner) = trimmed.strip_prefix('"') {
+            // Quoted string: find the closing quote (skipping escaped chars).
+            let mut chars = inner.char_indices();
+            loop {
+                match chars.next() {
+                    Some((_, '\\')) => {
+                        chars.next();
                     }
+                    Some((i, '"')) => {
+                        let token_end = 1 + i + 1;
+                        let trailing =
+                            trimmed[token_end..].len() - trimmed[token_end..].trim_start().len();
+                        return Some(leading + token_end + trailing);
+                    }
+                    Some(_) => {}
+                    None => return None,
                 }
-            } else {
-                // Atom: run until whitespace.
-                let end = trimmed.find(' ')?;
-                let trailing = trimmed[end..].len() - trimmed[end..].trim_start().len();
-                Some(leading + end + trailing)
             }
+        } else {
+            // Atom: run until whitespace.
+            let end = trimmed.find(' ')?;
+            let trailing = trimmed[end..].len() - trimmed[end..].trim_start().len();
+            Some(leading + end + trailing)
         }
     }
 
     #[derive(Debug)]
     pub struct LoggedTlsStream {
         inner: TlsStream<TcpStream>,
-        logger: Arc<GmailImapLogger>,
+        logger: Arc<DebugLog>,
         connection_id: usize,
+        outgoing: LineAssembler,
+        incoming: LineAssembler,
+        redactor: ImapRedactor,
     }
 
     impl LoggedTlsStream {
         pub fn new(inner: TlsStream<TcpStream>) -> Result<Self> {
-            let logger = GmailImapLogger::global()?;
+            let logger = logger()?;
             let connection_id = logger.allocate_connection_id();
-            logger.log_event(connection_id, "INFO", "IMAP connection established");
+            logger.log_event(
+                &format!("conn#{connection_id:02}"),
+                "INFO",
+                "IMAP connection established",
+            );
 
             Ok(Self {
                 inner,
                 logger,
                 connection_id,
+                outgoing: LineAssembler::default(),
+                incoming: LineAssembler::default(),
+                redactor: ImapRedactor::default(),
             })
         }
 
-        fn log_outgoing(&self, data: &[u8]) {
-            self.logger.log_data(self.connection_id, "C->S", data);
+        fn log_outgoing(&mut self, data: &[u8]) {
+            let Self {
+                logger,
+                connection_id,
+                outgoing,
+                redactor,
+                ..
+            } = self;
+            outgoing.push(data, |line, terminated| {
+                let line = redactor.client_line(line);
+                log_line(logger, *connection_id, "C->S", &line, terminated);
+            });
         }
 
-        fn log_incoming(&self, data: &[u8]) {
-            self.logger.log_data(self.connection_id, "S->C", data);
+        fn log_incoming(&mut self, data: &[u8]) {
+            let Self {
+                logger,
+                connection_id,
+                incoming,
+                redactor,
+                ..
+            } = self;
+            incoming.push(data, |line, terminated| {
+                redactor.server_line(line);
+                log_line(logger, *connection_id, "S->C", line, terminated);
+            });
         }
     }
 
@@ -240,8 +354,26 @@ mod debug_logging {
 
     impl Drop for LoggedTlsStream {
         fn drop(&mut self) {
-            self.logger
-                .log_event(self.connection_id, "INFO", "IMAP connection closed");
+            let Self {
+                logger,
+                connection_id,
+                outgoing,
+                incoming,
+                redactor,
+                ..
+            } = self;
+            outgoing.flush(|line, terminated| {
+                let line = redactor.client_line(line);
+                log_line(logger, *connection_id, "C->S", &line, terminated);
+            });
+            incoming.flush(|line, terminated| {
+                log_line(logger, *connection_id, "S->C", line, terminated);
+            });
+            logger.log_event(
+                &format!("conn#{connection_id:02}"),
+                "INFO",
+                "IMAP connection closed",
+            );
         }
     }
 
@@ -328,9 +460,142 @@ mod debug_logging {
         LoggedTlsStream::new(stream)
     }
 
-    pub fn log_backend_event(label: &str, payload: &str) {
-        if let Ok(logger) = GmailImapLogger::global() {
-            logger.log_event(0, label, payload);
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Push `writes` through the same assemble-then-redact pipeline
+        /// `log_outgoing` uses, and collect what would reach the log.
+        fn trace_client(writes: &[&str]) -> Vec<String> {
+            let mut assembler = LineAssembler::default();
+            let mut redactor = ImapRedactor::default();
+            let mut logged = Vec::new();
+            for write in writes {
+                assembler.push(write.as_bytes(), |line, _| {
+                    logged.push(redactor.client_line(line).into_owned());
+                });
+            }
+            assembler.flush(|line, _| logged.push(redactor.client_line(line).into_owned()));
+            logged
+        }
+
+        /// Split `data` into lines the way the logger does.
+        fn assemble(chunks: &[&str]) -> Vec<(String, bool)> {
+            let mut assembler = LineAssembler::default();
+            let mut lines = Vec::new();
+            for chunk in chunks {
+                assembler.push(chunk.as_bytes(), |line, terminated| {
+                    lines.push((line.to_owned(), terminated));
+                });
+            }
+            assembler.flush(|line, terminated| lines.push((line.to_owned(), terminated)));
+            lines
+        }
+
+        #[test]
+        fn redact_login_quoted() {
+            let logged = trace_client(&["A001 LOGIN \"user@example.com\" \"s3cret\"\r\n"]);
+            assert_eq!(logged[0], r#"A001 LOGIN "user@example.com" "***""#);
+        }
+
+        #[test]
+        fn redact_login_unquoted() {
+            let logged = trace_client(&["A001 LOGIN user@example.com mypassword\r\n"]);
+            assert_eq!(logged[0], r#"A001 LOGIN user@example.com "***""#);
+            assert!(!logged[0].contains("mypassword"));
+        }
+
+        #[test]
+        fn redact_login_case_insensitive() {
+            let logged = trace_client(&["tag login \"USER\" \"PASS\"\r\n"]);
+            assert_eq!(logged[0], r#"tag login "USER" "***""#);
+        }
+
+        #[test]
+        fn redact_ignores_non_login() {
+            assert_eq!(
+                trace_client(&["A002 SELECT INBOX\r\n"])[0],
+                "A002 SELECT INBOX"
+            );
+        }
+
+        #[test]
+        fn redact_login_with_escaped_quotes_in_username() {
+            let logged = trace_client(&["A001 LOGIN \"user\\\"name\" \"pass\"\r\n"]);
+            assert!(logged[0].contains(r#""***""#));
+            assert!(!logged[0].contains(r#""pass""#));
+        }
+
+        #[test]
+        fn redact_login_split_across_writes() {
+            // This is how the password used to reach the log: async-imap writes
+            // the tag, the separator, the command and the trailing CRLF
+            // separately, and no single write looks like a LOGIN command.
+            let logged = trace_client(&["A0001", " ", r#"LOGIN "user" "s3cret""#, " \r\n"]);
+
+            assert_eq!(logged.len(), 1);
+            assert_eq!(logged[0], r#"A0001 LOGIN "user" "***""#);
+            assert!(!logged[0].contains("s3cret"));
+        }
+
+        #[test]
+        fn redact_login_sent_as_literal() {
+            // `LOGIN {4+}` announces the arguments on the next line.
+            let logged = trace_client(&[
+                "A001 LOGIN {4+}\r\n",
+                "user \"s3cret\"\r\n",
+                "A002 NOOP\r\n",
+            ]);
+            assert_eq!(logged, vec!["A001 LOGIN ***", "***", "A002 NOOP"]);
+        }
+
+        #[test]
+        fn redact_login_with_password_as_second_literal() {
+            let logged = trace_client(&[
+                "A001 LOGIN {4+}\r\n",
+                "user {6+}\r\n",
+                "s3cret\r\n",
+                "A002 NOOP\r\n",
+            ]);
+            assert!(logged[..3].iter().all(|line| !line.contains("s3cret")));
+            assert_eq!(logged[3], "A002 NOOP");
+        }
+
+        #[test]
+        fn redact_authenticate_initial_response() {
+            let logged = trace_client(&["A001 AUTHENTICATE PLAIN AHVzZXIAcGFzc3dvcmQ=\r\n"]);
+            assert_eq!(logged[0], "A001 AUTHENTICATE PLAIN ***");
+        }
+
+        #[test]
+        fn redact_sasl_continuation_lines() {
+            let mut redactor = ImapRedactor::default();
+            assert_eq!(
+                redactor.client_line("A001 AUTHENTICATE XOAUTH2"),
+                "A001 AUTHENTICATE XOAUTH2"
+            );
+            // Everything the client sends now is credential material, until the
+            // server answers with something other than a continuation.
+            redactor.server_line("+");
+            assert_eq!(redactor.client_line("dXNlcj1yb2JAZXhhbXBsZS5jb20B"), "***");
+            redactor.server_line("A001 OK user authenticated");
+            assert_eq!(
+                redactor.client_line("A002 SELECT INBOX"),
+                "A002 SELECT INBOX"
+            );
+        }
+
+        #[test]
+        fn assembler_keeps_lines_whole_and_marks_terminators() {
+            let lines = assemble(&["* OK Gimap ready\r\n* CAPABILITY IMAP", "4rev1\r\npartial"]);
+            assert_eq!(
+                lines,
+                vec![
+                    ("* OK Gimap ready".to_owned(), true),
+                    ("* CAPABILITY IMAP4rev1".to_owned(), true),
+                    ("partial".to_owned(), false),
+                ]
+            );
         }
     }
 }
@@ -347,9 +612,11 @@ mod debug_logging {
     }
 
     pub fn log_backend_event(_label: &str, _payload: &str) {}
+
+    pub fn register_secret(_secret: &str) {}
 }
 
-use debug_logging::{LoggedTlsStream, log_backend_event, wrap_stream};
+use debug_logging::{LoggedTlsStream, log_backend_event, register_secret, wrap_stream};
 
 type AsyncSession = Session<LoggedTlsStream>;
 
@@ -630,6 +897,11 @@ impl GmailInner {
         if guard.is_some() {
             return Ok(());
         }
+
+        // Registered before the connection exists, so the debug log can scrub
+        // the password out of everything it writes -- whichever way the
+        // protocol, or a future version of async-imap, happens to frame it.
+        register_secret(&self.password);
 
         let tcp = TcpStream::connect((GMAIL_HOST, GMAIL_PORT))
             .await
@@ -2885,51 +3157,5 @@ mod tests {
         let (start, end) = state.next_backfill_range(10).unwrap();
         assert_eq!(end, 49);
         assert_eq!(start, 40);
-    }
-
-    // ---------------------------------------------------------------
-    //  Credential redaction in debug logger
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn redact_login_quoted() {
-        use debug_logging::GmailImapLogger;
-        let line = r#"A001 LOGIN "user@example.com" "s3cret""#;
-        let redacted = GmailImapLogger::redact_credentials(line).unwrap();
-        assert_eq!(redacted, r#"A001 LOGIN "user@example.com" "***""#);
-        assert!(!redacted.contains("s3cret"));
-    }
-
-    #[test]
-    fn redact_login_unquoted() {
-        use debug_logging::GmailImapLogger;
-        let line = "A001 LOGIN user@example.com mypassword";
-        let redacted = GmailImapLogger::redact_credentials(line).unwrap();
-        assert_eq!(redacted, r#"A001 LOGIN user@example.com "***""#);
-        assert!(!redacted.contains("mypassword"));
-    }
-
-    #[test]
-    fn redact_login_case_insensitive() {
-        use debug_logging::GmailImapLogger;
-        let line = r#"tag login "USER" "PASS""#;
-        let redacted = GmailImapLogger::redact_credentials(line).unwrap();
-        assert_eq!(redacted, r#"tag login "USER" "***""#);
-    }
-
-    #[test]
-    fn redact_ignores_non_login() {
-        use debug_logging::GmailImapLogger;
-        let line = "A001 SELECT INBOX";
-        assert!(GmailImapLogger::redact_credentials(line).is_none());
-    }
-
-    #[test]
-    fn redact_login_with_escaped_quotes_in_username() {
-        use debug_logging::GmailImapLogger;
-        let line = r#"A001 LOGIN "user\"name" "pass""#;
-        let redacted = GmailImapLogger::redact_credentials(line).unwrap();
-        assert!(redacted.contains(r#""***""#));
-        assert!(!redacted.contains(r#""pass""#));
     }
 }
