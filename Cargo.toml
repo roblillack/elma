@@ -28,15 +28,18 @@ async-imap = { version = "0.11", default-features = false, features = ["runtime-
 # handshake. See `tls_config` in src/backend/gmail.rs.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-webpki-roots = "0.26"
+# Certificates are checked against the operating system's trust store, the way
+# they were before rustls. Pinned to the version lettre uses so SMTP and IMAP
+# share one verifier rather than compiling two.
+rustls-platform-verifier = "0.6"
 futures = "0.3"
-jmap-client = "0.4"
+jmap-client = { version = "0.4.2", default-features = false, features = ["async", "websockets", "ring"] }
 mailparse = "0.16.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.9.8"
 imap-proto = "0.16"
-lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"] }
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls", "rustls-platform-verifier"] }
 shell-words = "1"
 tempfile = "3"
 mime_guess = "2"

@@ -30,6 +30,7 @@ use lettre::{
     transport::smtp::authentication::Credentials,
 };
 use mailparse::{self, DispositionType, MailHeaderMap, ParsedMail};
+use rustls_platform_verifier::ConfigVerifierExt;
 use std::{
     collections::{BTreeMap, HashMap},
     str,
@@ -368,25 +369,26 @@ const FETCH_MESSAGE_QUERY: &str = "(FLAGS INTERNALDATE RFC822.SIZE ENVELOPE UID 
 
 /// TLS settings shared by every connection to Gmail.
 ///
-/// Built once. The trust anchors do not change between connections, and a
-/// dropped IDLE session reconnects often enough that re-parsing them each time
-/// is pure waste.
+/// Certificates are checked against the operating system's trust store, so a CA
+/// the machine has been told to trust — a corporate TLS-inspecting proxy, an
+/// internal CA — works here, and one the machine has revoked stops working.
 ///
-/// Trust comes from the `webpki-roots` bundle rather than the operating system,
-/// so a certificate signed by a CA that only the OS knows about — a corporate
-/// TLS-inspecting proxy, an internal CA — is rejected here.
-fn tls_config() -> Arc<rustls::ClientConfig> {
+/// Built once. The trust store does not change between connections, and a
+/// dropped IDLE session reconnects often enough that loading it each time is
+/// pure waste. A failure is not cached: only a successful config is stored, so a
+/// platform that was briefly unable to answer gets asked again.
+fn tls_config() -> Result<Arc<rustls::ClientConfig>> {
     static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
 
-    Arc::clone(CONFIG.get_or_init(|| {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        )
-    }))
+    if let Some(config) = CONFIG.get() {
+        return Ok(Arc::clone(config));
+    }
+
+    let config = Arc::new(
+        rustls::ClientConfig::with_platform_verifier()
+            .context("loading the platform certificate store")?,
+    );
+    Ok(Arc::clone(CONFIG.get_or_init(|| config)))
 }
 
 /// Production backend that communicates with Gmail over IMAP.
@@ -632,7 +634,7 @@ impl GmailInner {
         let tcp = TcpStream::connect((GMAIL_HOST, GMAIL_PORT))
             .await
             .context("connecting to Gmail IMAP server")?;
-        let connector = TlsConnector::from(tls_config());
+        let connector = TlsConnector::from(tls_config()?);
         let server_name = rustls::pki_types::ServerName::try_from(GMAIL_HOST)
             .context("invalid TLS server name")?
             .to_owned();
@@ -2192,6 +2194,10 @@ mod tests {
     /// Nothing else in the suite opens a TLS connection, so a dependency that
     /// quietly switches on a second rustls crypto provider would otherwise get
     /// past CI and panic on the first handshake instead.
+    ///
+    /// The `Err` is ignored on purpose. A machine with no CA certificates
+    /// installed says nothing about this code, and the bug being guarded against
+    /// is a panic rather than a returned error.
     #[test]
     fn the_tls_settings_name_exactly_one_crypto_provider() {
         let _ = tls_config();
