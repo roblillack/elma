@@ -725,6 +725,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-imap",
+ "base64 0.22.1",
  "chrono",
  "crossterm 0.29.0",
  "futures",
@@ -737,7 +738,9 @@ dependencies = [
  "mailparse",
  "mime_guess",
  "ratatui",
+ "reqwest",
  "resvg",
+ "ring",
  "rustls",
  "rustls-platform-verifier",
  "serde",
@@ -750,6 +753,7 @@ dependencies = [
  "tokio-rustls",
  "toml",
  "unicode-width 0.2.3",
+ "url",
 ]
 
 [[package]]
