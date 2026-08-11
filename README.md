@@ -74,7 +74,7 @@ The split is not deliberate. The `jmap-client` library fixes the TLS settings it
 gives its HTTP stack, and the releases that do use the system store also force a
 cryptography provider that needs cmake and a C compiler to build — a build
 dependency Elma does without on purpose. The two should converge once that is
-resolved upstream.
+resolved upstream (tracking issue: https://github.com/stalwartlabs/jmap-client/issues/34).
 
 ### General use
 
