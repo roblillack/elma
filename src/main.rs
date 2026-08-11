@@ -24,6 +24,10 @@ use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
 const TICK_RATE: Duration = Duration::from_millis(100);
 
+/// Where a JMAP account looks for its session object when the configuration
+/// does not say.  FastMail is the provider this backend was written against.
+const DEFAULT_JMAP_SESSION_URL: &str = "https://api.fastmail.com/jmap/session";
+
 fn main() -> Result<()> {
     let args = std::env::args().skip(1);
     let mut demo_mode = false;
@@ -181,7 +185,8 @@ fn build_account_from_config(mut config: AccountConfig, index: usize) -> Result<
         "gmail" => {
             let username = config
                 .email
-                .ok_or_else(|| anyhow!("accounts[{index}].username missing for Gmail backend"))?;
+                .or(config.username)
+                .ok_or_else(|| anyhow!("accounts[{index}].email missing for Gmail backend"))?;
             let password = config
                 .password
                 .ok_or_else(|| anyhow!("accounts[{index}].password missing for Gmail backend"))?;
@@ -196,48 +201,104 @@ fn build_account_from_config(mut config: AccountConfig, index: usize) -> Result<
             Ok(AccountDescriptor::new(name, backend))
         }
         "jmap" => {
-            let username = config
-                .username
-                .take()
-                .or_else(|| config.email.clone())
-                .ok_or_else(|| anyhow!("accounts[{index}].username missing for JMAP backend"))?;
-            let auth = if let Some(token) = config.token.take() {
-                JmapAuth::Bearer { token }
-            } else {
-                let password = config.password.take().ok_or_else(|| {
-                    anyhow!("accounts[{index}].password or token missing for JMAP backend")
-                })?;
-                JmapAuth::Basic {
-                    username: username.clone(),
-                    password,
-                }
-            };
-            let mut base_url = config
-                .url
-                .take()
-                .unwrap_or_else(|| "https://api.fastmail.com/jmap/session".to_string());
-            normalize_fastmail_url(&mut base_url);
-            let mut trusted_hosts = config.redirect_hosts.take().unwrap_or_default();
-            if let Some(host) = url_host(&base_url) {
-                if !trusted_hosts
-                    .iter()
-                    .any(|existing| existing.eq_ignore_ascii_case(host))
-                {
-                    trusted_hosts.push(host.to_string());
-                }
-                extend_fastmail_hosts(host, &mut trusted_hosts);
-            }
-            let backend = JmapBackend::new(JmapConfig {
-                base_url,
-                auth,
-                trusted_hosts,
-            })
-            .with_context(|| format!("failed to initialize JMAP backend for {username}"))?;
+            let JmapSetup {
+                username,
+                config: jmap,
+            } = jmap_setup_from_config(&mut config, index)?;
+            let backend = JmapBackend::new(jmap)
+                .with_context(|| format!("failed to initialize JMAP backend for {username}"))?;
             let name = config.name.unwrap_or(username);
             Ok(AccountDescriptor::new(name, Arc::new(backend)))
         }
         other => Err(anyhow!("accounts[{index}]: unsupported backend '{other}'")),
     }
+}
+
+/// A JMAP account worked out from one `[[accounts]]` entry.
+///
+/// Safe to format: the credential it carries is inside [`JmapConfig`], whose
+/// `Debug` redacts it.
+#[derive(Debug)]
+struct JmapSetup {
+    /// Who we are logging in as, also the account's name unless one is given.
+    username: String,
+    config: JmapConfig,
+}
+
+/// Translate an `[[accounts]]` entry into the parameters the JMAP backend takes.
+///
+/// Kept apart from [`build_account_from_config`] so the mapping -- which
+/// endpoint, which credentials, which hosts a redirect may go to -- is testable
+/// without building a backend or touching the network.
+///
+/// Either credential works: `token` is sent as a bearer token, `password` as
+/// HTTP Basic.  A token wins if both are configured, since a server that issues
+/// tokens is the one that wants them.
+fn jmap_setup_from_config(config: &mut AccountConfig, index: usize) -> Result<JmapSetup> {
+    let username = config
+        .username
+        .take()
+        .or_else(|| config.email.clone())
+        .ok_or_else(|| anyhow!("accounts[{index}].username missing for JMAP backend"))?;
+
+    let mut base_url = config
+        .url
+        .take()
+        .unwrap_or_else(|| DEFAULT_JMAP_SESSION_URL.to_string());
+    normalize_fastmail_url(&mut base_url);
+    let host_is_fastmail = url_host(&base_url).is_some_and(is_fastmail_host);
+
+    let auth = if let Some(token) = config.token.take() {
+        JmapAuth::Bearer { token }
+    } else if let Some(password) = config.password.take() {
+        // FastMail's app-specific passwords cover IMAP, POP, SMTP, CalDAV and
+        // CardDAV, but not JMAP: every JMAP endpoint answers a Basic header with
+        // `401 Invalid Authorization header, not bearer` before it ever looks at
+        // the credentials, and advertises bearer as the only method it accepts
+        // (`.well-known/oauth-protected-resource/jmap/session`).  Letting the
+        // account through would trade this explanation for that bare 401 on the
+        // first folder load, so say it here instead.  Should FastMail start
+        // accepting Basic, this is the check to drop.
+        if host_is_fastmail {
+            return Err(anyhow!(
+                "accounts[{index}]: {base_url} is FastMail's JMAP API, which accepts API tokens \
+                 only, not passwords. App-specific passwords work for IMAP, POP, SMTP, CalDAV \
+                 and CardDAV, but not for JMAP. Create a token with the \"Mail\" scope under \
+                 Settings -> Privacy & Security -> Manage API tokens and configure it as \
+                 `token = \"...\"` in place of `password = \"...\"`."
+            ));
+        }
+        JmapAuth::Basic {
+            username: username.clone(),
+            password,
+        }
+    } else {
+        return Err(anyhow!(
+            "accounts[{index}].password or token missing for JMAP backend"
+        ));
+    };
+
+    let mut trusted_hosts = config.redirect_hosts.take().unwrap_or_default();
+    if let Some(host) = url_host(&base_url) {
+        if !trusted_hosts
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(host))
+        {
+            trusted_hosts.push(host.to_string());
+        }
+        if host_is_fastmail {
+            extend_fastmail_hosts(&mut trusted_hosts);
+        }
+    }
+
+    Ok(JmapSetup {
+        username,
+        config: JmapConfig {
+            base_url,
+            auth,
+            trusted_hosts,
+        },
+    })
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -253,6 +314,10 @@ struct Config {
 #[derive(Deserialize)]
 struct AccountConfig {
     name: Option<String>,
+    /// Which backend serves the account.  `backend` is accepted as well: both
+    /// spellings have been documented, and a configuration that names the wrong
+    /// one would otherwise fail to parse at all.
+    #[serde(alias = "backend")]
     r#type: String,
     email: Option<String>,
     password: Option<String>,
@@ -290,37 +355,49 @@ fn url_host(url: &str) -> Option<&str> {
     if host.is_empty() { None } else { Some(host) }
 }
 
-fn extend_fastmail_hosts(host: &str, list: &mut Vec<String>) {
-    if host.ends_with("fastmail.com") {
-        for candidate in [
-            "fastmail.com",
-            "www.fastmail.com",
-            "api.fastmail.com",
-            "jmap.fastmail.com",
-        ] {
-            if !list
-                .iter()
-                .any(|existing| existing.eq_ignore_ascii_case(candidate))
-            {
-                list.push(candidate.to_string());
-            }
+/// Whether `host` belongs to FastMail, rather than merely ending in something
+/// that reads like it (`notfastmail.com`).
+fn is_fastmail_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    host.eq_ignore_ascii_case("fastmail.com")
+        || host.to_ascii_lowercase().ends_with(".fastmail.com")
+}
+
+/// Add the hosts FastMail moves a session between, so the redirect policy lets
+/// them through.
+fn extend_fastmail_hosts(list: &mut Vec<String>) {
+    for candidate in [
+        "fastmail.com",
+        "www.fastmail.com",
+        "api.fastmail.com",
+        "jmap.fastmail.com",
+    ] {
+        if !list
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(candidate))
+        {
+            list.push(candidate.to_string());
         }
     }
 }
 
+/// Point the ways one might write down "FastMail" at the endpoint FastMail
+/// actually serves.  `jmap.fastmail.com` was retired -- it answers with a
+/// redirect to the marketing site -- so a configuration naming it is sent to
+/// `api.fastmail.com` rather than left to fail.
 fn normalize_fastmail_url(url: &mut String) {
     if url.eq_ignore_ascii_case("https://jmap.fastmail.com")
         || url.eq_ignore_ascii_case("https://jmap.fastmail.com/")
         || url.eq_ignore_ascii_case("https://jmap.fastmail.com/.well-known/jmap")
     {
-        *url = "https://api.fastmail.com/jmap/session".to_string();
+        *url = DEFAULT_JMAP_SESSION_URL.to_string();
         return;
     }
 
     if url.eq_ignore_ascii_case("https://api.fastmail.com")
         || url.eq_ignore_ascii_case("https://api.fastmail.com/")
     {
-        *url = "https://api.fastmail.com/jmap/session".to_string();
+        *url = DEFAULT_JMAP_SESSION_URL.to_string();
         return;
     }
 
@@ -331,6 +408,258 @@ fn normalize_fastmail_url(url: &mut String) {
     }
 
     if url.eq_ignore_ascii_case("api.fastmail.com") {
-        *url = "https://api.fastmail.com/jmap/session".to_string();
+        *url = DEFAULT_JMAP_SESSION_URL.to_string();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account(toml_source: &str) -> AccountConfig {
+        let config: Config = toml::from_str(toml_source).expect("configuration should parse");
+        config
+            .accounts
+            .expect("configuration should carry accounts")
+            .pop()
+            .expect("configuration should carry one account")
+    }
+
+    fn jmap_setup(toml_source: &str) -> Result<JmapSetup> {
+        jmap_setup_from_config(&mut account(toml_source), 0)
+    }
+
+    #[test]
+    fn jmap_password_authenticates_with_basic() {
+        let setup = jmap_setup(
+            r#"
+            [[accounts]]
+            type = "jmap"
+            username = "rob@example.com"
+            password = "s3cret"
+            url = "https://mail.example.com"
+            "#,
+        )
+        .expect("a password should be enough to set up a JMAP account");
+
+        assert_eq!(setup.username, "rob@example.com");
+        assert_eq!(setup.config.base_url, "https://mail.example.com");
+        assert_eq!(
+            format!("{:?}", setup.config.auth),
+            r#"Basic { username: "rob@example.com" }"#
+        );
+    }
+
+    /// The username the Basic header carries is the account's, not whatever the
+    /// server might infer from the endpoint.
+    #[test]
+    fn jmap_password_falls_back_to_the_email_address() {
+        let setup = jmap_setup(
+            r#"
+            [[accounts]]
+            type = "jmap"
+            email = "rob@example.com"
+            password = "s3cret"
+            url = "https://mail.example.com"
+            "#,
+        )
+        .expect("an email address should stand in for a username");
+
+        assert_eq!(setup.username, "rob@example.com");
+        assert_eq!(
+            format!("{:?}", setup.config.auth),
+            r#"Basic { username: "rob@example.com" }"#
+        );
+    }
+
+    #[test]
+    fn jmap_token_authenticates_with_bearer() {
+        let setup = jmap_setup(
+            r#"
+            [[accounts]]
+            type = "jmap"
+            username = "rob@fastmail.com"
+            token = "an-api-token"
+            "#,
+        )
+        .expect("a token should be enough to set up a JMAP account");
+
+        assert_eq!(format!("{:?}", setup.config.auth), "Bearer");
+        assert_eq!(setup.config.base_url, DEFAULT_JMAP_SESSION_URL);
+    }
+
+    #[test]
+    fn jmap_prefers_the_token_when_both_credentials_are_given() {
+        let setup = jmap_setup(
+            r#"
+            [[accounts]]
+            type = "jmap"
+            username = "rob@fastmail.com"
+            password = "s3cret"
+            token = "an-api-token"
+            "#,
+        )
+        .expect("a token should be usable alongside a password");
+
+        assert_eq!(format!("{:?}", setup.config.auth), "Bearer");
+    }
+
+    #[test]
+    fn jmap_without_a_credential_is_rejected() {
+        let error = jmap_setup(
+            r#"
+            [[accounts]]
+            type = "jmap"
+            username = "rob@example.com"
+            "#,
+        )
+        .expect_err("an account without a credential cannot connect");
+
+        assert!(
+            error.to_string().contains("password or token missing"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// FastMail's JMAP API only accepts bearer tokens, so an account configured
+    /// with a password is turned away at startup -- with the token to create
+    /// spelled out -- rather than on the first folder load.
+    #[test]
+    fn jmap_password_against_fastmail_explains_the_token() {
+        for url in [
+            None,
+            Some("https://api.fastmail.com/jmap/session"),
+            Some("https://jmap.fastmail.com/.well-known/jmap"),
+            Some("https://phl.api.fastmail.com/jmap/session"),
+        ] {
+            let mut source = String::from(
+                "[[accounts]]\ntype = \"jmap\"\nusername = \"rob@fastmail.com\"\npassword = \"s3cret\"\n",
+            );
+            if let Some(url) = url {
+                source.push_str(&format!("url = \"{url}\"\n"));
+            }
+
+            let error = jmap_setup(&source)
+                .expect_err("FastMail cannot be reached over JMAP with a password");
+            let message = error.to_string();
+            assert!(
+                message.contains("API token") && message.contains("token = "),
+                "unexpected error for {url:?}: {message}"
+            );
+        }
+    }
+
+    /// A server that is not FastMail is left to judge the password itself.
+    #[test]
+    fn jmap_password_against_a_lookalike_host_is_allowed() {
+        let setup = jmap_setup(
+            r#"
+            [[accounts]]
+            type = "jmap"
+            username = "rob@notfastmail.com"
+            password = "s3cret"
+            url = "https://jmap.notfastmail.com"
+            "#,
+        )
+        .expect("only FastMail's own hosts refuse Basic authentication");
+
+        assert!(format!("{:?}", setup.config.auth).starts_with("Basic"));
+    }
+
+    #[test]
+    fn jmap_trusts_the_endpoint_host_for_redirects() {
+        let setup = jmap_setup(
+            r#"
+            [[accounts]]
+            type = "jmap"
+            username = "rob@example.com"
+            password = "s3cret"
+            url = "https://mail.example.com/.well-known/jmap"
+            "#,
+        )
+        .expect("setup should succeed");
+
+        assert_eq!(setup.config.trusted_hosts, vec!["mail.example.com"]);
+    }
+
+    #[test]
+    fn jmap_trusts_the_hosts_fastmail_redirects_between() {
+        let setup = jmap_setup(
+            r#"
+            [[accounts]]
+            type = "jmap"
+            username = "rob@fastmail.com"
+            token = "an-api-token"
+            "#,
+        )
+        .expect("setup should succeed");
+
+        for host in ["api.fastmail.com", "www.fastmail.com", "jmap.fastmail.com"] {
+            assert!(
+                setup.config.trusted_hosts.iter().any(|h| h == host),
+                "{host} should be trusted: {:?}",
+                setup.config.trusted_hosts
+            );
+        }
+    }
+
+    /// Both key spellings have been documented for the backend selector.
+    #[test]
+    fn account_type_is_also_spelled_backend() {
+        assert_eq!(
+            account(
+                r#"
+                [[accounts]]
+                backend = "jmap"
+                username = "rob@example.com"
+                password = "s3cret"
+                "#,
+            )
+            .r#type,
+            "jmap"
+        );
+    }
+
+    #[test]
+    fn retired_fastmail_urls_are_pointed_at_the_current_endpoint() {
+        for candidate in [
+            "https://jmap.fastmail.com",
+            "https://jmap.fastmail.com/",
+            "https://jmap.fastmail.com/.well-known/jmap",
+            "https://api.fastmail.com",
+            "https://api.fastmail.com/",
+            "api.fastmail.com",
+        ] {
+            let mut url = candidate.to_string();
+            normalize_fastmail_url(&mut url);
+            assert_eq!(url, DEFAULT_JMAP_SESSION_URL, "for {candidate}");
+        }
+    }
+
+    #[test]
+    fn other_urls_only_lose_their_trailing_slash() {
+        let mut url = "https://mail.example.com/jmap/".to_string();
+        normalize_fastmail_url(&mut url);
+        assert_eq!(url, "https://mail.example.com/jmap");
+    }
+
+    #[test]
+    fn fastmail_hosts_are_told_apart_from_lookalikes() {
+        for host in ["fastmail.com", "api.fastmail.com", "PHL.API.FASTMAIL.COM"] {
+            assert!(is_fastmail_host(host), "{host} is FastMail");
+        }
+        for host in ["notfastmail.com", "fastmail.com.example.net", "example.com"] {
+            assert!(!is_fastmail_host(host), "{host} is not FastMail");
+        }
+    }
+
+    #[test]
+    fn url_host_ignores_scheme_and_path() {
+        assert_eq!(
+            url_host("https://mail.example.com/jmap/session"),
+            Some("mail.example.com")
+        );
+        assert_eq!(url_host("mail.example.com"), Some("mail.example.com"));
+        assert_eq!(url_host("https://"), None);
     }
 }
