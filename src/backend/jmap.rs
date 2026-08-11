@@ -272,7 +272,7 @@ impl JmapInner {
         for (index, data) in emails.into_iter().enumerate() {
             let (message_id, uid, is_new) = state.ensure_ids(&data.jmap_id);
             let seq = total.saturating_sub(start_position + index).max(1) as u32;
-            let message = build_message(message_id, uid, seq, &data, &mailbox_cache)?;
+            let message = build_message(message_id, uid, seq, &data, &mailbox_cache, mailbox)?;
 
             if is_new {
                 added_ids.push(message_id);
@@ -724,7 +724,7 @@ impl JmapInner {
                         continue;
                     }
                     let seq = total.saturating_sub(start_position + offset).max(1) as u32;
-                    match build_message(message_id, uid, seq, &data, &mailbox_cache) {
+                    match build_message(message_id, uid, seq, &data, &mailbox_cache, mailbox) {
                         Ok(message) => entries.push((
                             message_id,
                             StoredMessage {
@@ -1254,6 +1254,7 @@ fn build_message(
     seq: u32,
     data: &FetchedEmail,
     cache: &MailboxCache,
+    mailbox: MailboxKind,
 ) -> Result<Message> {
     let sent = data
         .sent_at
@@ -1285,13 +1286,23 @@ fn build_message(
         .iter()
         .any(|kw| kw.eq_ignore_ascii_case("$forwarded"));
 
+    // Every message listed in a mailbox is by definition part of it, so the
+    // mailbox that is currently open never earns a label of its own — only the
+    // *other* mailboxes a message belongs to carry information.  Matching by id
+    // rather than by name also keeps this working for servers that hand out
+    // localized mailbox names.
+    let current_mailbox_id = cache.id_for_kind(mailbox);
     let mut labels = Vec::new();
     for mailbox_id in &data.mailbox_ids {
+        if Some(mailbox_id) == current_mailbox_id {
+            continue;
+        }
         if let Some(name) = cache.name_for_id(mailbox_id) {
             labels.push(name.to_string());
         }
     }
     if starred
+        && mailbox != MailboxKind::Starred
         && !labels
             .iter()
             .any(|label| label.eq_ignore_ascii_case("Starred"))
@@ -1299,6 +1310,7 @@ fn build_message(
         labels.push("Starred".to_string());
     }
     if important
+        && mailbox != MailboxKind::Important
         && !labels
             .iter()
             .any(|label| label.eq_ignore_ascii_case("Important"))
@@ -1466,5 +1478,111 @@ fn kind_from_role(role: &MailboxRole) -> Option<MailboxKind> {
         MailboxRole::Trash => Some(MailboxKind::Trash),
         MailboxRole::Important => Some(MailboxKind::Important),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mailbox cache with the given `(id, name, kind)` entries; user mailboxes
+    /// pass `None` as their kind.
+    fn cache(entries: &[(&str, &str, Option<MailboxKind>)]) -> MailboxCache {
+        let mut by_id = HashMap::new();
+        let mut by_kind = HashMap::new();
+        for (id, name, kind) in entries {
+            by_id.insert(
+                (*id).to_string(),
+                MailboxInfo {
+                    name: (*name).to_string(),
+                    total_emails: 0,
+                },
+            );
+            if let Some(kind) = kind {
+                by_kind.insert(*kind, (*id).to_string());
+            }
+        }
+
+        MailboxCache {
+            by_id,
+            by_kind,
+            totals_override: HashMap::new(),
+        }
+    }
+
+    fn email(mailbox_ids: &[&str], keywords: &[&str]) -> FetchedEmail {
+        FetchedEmail {
+            jmap_id: "M1".to_string(),
+            from: vec!["someone@example.com".to_string()],
+            to: vec!["me@example.com".to_string()],
+            subject: "Hello".to_string(),
+            received_at: Some(0),
+            sent_at: Some(0),
+            size: 42,
+            mailbox_ids: mailbox_ids.iter().map(|id| (*id).to_string()).collect(),
+            keywords: keywords.iter().map(|kw| (*kw).to_string()).collect(),
+            has_attachments: false,
+        }
+    }
+
+    fn labels_in(mailbox: MailboxKind, data: &FetchedEmail, cache: &MailboxCache) -> Vec<String> {
+        build_message(1, 1, 1, data, cache, mailbox)
+            .expect("message builds")
+            .labels
+    }
+
+    fn standard_cache() -> MailboxCache {
+        cache(&[
+            ("mb-inbox", "Inbox", Some(MailboxKind::Inbox)),
+            ("mb-sent", "Sent", Some(MailboxKind::Sent)),
+            ("mb-archive", "Archive", Some(MailboxKind::Archive)),
+            ("mb-news", "Newsletters", None),
+        ])
+    }
+
+    #[test]
+    fn open_mailbox_is_not_repeated_as_a_label() {
+        let cache = standard_cache();
+
+        assert!(labels_in(MailboxKind::Inbox, &email(&["mb-inbox"], &[]), &cache).is_empty());
+        assert!(labels_in(MailboxKind::Sent, &email(&["mb-sent"], &[]), &cache).is_empty());
+    }
+
+    #[test]
+    fn other_mailboxes_stay_visible_as_labels() {
+        let cache = standard_cache();
+        let data = email(&["mb-inbox", "mb-news"], &[]);
+
+        assert_eq!(
+            labels_in(MailboxKind::Inbox, &data, &cache),
+            vec!["Newsletters".to_string()]
+        );
+        // Seen from the newsletter side the inbox is the interesting part.
+        assert_eq!(
+            labels_in(MailboxKind::Archive, &data, &cache),
+            vec!["Inbox".to_string(), "Newsletters".to_string()]
+        );
+    }
+
+    #[test]
+    fn localized_mailbox_names_are_matched_by_id() {
+        let cache = cache(&[("mb-sent", "Gesendet", Some(MailboxKind::Sent))]);
+
+        assert!(labels_in(MailboxKind::Sent, &email(&["mb-sent"], &[]), &cache).is_empty());
+    }
+
+    #[test]
+    fn starred_and_important_are_dropped_in_their_own_mailbox() {
+        let cache = standard_cache();
+        let data = email(&["mb-inbox"], &["$flagged", "$important"]);
+
+        assert_eq!(
+            labels_in(MailboxKind::Starred, &data, &cache),
+            vec!["Inbox".to_string(), "Important".to_string()]
+        );
+        assert_eq!(
+            labels_in(MailboxKind::Important, &data, &cache),
+            vec!["Inbox".to_string(), "Starred".to_string()]
+        );
     }
 }
