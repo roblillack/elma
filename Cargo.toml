@@ -33,7 +33,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # share one verifier rather than compiling two.
 rustls-platform-verifier = "0.6"
 futures = "0.3"
-jmap-client = { version = "0.4.2", default-features = false, features = ["async", "websockets", "ring"] }
+# Held at exactly 0.4.0 on purpose. 0.4.1+ ask reqwest for its `rustls` feature,
+# which forces the `aws-lc-rs` provider — that puts aws-lc-sys, cmake and a C
+# compiler back in the build and makes rustls panic on the ambiguous provider. A
+# plain "0.4" lets `cargo update` walk into it. See ISSUE.md.
+jmap-client = "=0.4.0"
 mailparse = "0.16.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde = { version = "1", features = ["derive"] }
