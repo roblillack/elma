@@ -15,11 +15,7 @@ use crate::{
     },
 };
 use anyhow::{Context, Result, anyhow};
-use async_imap::{
-    Session,
-    extensions::idle::IdleResponse,
-    types::{Fetch, Flag},
-};
+use async_imap::{Session, extensions::idle::IdleResponse, types::Flag};
 use futures::TryStreamExt;
 use imap_proto::types::{
     AttributeValue, BodyContentCommon, BodyContentSinglePart, BodyParams, BodyStructure,
@@ -840,7 +836,8 @@ impl MailBackend for GmailBackend {
                 }
             }
 
-            self.inner
+            let _ = self
+                .inner
                 .fetch_gmail_labels_command(session, &format!("UID FETCH {uid} (UID X-GM-LABELS)"))
                 .await?;
 
@@ -1025,12 +1022,12 @@ impl GmailInner {
             .as_mut()
             .ok_or_else(|| anyhow!("IMAP session is not available"))?;
 
-        let stored_messages = match self
+        let (stored_messages, fetch_exists) = match self
             .fetch_message_range(session, start, end)
             .await
             .with_context(|| format!("fetching backfill range {start}:{end}"))
         {
-            Ok(messages) => messages,
+            Ok(result) => result,
             Err(err) => {
                 drop(session_guard);
                 let _ = self.start_idle_loop().await;
@@ -1047,6 +1044,7 @@ impl GmailInner {
             }
         }
 
+        let mut label_exists = None;
         if to_emit_ids.is_empty() {
             cancel.store(true, Ordering::SeqCst);
         } else if !cancel.load(Ordering::SeqCst) {
@@ -1055,9 +1053,21 @@ impl GmailInner {
             } else {
                 format!("FETCH {start}:{end} (UID X-GM-LABELS)")
             };
-            if let Err(err) = self.fetch_gmail_labels_command(session, &command).await {
-                eprintln!("Gmail backfill label fetch error: {err:?}");
+            match self.fetch_gmail_labels_command(session, &command).await {
+                Ok(exists) => label_exists = exists,
+                Err(err) => eprintln!("Gmail backfill label fetch error: {err:?}"),
             }
+        }
+
+        // Process any EXISTS notifications observed during the FETCH commands.
+        let highest_exists = match (fetch_exists, label_exists) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        if let Some(count) = highest_exists
+            && let Err(err) = self.handle_exists(session, count).await
+        {
+            eprintln!("Gmail backfill EXISTS handling error: {err:?}");
         }
 
         drop(session_guard);
@@ -1130,7 +1140,7 @@ impl GmailInner {
                 .as_mut()
                 .ok_or_else(|| anyhow!("IMAP session is not available"))?;
 
-            let stored_messages = self
+            let (stored_messages, _) = self
                 .fetch_message_range(session, start, end)
                 .await
                 .context("fetching initial mailbox slice")?;
@@ -1152,7 +1162,7 @@ impl GmailInner {
                 } else {
                     format!("FETCH {start}:{end} (UID X-GM-LABELS)")
                 };
-                self.fetch_gmail_labels_command(session, &command).await?;
+                let _ = self.fetch_gmail_labels_command(session, &command).await?;
             }
         }
 
@@ -1175,9 +1185,9 @@ impl GmailInner {
         session: &mut AsyncSession,
         start: u32,
         end: u32,
-    ) -> Result<Vec<StoredMessage>> {
+    ) -> Result<(Vec<StoredMessage>, Option<u32>)> {
         if start == 0 || end == 0 || start > end {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
 
         let range = if start == end {
@@ -1186,16 +1196,45 @@ impl GmailInner {
             format!("{start}:{end}")
         };
 
-        let mut fetch_stream = session.fetch(&range, FETCH_MESSAGE_QUERY).await?;
-        let mut collected = Vec::new();
+        let command = format!("FETCH {range} {FETCH_MESSAGE_QUERY}");
+        let tag = session
+            .run_command(&command)
+            .await
+            .with_context(|| format!("issuing FETCH command for range {range}"))?;
 
-        while let Some(fetch) = fetch_stream.try_next().await? {
-            if let Some(stored) = build_message_from_fetch(&fetch)? {
-                collected.push(stored);
+        let mut collected = Vec::new();
+        let mut highest_exists: Option<u32> = None;
+
+        loop {
+            let Some(response) = session
+                .read_response()
+                .await
+                .context("reading FETCH response")?
+            else {
+                return Err(anyhow!("IMAP connection closed during FETCH"));
+            };
+
+            let parsed = response.parsed();
+            match parsed {
+                Response::Fetch(seq, attrs) => match build_message_from_attrs(*seq, attrs)? {
+                    Some(stored) => collected.push(stored),
+                    None => {
+                        let _ = self.handle_fetch_update(*seq, attrs).await?;
+                    }
+                },
+                Response::Expunge(seq) => {
+                    self.handle_expunge(*seq).await;
+                }
+                Response::MailboxData(MailboxDatum::Exists(count)) => {
+                    highest_exists =
+                        Some(highest_exists.map_or(*count, |prev: u32| prev.max(*count)));
+                }
+                Response::Done { tag: done_tag, .. } if done_tag == &tag => break,
+                _ => {}
             }
         }
 
-        Ok(collected)
+        Ok((collected, highest_exists))
     }
 
     /// Discover the Gmail archive and trash mailboxes so we can move messages later.
@@ -1293,12 +1332,14 @@ impl GmailInner {
         &self,
         session: &mut AsyncSession,
         command: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<u32>> {
         let command_text = command.to_string();
         let tag = session
             .run_command(&command_text)
             .await
             .with_context(|| format!("issuing command `{command_text}`"))?;
+
+        let mut highest_exists: Option<u32> = None;
 
         loop {
             let Some(response) = session
@@ -1321,14 +1362,14 @@ impl GmailInner {
                     self.handle_expunge(*seq).await;
                 }
                 Response::MailboxData(MailboxDatum::Exists(count)) => {
-                    let mut state = self.state.lock().await;
-                    state.set_expected_exists(*count);
+                    highest_exists =
+                        Some(highest_exists.map_or(*count, |prev: u32| prev.max(*count)));
                 }
                 _ => {}
             }
         }
 
-        Ok(())
+        Ok(highest_exists)
     }
 
     async fn send_via_smtp(self: Arc<Self>, outgoing: OutgoingMessage) -> Result<()> {
@@ -1664,7 +1705,7 @@ impl GmailInner {
     async fn handle_exists(&self, session: &mut AsyncSession, remote_count: u32) -> Result<()> {
         if let Some(range) = self.collect_new_messages(session, remote_count).await? {
             let command = format!("FETCH {range} (UID X-GM-LABELS)");
-            self.fetch_gmail_labels_command(session, &command).await?;
+            let _ = self.fetch_gmail_labels_command(session, &command).await?;
         }
         Ok(())
     }
@@ -1696,7 +1737,7 @@ impl GmailInner {
             format!("{start}:{remote_count}")
         };
 
-        let stored_messages = self
+        let (stored_messages, _) = self
             .fetch_message_range(session, start, remote_count)
             .await
             .with_context(|| format!("fetching new message range {range}"))?;
@@ -2108,40 +2149,56 @@ fn has_important_attribute(attrs: &[NameAttribute<'_>]) -> bool {
     })
 }
 
-fn build_message_from_fetch(fetch: &Fetch) -> Result<Option<StoredMessage>> {
-    let uid = fetch
-        .uid
-        .ok_or_else(|| anyhow!("missing UID in fetch response"))?;
-    let seq = fetch.message;
+fn build_message_from_attrs(
+    seq: u32,
+    attrs: &[AttributeValue<'_>],
+) -> Result<Option<StoredMessage>> {
+    let mut uid = None;
+    let mut envelope = None;
+    let mut flags_raw: Option<&Vec<std::borrow::Cow<'_, str>>> = None;
+    let mut internal_date_str: Option<&str> = None;
+    let mut size = 0u32;
+    let mut body_structure: Option<&BodyStructure<'_>> = None;
 
-    let envelope = match fetch.envelope() {
+    for attr in attrs {
+        match attr {
+            AttributeValue::Uid(u) => uid = Some(*u),
+            AttributeValue::Envelope(env) => envelope = Some(env.as_ref()),
+            AttributeValue::Flags(f) => flags_raw = Some(f),
+            AttributeValue::InternalDate(d) => internal_date_str = Some(d.as_ref()),
+            AttributeValue::Rfc822Size(s) => size = *s,
+            AttributeValue::BodyStructure(bs) => body_structure = Some(bs),
+            _ => {}
+        }
+    }
+
+    let uid = uid.ok_or_else(|| anyhow!("missing UID in fetch response"))?;
+
+    let envelope = match envelope {
         Some(env) => env,
         None => return Ok(None),
     };
 
     let sent = parse_envelope_date(envelope)
-        .or_else(|| fetch.internal_date().and_then(convert_internal_date))
+        .or_else(|| {
+            internal_date_str.and_then(|s| {
+                mailparse::dateparse(s)
+                    .ok()
+                    .and_then(|ts| OffsetDateTime::from_unix_timestamp(ts).ok())
+            })
+        })
         .unwrap_or_else(OffsetDateTime::now_utc);
 
     let sender = extract_sender(envelope);
     let recipients = extract_recipients(envelope);
     let subject = decode_header(envelope.subject.as_ref(), "Subject");
-    let size = fetch.size.unwrap_or_default() as usize;
-    let flags: Vec<_> = fetch.flags().collect();
 
-    let status = if flags.iter().any(|flag| matches!(flag, Flag::Seen)) {
-        MessageStatus::Read
-    } else {
-        MessageStatus::New
+    let (status, starred, answered, forwarded, important) = match flags_raw {
+        Some(flags) => summarize_flags_from_names(flags.iter().map(|s| s.as_ref())),
+        None => (MessageStatus::New, false, false, false, false),
     };
-    let starred = flags.iter().any(|flag| matches!(flag, Flag::Flagged));
-    let answered = flags.iter().any(|flag| matches!(flag, Flag::Answered));
-    let forwarded = flags.iter().any(|flag| matches!(flag, Flag::Custom(name) if name.eq_ignore_ascii_case("\\Forwarded") || name.eq_ignore_ascii_case("$Forwarded")));
-    let important = flags
-        .iter()
-        .any(|flag| matches!(flag, Flag::Custom(name) if name.eq_ignore_ascii_case("\\Important")));
-    let has_attachments = fetch
-        .bodystructure()
+
+    let has_attachments = body_structure
         .map(body_contains_attachment)
         .unwrap_or(false);
 
@@ -2151,7 +2208,7 @@ fn build_message_from_fetch(fetch: &Fetch) -> Result<Option<StoredMessage>> {
         sender,
         recipients,
         subject,
-        size,
+        size: size as usize,
         starred,
         important,
         answered,
@@ -2309,10 +2366,6 @@ fn parse_envelope_date(envelope: &imap_proto::types::Envelope<'_>) -> Option<Off
         let ts = mailparse::dateparse(text).ok()?;
         OffsetDateTime::from_unix_timestamp(ts).ok()
     })
-}
-
-fn convert_internal_date(dt: chrono::DateTime<chrono::FixedOffset>) -> Option<OffsetDateTime> {
-    OffsetDateTime::from_unix_timestamp(dt.timestamp()).ok()
 }
 
 fn decode_header(value: Option<&std::borrow::Cow<'_, [u8]>>, field_name: &str) -> String {
