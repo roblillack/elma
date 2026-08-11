@@ -664,6 +664,15 @@ impl JmapInner {
     }
 
     async fn start_backfill_if_needed(self: &Arc<Self>, mailbox: MailboxKind) -> Result<()> {
+        // `refresh_current_mailbox` picks its mailbox before a network round-trip
+        // and cannot be cancelled, so it can arrive here after the user has moved
+        // on.  Returning early keeps it from stopping the backfill the new folder
+        // just started -- there is one handle slot, so that backfill would be
+        // forgotten rather than paused -- and from downloading the folder we left.
+        if self.current_mailbox() != mailbox {
+            return Ok(());
+        }
+
         let more_available = {
             let mut state = self.state.lock().await;
             if state.highest_received_index < state.current_sequence.len() {
