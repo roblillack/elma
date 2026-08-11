@@ -216,6 +216,51 @@ struct MailboxLoaderState {
     receiver: Receiver<MailboxLoadUpdate>,
 }
 
+/// How far along a background mailbox load is, in the terms the overlay uses.
+///
+/// Deliberately coarser than what the backend knows: everything from opening
+/// the socket to receiving the first batch of headers is one wait as far as the
+/// user is concerned, because [`MailBackend::load_mailbox`] does not report back
+/// until it has all of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LoadPhase {
+    /// First contact with this account: opening a socket, authenticating and
+    /// asking for the mailbox. On a cold start this is nearly all of the wait.
+    Connecting,
+    /// A folder being opened on an account that is already up.  Distinct from
+    /// [`Self::Connecting`] because saying "connecting" on every folder switch
+    /// reads as though the session were being dropped and rebuilt each time,
+    /// which is not what happens: the socket stays put and only the mailbox
+    /// changes.  True whether or not the backend has to quietly re-establish a
+    /// stale session underneath, because it describes the request, not the
+    /// transport.
+    Opening,
+    /// The mailbox size is known and headers are arriving.
+    Receiving { loaded: usize, total: usize },
+    /// The load ended without producing anything; the message is the reason.
+    Failed(String),
+}
+
+/// A mailbox load the user is waiting on, described well enough to explain the
+/// wait while the message list is still empty.
+pub(crate) struct LoadingState {
+    pub(crate) phase: LoadPhase,
+    started: Instant,
+}
+
+impl LoadingState {
+    pub(crate) fn in_phase(phase: LoadPhase) -> Self {
+        Self {
+            phase,
+            started: Instant::now(),
+        }
+    }
+
+    pub(crate) fn elapsed(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+}
+
 /// What the UI does with a message body once the worker delivers it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MessageLoadPurpose {
@@ -337,6 +382,18 @@ pub struct AccountState {
     commit_progress: Option<CommitProgress>,
     mailbox_loader: Option<MailboxLoaderState>,
     mailbox_load_progress: Option<CommitProgress>,
+    /// What the in-flight load is doing, for the overlay that explains the wait.
+    /// Outlives `mailbox_loader` on failure so the reason stays on screen.
+    loading: Option<LoadingState>,
+    /// Whether a load has ever populated this account, so switching to one that
+    /// failed on startup can retry rather than showing a permanently empty list.
+    loaded: bool,
+    /// Whether the backend has ever answered for this account, which is the
+    /// point from which there is a session to reuse.  Earlier than `loaded`:
+    /// that one waits for the whole mailbox, this one only for the first sign
+    /// the server is there, which is what decides whether the next load is a
+    /// connect or just a folder change.
+    connected: bool,
     /// Message body being fetched for this account, if any.
     message_loader: Option<MessageLoadOperation>,
     scheduled_actions: Vec<Action>,
@@ -1448,78 +1505,52 @@ impl ShortcutItem {
 }
 impl App {
     /// Build the application state around the configured accounts.
+    /// Build the application state and start loading every account.
+    ///
+    /// Nothing here touches the network.  Each account begins empty with its
+    /// inbox load already running on its own thread, so the caller can put a
+    /// frame on screen immediately and the accounts connect in parallel instead
+    /// of one after another.  Until a load reports back, the account shows the
+    /// overlay from [`Self::loading_overlay`] rather than an empty list.
     pub fn new(descriptors: Vec<AccountDescriptor>) -> Result<Self> {
         if descriptors.is_empty() {
             return Err(anyhow!("no accounts configured"));
         }
 
-        let mut accounts = Vec::with_capacity(descriptors.len());
-
-        for descriptor in descriptors {
-            let backend = descriptor.backend;
-            let account_name = descriptor.name;
-            let (mut snapshot, events) = backend
-                .load_inbox()
-                .with_context(|| format!("failed to load inbox for account {}", account_name))?;
-            snapshot.messages.sort_by_key(|msg| msg.seq);
-
-            let mut messages = Vec::new();
-            if snapshot.total > 0 {
-                ensure_placeholder_capacity(&mut messages, snapshot.total);
-            }
-            for message in snapshot.messages {
-                if message.seq == 0 {
-                    messages.push(message);
-                    continue;
+        let accounts = descriptors
+            .into_iter()
+            .map(|descriptor| {
+                // Replaced by the loader's channel once the mailbox is up; until
+                // then a disconnected receiver just yields no events.
+                let (_tx, placeholder_rx) = std::sync::mpsc::channel();
+                AccountState {
+                    name: descriptor.name,
+                    backend: descriptor.backend,
+                    mailbox: MailboxState {
+                        messages: Vec::new(),
+                        selected: None,
+                        events: placeholder_rx,
+                        event_count: 0,
+                        status_line: None,
+                        scroll_top: 0,
+                    },
+                    message_view: None,
+                    commit_batches: VecDeque::new(),
+                    commit_progress: None,
+                    mailbox_loader: None,
+                    mailbox_load_progress: None,
+                    loading: None,
+                    loaded: false,
+                    connected: false,
+                    message_loader: None,
+                    scheduled_actions: Vec::new(),
+                    current_mailbox: MailboxKind::Inbox,
+                    search: None,
                 }
-                let index = message.seq.saturating_sub(1) as usize;
-                ensure_placeholder_capacity(&mut messages, index + 1);
-                messages[index] = message;
-            }
+            })
+            .collect::<Vec<_>>();
 
-            let selected = last_loaded_index(&messages).or_else(|| {
-                if messages.is_empty() {
-                    None
-                } else {
-                    Some(messages.len() - 1)
-                }
-            });
-
-            let total = messages.len();
-            let loaded = loaded_message_count(&messages);
-            let initial_load_progress = if loaded < total {
-                Some(CommitProgress {
-                    total,
-                    completed: loaded,
-                })
-            } else {
-                None
-            };
-
-            accounts.push(AccountState {
-                name: account_name,
-                backend,
-                mailbox: MailboxState {
-                    messages,
-                    selected,
-                    events,
-                    event_count: 0,
-                    status_line: None,
-                    scroll_top: 0,
-                },
-                message_view: None,
-                commit_batches: VecDeque::new(),
-                commit_progress: None,
-                mailbox_loader: None,
-                mailbox_load_progress: initial_load_progress,
-                message_loader: None,
-                scheduled_actions: Vec::new(),
-                current_mailbox: MailboxKind::Inbox,
-                search: None,
-            });
-        }
-
-        Ok(Self {
+        let mut app = Self {
             accounts,
             active_account: 0,
             compose: None,
@@ -1529,7 +1560,13 @@ impl App {
             save_attachment: None,
             outgoing: None,
             needs_full_redraw: false,
-        })
+        };
+
+        for index in 0..app.accounts.len() {
+            app.begin_mailbox_load_for(index, MailboxKind::Inbox, None)?;
+        }
+
+        Ok(app)
     }
 
     /// Whether the screen has to be repainted from scratch, clearing the request.
@@ -1790,8 +1827,32 @@ impl App {
         }
     }
 
+    /// Run `f` with `index` as the active account, restoring it afterwards.
+    ///
+    /// The mailbox helpers all reach their state through `Deref`, which resolves
+    /// to whichever account is active.  Pointing that at a background account
+    /// for the duration of an update reuses them as they are, rather than
+    /// growing an index-taking twin of each one that could drift.
+    fn with_account<T>(&mut self, index: usize, f: impl FnOnce(&mut Self) -> T) -> T {
+        let previous = self.active_account;
+        self.active_account = index;
+        let result = f(self);
+        self.active_account = previous;
+        result
+    }
+
     fn begin_mailbox_load(&mut self, target: MailboxKind, status: Option<String>) -> Result<()> {
-        let backend = Arc::clone(&self.current_account().backend);
+        self.begin_mailbox_load_for(self.active_account, target, status)
+    }
+
+    /// Start loading `target` for the account at `index` on a worker thread.
+    fn begin_mailbox_load_for(
+        &mut self,
+        index: usize,
+        target: MailboxKind,
+        status: Option<String>,
+    ) -> Result<()> {
+        let backend = Arc::clone(&self.accounts[index].backend);
         let status_for_finish = status.clone();
         let (sender, receiver) = std::sync::mpsc::channel();
 
@@ -1823,12 +1884,20 @@ impl App {
         });
 
         {
-            let account = self.current_account_mut();
+            let account = &mut self.accounts[index];
             account.mailbox_loader = Some(MailboxLoaderState { receiver });
             account.mailbox_load_progress = Some(CommitProgress {
                 total: PROGRESS_SEGMENTS,
                 completed: 0,
             });
+            // An account the backend has already answered for is connected, so
+            // this is a folder being opened rather than a session being built.
+            let phase = if account.connected {
+                LoadPhase::Opening
+            } else {
+                LoadPhase::Connecting
+            };
+            account.loading = Some(LoadingState::in_phase(phase));
             // A body still arriving for the mailbox we are leaving is of no use.
             account.message_loader = None;
             account.message_view = None;
@@ -1878,6 +1947,13 @@ impl App {
         let name = self.name.clone();
         let mailbox = self.current_mailbox;
         self.mailbox.status_line = Some(format!("Switched to {name} ({mailbox})."));
+
+        // An account whose startup load failed would otherwise stay empty for
+        // the rest of the session; arriving on it is the natural cue to retry.
+        if !self.loaded && self.mailbox_loader.is_none() {
+            self.begin_mailbox_load(mailbox, None)?;
+        }
+
         Ok(())
     }
 
@@ -2056,7 +2132,20 @@ impl App {
         }
     }
 
+    /// Drain loader updates for every account, not just the visible one.
+    ///
+    /// All accounts load at once on startup, and the ones in the background have
+    /// to finish on their own so that switching to them lands on a ready mailbox.
     fn poll_mailbox_loader(&mut self) {
+        for index in 0..self.accounts.len() {
+            if self.accounts[index].mailbox_loader.is_none() {
+                continue;
+            }
+            self.with_account(index, |app| app.poll_active_mailbox_loader());
+        }
+    }
+
+    fn poll_active_mailbox_loader(&mut self) {
         loop {
             let update = {
                 let Some(loader) = self.mailbox_loader.as_mut() else {
@@ -2068,6 +2157,12 @@ impl App {
                     Err(TryRecvError::Disconnected) => {
                         self.mailbox_loader = None;
                         self.mailbox_load_progress = None;
+                        // The worker died without reporting; say so in the
+                        // overlay too, or an empty list is all that is left.
+                        if let Some(loading) = self.loading.as_mut() {
+                            loading.phase =
+                                LoadPhase::Failed("the loader stopped unexpectedly".to_string());
+                        }
                         self.mailbox
                             .status_line
                             .get_or_insert_with(|| "Mailbox load interrupted.".to_string());
@@ -2090,6 +2185,9 @@ impl App {
         match update {
             MailboxLoadUpdate::Started { total } => {
                 let current = self.current_mailbox;
+                // The backend got far enough to answer, so there is a session
+                // from here on and the next folder change is not a reconnect.
+                self.connected = true;
                 self.mailbox.messages.clear();
                 if total > 0 {
                     ensure_placeholder_capacity(&mut self.mailbox.messages, total);
@@ -2105,6 +2203,12 @@ impl App {
                     .get_or_insert(CommitProgress { total, completed });
                 progress.total = total;
                 progress.completed = completed;
+                if let Some(loading) = self.loading.as_mut() {
+                    loading.phase = LoadPhase::Receiving {
+                        loaded: completed,
+                        total,
+                    };
+                }
                 self.mailbox.status_line =
                     Some(format!("Loading {current}: {completed}/{total} messages"));
             }
@@ -2128,6 +2232,12 @@ impl App {
                     }
                     progress.completed = completed;
                 }
+                if let Some(loading) = self.loading.as_mut() {
+                    loading.phase = LoadPhase::Receiving {
+                        loaded: completed,
+                        total: total_len,
+                    };
+                }
 
                 if let Some(last_loaded) = last_loaded_index(&self.mailbox.messages) {
                     self.mailbox.selected = Some(last_loaded);
@@ -2146,6 +2256,8 @@ impl App {
             MailboxLoadUpdate::Finished { events, status } => {
                 self.mailbox.events = events;
                 self.mailbox_loader = None;
+                self.loading = None;
+                self.loaded = true;
                 let loaded = loaded_message_count(&self.mailbox.messages);
                 let total = self.mailbox.messages.len();
                 if loaded < total {
@@ -2173,6 +2285,11 @@ impl App {
                 let target = self.current_mailbox;
                 self.mailbox_loader = None;
                 self.mailbox_load_progress = None;
+                // Kept rather than cleared: with no messages to fall back on,
+                // the overlay is the only place the reason is readable in full.
+                if let Some(loading) = self.loading.as_mut() {
+                    loading.phase = LoadPhase::Failed(message.clone());
+                }
                 self.mailbox.status_line = Some(format!("Failed to load {target}: {message}"));
             }
         }
@@ -2635,6 +2752,26 @@ impl App {
 
     pub(crate) fn compose_status_line(&self) -> Option<&str> {
         self.compose.as_ref().and_then(|state| state.status())
+    }
+
+    /// The load the user is waiting on, while there is nothing else to look at.
+    ///
+    /// Returns `None` the moment the list has a real message in it: once the
+    /// mailbox is readable, the remaining progress belongs in the status bar
+    /// rather than over the top of what the user came to read.  This covers the
+    /// cold start, switching accounts and switching mailboxes alike, because all
+    /// three go through [`Self::begin_mailbox_load_for`].
+    pub(crate) fn loading_overlay(&self) -> Option<(&str, MailboxKind, &LoadingState)> {
+        let loading = self.loading.as_ref()?;
+        if self
+            .mailbox
+            .messages
+            .iter()
+            .any(|msg| !msg.is_placeholder())
+        {
+            return None;
+        }
+        Some((self.name.as_str(), self.current_mailbox, loading))
     }
 
     /// Label and elapsed time of the message body loading in the background.
@@ -5709,6 +5846,9 @@ mod tests {
             commit_progress: None,
             mailbox_loader: None,
             mailbox_load_progress: None,
+            loading: None,
+            loaded: true,
+            connected: true,
             message_loader: None,
             scheduled_actions: vec![],
             current_mailbox: MailboxKind::Inbox,
@@ -7547,5 +7687,261 @@ mod tests {
 
         release.send(()).expect("release the backend");
         pump_until(&mut app, "compose to open", |app| app.compose.is_some());
+    }
+
+    /// Backend whose mailbox load parks until the test releases it.
+    ///
+    /// Stands in for the real cost of connecting and authenticating, which is
+    /// what startup used to wait for one account at a time.
+    struct SlowLoadBackend {
+        gate: Mutex<mpsc::Receiver<()>>,
+        started: Arc<std::sync::atomic::AtomicUsize>,
+        fail: bool,
+    }
+
+    impl SlowLoadBackend {
+        fn new(fail: bool) -> (Arc<Self>, mpsc::Sender<()>) {
+            let (tx, rx) = mpsc::channel();
+            let backend = Arc::new(Self {
+                gate: Mutex::new(rx),
+                started: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                fail,
+            });
+            (backend, tx)
+        }
+
+        /// How many loads have entered the backend, released or not.
+        fn started(&self) -> usize {
+            self.started.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl MailBackend for SlowLoadBackend {
+        fn load_mailbox(
+            &self,
+            _mailbox: MailboxKind,
+        ) -> anyhow::Result<(MailboxSnapshot, mpsc::Receiver<BackendEvent>)> {
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = self.gate.lock().unwrap().recv();
+            if self.fail {
+                anyhow::bail!("could not reach the server");
+            }
+            let (_tx, rx) = mpsc::channel();
+            Ok((
+                MailboxSnapshot {
+                    total: 1,
+                    messages: vec![make_message(1, MessageStatus::New)],
+                },
+                rx,
+            ))
+        }
+
+        fn load_message(&self, _message_id: MessageId) -> anyhow::Result<MessageContent> {
+            unimplemented!()
+        }
+
+        fn apply_actions(
+            &self,
+            _actions: Vec<Action>,
+        ) -> anyhow::Result<mpsc::Receiver<ActionStatus>> {
+            let (_tx, rx) = mpsc::channel();
+            Ok(rx)
+        }
+
+        fn send_message(&self, _message: OutgoingMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn save_draft(&self, _message: OutgoingMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Spin until `predicate` holds, without pumping the app.
+    fn spin_until(what: &str, mut predicate: impl FnMut() -> bool) {
+        for _ in 0..400 {
+            if predicate() {
+                return;
+            }
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[test]
+    fn startup_does_not_wait_for_the_accounts_to_connect() {
+        let (backend, release) = SlowLoadBackend::new(false);
+        // Returns while the backend is still parked inside load_mailbox: the
+        // terminal can be set up and a first frame drawn before any account is
+        // reachable.
+        let app = App::new(vec![AccountDescriptor::new("Work", backend.clone())]).expect("app");
+
+        let (name, mailbox, state) = app
+            .loading_overlay()
+            .expect("an account that has not connected yet must explain itself");
+        assert_eq!(name, "Work");
+        assert_eq!(mailbox, MailboxKind::Inbox);
+        assert_eq!(state.phase, LoadPhase::Connecting);
+
+        release.send(()).expect("release the backend");
+    }
+
+    #[test]
+    fn every_account_connects_at_once() {
+        let (first, release_first) = SlowLoadBackend::new(false);
+        let (second, release_second) = SlowLoadBackend::new(false);
+
+        let app = App::new(vec![
+            AccountDescriptor::new("First", first.clone()),
+            AccountDescriptor::new("Second", second.clone()),
+        ])
+        .expect("app");
+
+        // Both are inside load_mailbox while neither has been released, so the
+        // second account did not have to wait out the first.
+        spin_until("both accounts to start loading", || {
+            first.started() == 1 && second.started() == 1
+        });
+        assert!(app.loading_overlay().is_some());
+
+        release_first.send(()).expect("release first");
+        release_second.send(()).expect("release second");
+    }
+
+    #[test]
+    fn the_overlay_gives_way_to_the_first_messages() {
+        let (backend, release) = SlowLoadBackend::new(false);
+        let mut app = App::new(vec![AccountDescriptor::new("Work", backend.clone())]).expect("app");
+
+        release.send(()).expect("release the backend");
+        pump_until(&mut app, "the inbox to arrive", |app| {
+            app.loading_overlay().is_none()
+        });
+
+        // The overlay lifts on the first batch of messages rather than on the
+        // end of the load, so the list is readable while the rest arrives.
+        assert!(
+            app.mailbox.messages.iter().any(|msg| !msg.is_placeholder()),
+            "the overlay may only go once there is something to read"
+        );
+
+        pump_until(&mut app, "the load to finish", |app| app.loaded);
+        assert!(
+            app.loading.is_none(),
+            "a finished load leaves nothing behind"
+        );
+    }
+
+    #[test]
+    fn a_background_account_finishes_without_being_looked_at() {
+        let (visible, release_visible) = SlowLoadBackend::new(false);
+        let (background, release_background) = SlowLoadBackend::new(false);
+
+        let mut app = App::new(vec![
+            AccountDescriptor::new("Visible", visible.clone()),
+            AccountDescriptor::new("Background", background.clone()),
+        ])
+        .expect("app");
+
+        release_visible.send(()).expect("release visible");
+        release_background.send(()).expect("release background");
+
+        // The second account is never selected, so only a poll that covers every
+        // account will ever complete it.
+        pump_until(&mut app, "the background account to load", |app| {
+            app.accounts[1].loaded
+        });
+        assert!(
+            app.accounts[1]
+                .mailbox
+                .messages
+                .iter()
+                .any(|msg| !msg.is_placeholder()),
+            "switching to it later must land on a ready mailbox"
+        );
+    }
+
+    #[test]
+    fn switching_to_an_account_that_is_still_loading_explains_the_wait() {
+        let (ready, release_ready) = SlowLoadBackend::new(false);
+        let (slow, release_slow) = SlowLoadBackend::new(false);
+
+        let mut app = App::new(vec![
+            AccountDescriptor::new("Ready", ready.clone()),
+            AccountDescriptor::new("Slow", slow.clone()),
+        ])
+        .expect("app");
+
+        release_ready.send(()).expect("release ready");
+        pump_until(&mut app, "the first account to load", |app| {
+            app.loading_overlay().is_none()
+        });
+
+        app.switch_account(1).expect("switch");
+
+        let (name, _, state) = app
+            .loading_overlay()
+            .expect("landing on an account that is still connecting must say so");
+        assert_eq!(name, "Slow");
+        assert_eq!(state.phase, LoadPhase::Connecting);
+
+        release_slow.send(()).expect("release slow");
+        pump_until(&mut app, "the second account to load", |app| {
+            app.loading_overlay().is_none()
+        });
+    }
+
+    #[test]
+    fn switching_mailbox_explains_the_wait_until_messages_arrive() {
+        let (backend, release) = SlowLoadBackend::new(false);
+        let mut app = App::new(vec![AccountDescriptor::new("Work", backend.clone())]).expect("app");
+
+        release.send(()).expect("release the inbox load");
+        pump_until(&mut app, "the inbox to arrive", |app| {
+            app.loading_overlay().is_none()
+        });
+
+        // The backend gates every load, so this one parks the same way.
+        app.switch_mailbox(MailboxKind::Archive).expect("switch");
+
+        let (_, mailbox, state) = app
+            .loading_overlay()
+            .expect("an empty list mid-switch must explain itself");
+        assert_eq!(mailbox, MailboxKind::Archive);
+        // Not `Connecting`: the session from the inbox load is still up, and
+        // claiming otherwise reads as though every folder switch reconnected.
+        assert_eq!(state.phase, LoadPhase::Opening);
+
+        release.send(()).expect("release the archive load");
+        pump_until(&mut app, "the archive to arrive", |app| {
+            app.loading_overlay().is_none()
+        });
+    }
+
+    #[test]
+    fn a_failed_load_says_why_where_there_is_room_to_read_it() {
+        let (backend, release) = SlowLoadBackend::new(true);
+        let mut app = App::new(vec![AccountDescriptor::new("Work", backend.clone())]).expect("app");
+
+        release.send(()).expect("release the backend");
+        pump_until(&mut app, "the load to fail", |app| {
+            matches!(
+                app.loading_overlay().map(|(_, _, state)| &state.phase),
+                Some(LoadPhase::Failed(_))
+            )
+        });
+
+        let (_, _, state) = app
+            .loading_overlay()
+            .expect("the reason must stay on screen");
+        let LoadPhase::Failed(reason) = &state.phase else {
+            panic!("expected a failure phase");
+        };
+        assert!(
+            reason.contains("could not reach the server"),
+            "the overlay has to carry the backend's reason, got {reason:?}"
+        );
+        assert!(!app.loaded, "a failed load must not count as loaded");
     }
 }

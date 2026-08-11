@@ -198,9 +198,10 @@ impl LeafPart<'_> {
 ///
 /// # Design Notes
 ///
-/// * `load_inbox` produces both the initial message list and a channel that streams
+/// * `load_mailbox` produces both the initial message list and a channel that streams
 ///   [`BackendEvent`] updates.  This ensures there is a single source of truth for
-///   mailbox mutations.
+///   mailbox mutations.  It is called from a worker thread and may block for as
+///   long as connecting and authenticating take.
 /// * `load_message`, `send_message`, `save_draft` and `fetch_attachment_blob` are
 ///   blocking calls that the UI always makes from a worker thread, never from the
 ///   event loop.  They may take as long as the network does, and two of them (or
@@ -217,7 +218,7 @@ impl LeafPart<'_> {
 /// use elma_rs::model::{Action, ActionType, MessageId};
 /// # struct DemoBackend;
 /// # impl MailBackend for DemoBackend {
-/// #     fn load_inbox(&self) -> anyhow::Result<(MailboxSnapshot, std::sync::mpsc::Receiver<_>)> {
+/// #     fn load_mailbox(&self, _kind: elma_rs::model::MailboxKind) -> anyhow::Result<(MailboxSnapshot, std::sync::mpsc::Receiver<_>)> {
 /// #         unimplemented!()
 /// #     }
 /// #     fn load_message(&self, _id: MessageId) -> anyhow::Result<_> { unimplemented!() }
@@ -238,10 +239,6 @@ pub trait MailBackend: Send + Sync {
         mailbox: MailboxKind,
     ) -> Result<(MailboxSnapshot, Receiver<BackendEvent>)>;
 
-    /// Load the default inbox and return a channel that streams [`BackendEvent`] updates.
-    fn load_inbox(&self) -> Result<(MailboxSnapshot, Receiver<BackendEvent>)> {
-        self.load_mailbox(MailboxKind::Inbox)
-    }
     /// Load the full content for a single message.
     ///
     /// Called from a worker thread, so blocking here is expected.

@@ -69,18 +69,52 @@ pub struct JmapConfig {
 /// Production backend that communicates with FastMail (or any other JMAP
 /// provider) over HTTPS.
 pub struct JmapBackend {
-    inner: Arc<JmapInner>,
+    runtime: Arc<Runtime>,
+    config: JmapConfig,
+    /// Connected session, built on first use rather than at construction.
+    inner: Mutex<Option<Arc<JmapInner>>>,
 }
 
 impl JmapBackend {
     /// Create a new backend instance bound to `config`.
+    ///
+    /// Nothing is sent over the network here: fetching the JMAP session object,
+    /// the mailbox list and the identity all wait until the first call that
+    /// needs them.  Constructing an account is what the startup path does before
+    /// it can draw anything, so it has to stay off the network -- see
+    /// [`Self::inner`].
     pub fn new(config: JmapConfig) -> Result<Self> {
         let runtime =
             Arc::new(Runtime::new().context("failed to create Tokio runtime for JMAP backend")?);
 
-        let inner = runtime.block_on(JmapInner::initialize(runtime.clone(), config))?;
+        Ok(Self {
+            runtime,
+            config,
+            inner: Mutex::new(None),
+        })
+    }
 
-        Ok(Self { inner })
+    /// The connected session, connecting on the first call.
+    ///
+    /// Every trait method goes through here, and all of them are called from
+    /// worker threads, so blocking on the connection is expected.  The lock is
+    /// held across the connect so that two threads racing to be first produce
+    /// one session rather than two; the loser waits and gets the same one.
+    fn inner(&self) -> Result<Arc<JmapInner>> {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(inner) = guard.as_ref() {
+            return Ok(Arc::clone(inner));
+        }
+
+        let inner = self
+            .runtime
+            .block_on(JmapInner::initialize(
+                Arc::clone(&self.runtime),
+                self.config.clone(),
+            ))
+            .with_context(|| format!("connecting to JMAP server at {}", self.config.base_url))?;
+        *guard = Some(Arc::clone(&inner));
+        Ok(inner)
     }
 }
 
@@ -90,10 +124,11 @@ impl MailBackend for JmapBackend {
         mailbox: MailboxKind,
     ) -> Result<(MailboxSnapshot, mpsc::Receiver<BackendEvent>)> {
         let (sender, receiver) = mpsc::channel();
+        let inner = self.inner()?;
 
-        let snapshot = self.inner.runtime.block_on(async {
-            self.inner.set_current_mailbox(mailbox);
-            self.inner.stop_backfill().await;
+        let snapshot = inner.runtime.block_on(async {
+            inner.set_current_mailbox(mailbox);
+            inner.stop_backfill().await;
 
             // The new channel only goes live once the previous mailbox's
             // backfill is gone.  Installing it earlier hands that backfill's
@@ -101,20 +136,19 @@ impl MailBackend for JmapBackend {
             // sequence numbers from the *old* mailbox -- to the folder we are
             // switching to.
             {
-                let mut guard = self.inner.events.lock().unwrap();
+                let mut guard = inner.events.lock().unwrap();
                 *guard = Some(sender);
             }
 
-            let sync = self
-                .inner
+            let sync = inner
                 .sync_mailbox(mailbox)
                 .await
                 .context("loading mailbox contents")?;
-            self.inner
+            inner
                 .start_event_loop()
                 .await
                 .context("starting JMAP event loop")?;
-            self.inner
+            inner
                 .start_backfill_if_needed(mailbox)
                 .await
                 .context("starting JMAP backfill")?;
@@ -129,15 +163,14 @@ impl MailBackend for JmapBackend {
     }
 
     fn load_message(&self, message_id: MessageId) -> Result<MessageContent> {
-        self.inner
-            .runtime
-            .block_on(self.inner.load_message(message_id))
+        let inner = self.inner()?;
+        inner.runtime.block_on(inner.load_message(message_id))
     }
 
     fn apply_actions(&self, actions: Vec<Action>) -> Result<mpsc::Receiver<ActionStatus>> {
         let (tx, rx) = mpsc::channel();
-        let runtime = Arc::clone(&self.inner.runtime);
-        let inner = Arc::clone(&self.inner);
+        let inner = self.inner()?;
+        let runtime = Arc::clone(&inner.runtime);
 
         runtime.spawn(async move {
             let mut refresh_needed = false;
@@ -166,20 +199,21 @@ impl MailBackend for JmapBackend {
     }
 
     fn send_message(&self, message: OutgoingMessage) -> Result<()> {
-        let runtime = Arc::clone(&self.inner.runtime);
-        let inner = Arc::clone(&self.inner);
+        let inner = self.inner()?;
+        let runtime = Arc::clone(&inner.runtime);
         runtime.block_on(async move { inner.send_message(message).await })
     }
 
     fn save_draft(&self, message: OutgoingMessage) -> Result<()> {
-        let runtime = Arc::clone(&self.inner.runtime);
-        let inner = Arc::clone(&self.inner);
+        let inner = self.inner()?;
+        let runtime = Arc::clone(&inner.runtime);
         runtime.block_on(async move { inner.save_draft(message).await })
     }
 
     fn fetch_attachment_blob(&self, blob_id: &str) -> Result<Vec<u8>> {
-        let runtime = Arc::clone(&self.inner.runtime);
-        let client = Arc::clone(&self.inner.client);
+        let inner = self.inner()?;
+        let runtime = Arc::clone(&inner.runtime);
+        let client = Arc::clone(&inner.client);
         let blob_id = blob_id.to_string();
         runtime.block_on(async move {
             client
