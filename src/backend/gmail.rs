@@ -20,7 +20,6 @@ use async_imap::{
     extensions::idle::IdleResponse,
     types::{Fetch, Flag},
 };
-use async_native_tls::connect as tls_connect;
 use futures::TryStreamExt;
 use imap_proto::types::{
     AttributeValue, BodyContentCommon, BodyContentSinglePart, BodyParams, BodyStructure,
@@ -31,11 +30,12 @@ use lettre::{
     transport::smtp::authentication::Credentials,
 };
 use mailparse::{self, DispositionType, MailHeaderMap, ParsedMail};
+use rustls_platform_verifier::ConfigVerifierExt;
 use std::{
     collections::{BTreeMap, HashMap},
     str,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -49,6 +49,7 @@ use tokio::{
     sync::{Mutex as AsyncMutex, oneshot},
     task::JoinHandle,
 };
+use tokio_rustls::TlsConnector;
 
 #[cfg(debug_assertions)]
 mod debug_logging {
@@ -64,10 +65,10 @@ mod debug_logging {
     };
 
     use anyhow::{Context as AnyhowContext, Result};
-    use async_native_tls::TlsStream;
     use chrono::{Local, Utc};
     use tokio::io::ReadBuf;
     use tokio::net::TcpStream;
+    use tokio_rustls::client::TlsStream;
 
     #[derive(Debug)]
     pub struct GmailImapLogger {
@@ -336,8 +337,8 @@ mod debug_logging {
 
 #[cfg(not(debug_assertions))]
 mod debug_logging {
-    use async_native_tls::TlsStream;
     use tokio::net::TcpStream;
+    use tokio_rustls::client::TlsStream;
 
     pub type LoggedTlsStream = TlsStream<TcpStream>;
 
@@ -365,6 +366,30 @@ const MAX_PART_DEPTH: usize = 5;
 const INITIAL_FETCH_LIMIT: u32 = 100;
 const BACKFILL_BATCH_SIZE: u32 = 100;
 const FETCH_MESSAGE_QUERY: &str = "(FLAGS INTERNALDATE RFC822.SIZE ENVELOPE UID BODYSTRUCTURE)";
+
+/// TLS settings shared by every connection to Gmail.
+///
+/// Certificates are checked against the operating system's trust store, so a CA
+/// the machine has been told to trust — a corporate TLS-inspecting proxy, an
+/// internal CA — works here, and one the machine has revoked stops working.
+///
+/// Built once. The trust store does not change between connections, and a
+/// dropped IDLE session reconnects often enough that loading it each time is
+/// pure waste. A failure is not cached: only a successful config is stored, so a
+/// platform that was briefly unable to answer gets asked again.
+fn tls_config() -> Result<Arc<rustls::ClientConfig>> {
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+
+    if let Some(config) = CONFIG.get() {
+        return Ok(Arc::clone(config));
+    }
+
+    let config = Arc::new(
+        rustls::ClientConfig::with_platform_verifier()
+            .context("loading the platform certificate store")?,
+    );
+    Ok(Arc::clone(CONFIG.get_or_init(|| config)))
+}
 
 /// Production backend that communicates with Gmail over IMAP.
 ///
@@ -609,7 +634,12 @@ impl GmailInner {
         let tcp = TcpStream::connect((GMAIL_HOST, GMAIL_PORT))
             .await
             .context("connecting to Gmail IMAP server")?;
-        let tls_stream = tls_connect(GMAIL_HOST, tcp)
+        let connector = TlsConnector::from(tls_config()?);
+        let server_name = rustls::pki_types::ServerName::try_from(GMAIL_HOST)
+            .context("invalid TLS server name")?
+            .to_owned();
+        let tls_stream = connector
+            .connect(server_name, tcp)
             .await
             .context("starting TLS handshake with Gmail")?;
         let tls_stream = wrap_stream(tls_stream).context("enabling Gmail IMAP debug logging")?;
@@ -2160,6 +2190,18 @@ mod tests {
     use super::*;
     use imap_proto::types::{ContentDisposition, ContentEncoding, ContentType};
     use std::borrow::Cow;
+
+    /// Nothing else in the suite opens a TLS connection, so a dependency that
+    /// quietly switches on a second rustls crypto provider would otherwise get
+    /// past CI and panic on the first handshake instead.
+    ///
+    /// The `Err` is ignored on purpose. A machine with no CA certificates
+    /// installed says nothing about this code, and the bug being guarded against
+    /// is a panic rather than a returned error.
+    #[test]
+    fn the_tls_settings_name_exactly_one_crypto_provider() {
+        let _ = tls_config();
+    }
 
     fn make_message(id: u64, seq: u32) -> StoredMessage {
         let message = Message {

@@ -56,6 +56,26 @@ If no configuration is found the client falls back to the mock backend so you
 can continue exploring the UI without network access. New mock messages arrive
 every few seconds to keep the inbox active.
 
+### Server certificates
+
+The backends do not currently agree on where trust comes from. It only shows on
+a server whose certificate chains to a CA that your machine knows about but the
+public root list does not — a corporate TLS-inspecting proxy, or an internal CA.
+
+- `gmail` (IMAP and SMTP) checks certificates against your operating system's
+  trust store, so a CA you or your administrator installed is trusted here, and
+  one the system distrusts is not.
+- `jmap` checks against a copy of the Mozilla root list compiled into the binary
+  and never consults the system store. A certificate from a publicly trusted CA
+  works normally; an internally issued one is refused even though the rest of
+  your system accepts it.
+
+The split is not deliberate. The `jmap-client` library fixes the TLS settings it
+gives its HTTP stack, and the releases that do use the system store also force a
+cryptography provider that needs cmake and a C compiler to build — a build
+dependency Elma does without on purpose. The two should converge once that is
+resolved upstream (tracking issue: https://github.com/stalwartlabs/jmap-client/issues/34).
+
 ### General use
 
 Elma presents a terminal-based email client interface with a focus on keyboard navigation and
