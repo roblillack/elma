@@ -1879,7 +1879,10 @@ impl App {
                 });
             }
             Err(err) => {
-                let _ = sender.send(MailboxLoadUpdate::Failed(err.to_string()));
+                // `{:#}` rather than `{}`: the causes are where a failed login
+                // says what the server made of the credentials, and dropping
+                // them leaves the status line with only "connecting to ...".
+                let _ = sender.send(MailboxLoadUpdate::Failed(format!("{err:#}")));
             }
         });
 

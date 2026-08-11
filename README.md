@@ -37,7 +37,7 @@ accounts are supported via the `[[accounts]]` table:
 [[accounts]]
 name = "Private"
 backend = "gmail"
-username = "user@gmail.com"
+email = "user@gmail.com"
 password = "app-specific-password"
 
 [[accounts]]
@@ -52,9 +52,52 @@ Supported backends are:
 - `demo`: A mock backend that generates fake messages for demonstration
   purposes.
 
+`type` is accepted as a spelling of `backend`, and `username` as a spelling of
+`email`.
+
 If no configuration is found the client falls back to the mock backend so you
 can continue exploring the UI without network access. New mock messages arrive
 every few seconds to keep the inbox active.
+
+### JMAP accounts
+
+A JMAP account authenticates with either a password or an API token, and reads
+its session object from `url` — which defaults to Fastmail's endpoint:
+
+```toml
+[[accounts]]
+name = "Fastmail"
+backend = "jmap"
+username = "user@fastmail.com"
+# Fastmail's JMAP API takes API tokens only, not passwords. Create one under
+# Settings → Privacy & Security → Manage API tokens, with the "Mail" scope.
+token = "api-token"
+
+[[accounts]]
+name = "Work"
+backend = "jmap"
+username = "user@example.com"
+# Sent as HTTP Basic, for a server that asks for a password.
+password = "password"
+url = "https://mail.example.com"
+```
+
+`url` may name either the session object itself or the host that serves
+`/.well-known/jmap`. Should the server redirect the session fetch elsewhere, the
+target host has to be listed in `redirect_hosts` for the redirect to be
+followed; the host in `url` — plus Fastmail's own hosts, for a Fastmail URL — is
+trusted already. Configuring both credentials uses the token.
+
+#### Fastmail and app-specific passwords
+
+Fastmail's app-specific passwords cover IMAP, POP, SMTP, CalDAV and CardDAV, but
+**not** JMAP: its JMAP endpoints answer any Basic credential with `401 Invalid
+Authorization header, not bearer`, and advertise bearer tokens as the only method
+they accept. So a Fastmail account over JMAP needs an API token
+(Settings → Privacy & Security → Manage API tokens), and Elma says as much at
+startup rather than letting the login fail later. An app-specific password is
+still the credential to use for Fastmail over IMAP — a backend Elma does not
+offer yet, since `gmail` is fixed to Google's servers.
 
 ### Server certificates
 

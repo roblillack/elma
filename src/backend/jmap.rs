@@ -223,6 +223,26 @@ impl JmapAuth {
             JmapAuth::Bearer { token } => token,
         }
     }
+
+    /// What was sent, for an error message the user can act on.
+    fn credential_description(&self) -> String {
+        match self {
+            JmapAuth::Basic { username, .. } => format!("password for {username}"),
+            JmapAuth::Bearer { .. } => "API token".to_string(),
+        }
+    }
+
+    /// The other credential, in case the server wanted that one.
+    fn rejection_hint(&self) -> &'static str {
+        match self {
+            JmapAuth::Basic { .. } => {
+                "if the server expects an API token instead, configure it as `token = \"...\"`"
+            }
+            JmapAuth::Bearer { .. } => {
+                "if the server expects a password instead, configure it as `password = \"...\"`"
+            }
+        }
+    }
 }
 
 /// Written out by hand rather than derived: the derived version would put the
@@ -242,6 +262,42 @@ impl std::fmt::Display for JmapAuth {
             JmapAuth::Basic { username, .. } => write!(f, "Basic ({username})"),
             JmapAuth::Bearer { .. } => write!(f, "Bearer"),
         }
+    }
+}
+
+/// Say why the session could not be built, in one line.
+///
+/// A credential the server turns down arrives as a bare `401 Unauthorized` that
+/// names neither the account nor what was sent, and the mailbox loader shows an
+/// error's message rather than walking its causes -- so which credential went
+/// out, and which one to reach for instead, are folded into the message itself.
+fn connect_error(err: jmap_client::Error, auth: &JmapAuth, base_url: &str) -> anyhow::Error {
+    let url = debug_logging::redact_url(base_url);
+    match http_status(&err) {
+        Some(status @ (401 | 403)) => anyhow!(
+            "JMAP server at {url} rejected the {credential} (HTTP {status}); {hint}",
+            credential = auth.credential_description(),
+            hint = auth.rejection_hint(),
+        ),
+        _ => anyhow!("connecting to JMAP server at {url}: {err}"),
+    }
+}
+
+/// The HTTP status behind a `jmap-client` error, for the errors that carry one.
+fn http_status(err: &jmap_client::Error) -> Option<u16> {
+    match err {
+        jmap_client::Error::Transport(err) => err.status().map(|status| status.as_u16()),
+        jmap_client::Error::Problem(problem) => {
+            problem.status().and_then(|status| status.try_into().ok())
+        }
+        // A refusal that is not `application/problem+json` -- which is what a
+        // reverse proxy in front of the JMAP server tends to produce -- reaches
+        // us as the status line on its own, `401 Unauthorized`.
+        jmap_client::Error::Server(message) => message
+            .split_whitespace()
+            .next()
+            .and_then(|code| code.parse().ok()),
+        _ => None,
     }
 }
 
@@ -293,13 +349,13 @@ impl JmapBackend {
             return Ok(Arc::clone(inner));
         }
 
-        let inner = self
-            .runtime
-            .block_on(JmapInner::initialize(
-                Arc::clone(&self.runtime),
-                self.config.clone(),
-            ))
-            .with_context(|| format!("connecting to JMAP server at {}", self.config.base_url))?;
+        // No context is added here: everything [`JmapInner::initialize`] can
+        // fail at already names the server, and a wrapper would only hide the
+        // rejected-credential message the status line is meant to show.
+        let inner = self.runtime.block_on(JmapInner::initialize(
+            Arc::clone(&self.runtime),
+            self.config.clone(),
+        ))?;
         *guard = Some(Arc::clone(&inner));
         Ok(inner)
     }
@@ -459,7 +515,7 @@ impl JmapInner {
                     debug_logging::redact_url(client.session().api_url())
                 )
             })
-            .with_context(|| format!("connecting to JMAP server at {}", base_url))?;
+            .map_err(|err| connect_error(err, &auth, &base_url))?;
 
         let client = Arc::new(client);
 
@@ -1844,6 +1900,164 @@ fn kind_from_role(role: &MailboxRole) -> Option<MailboxKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn basic_auth() -> JmapAuth {
+        JmapAuth::Basic {
+            username: "rob@example.com".to_string(),
+            password: "s3cret".to_string(),
+        }
+    }
+
+    fn bearer_auth() -> JmapAuth {
+        JmapAuth::Bearer {
+            token: "an-api-token".to_string(),
+        }
+    }
+
+    /// A configured password reaches the server as an HTTP Basic header, and a
+    /// server that turns it down produces the message the status line shows.
+    ///
+    /// Driven through a socket on loopback rather than a stubbed HTTP layer:
+    /// `jmap-client` assembles the `Authorization` header itself, so only the
+    /// wire can show that the password goes out, and goes out intact.  Note that
+    /// a debug build leaves a `jmap-log-*.log` behind for this, the same trace
+    /// file a real session writes.
+    #[test]
+    fn a_password_is_sent_as_basic_authentication() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port to listen on");
+        let port = listener
+            .local_addr()
+            .expect("the listener to know its address")
+            .port();
+
+        // One connection is all the session fetch makes; the 401 ends it there.
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("the client to connect");
+            let mut reader = BufReader::new(&stream);
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            (&stream)
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .ok();
+            request
+        });
+
+        let backend = JmapBackend::new(JmapConfig {
+            base_url: format!("http://127.0.0.1:{port}"),
+            auth: basic_auth(),
+            trusted_hosts: Vec::new(),
+        })
+        .expect("the backend to be constructed");
+        let error = backend
+            .load_mailbox(MailboxKind::Inbox)
+            .expect_err("a server that answers 401 to have no mailboxes to hand over");
+        let request = server.join().expect("the server thread to finish");
+
+        let authorization = request
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+            .and_then(|line| line.split_once(':'))
+            .map(|(_, value)| value.trim().to_string())
+            .unwrap_or_else(|| panic!("the request should carry credentials:\n{request}"));
+        assert_eq!(
+            authorization, "Basic cm9iQGV4YW1wbGUuY29tOnMzY3JldA==",
+            "base64 of rob@example.com:s3cret"
+        );
+        assert!(
+            request.starts_with("GET /.well-known/jmap "),
+            "the session object is what gets fetched: {request}"
+        );
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("rejected the password for rob@example.com"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn status_is_read_off_a_bare_status_line() {
+        let err = jmap_client::Error::Server("401 Unauthorized".to_string());
+        assert_eq!(http_status(&err), Some(401));
+    }
+
+    #[test]
+    fn a_server_message_without_a_status_reads_as_none() {
+        let err = jmap_client::Error::Server("connection reset".to_string());
+        assert_eq!(http_status(&err), None);
+    }
+
+    #[test]
+    fn a_rejected_password_names_the_account_and_offers_the_token() {
+        let message = connect_error(
+            jmap_client::Error::Server("401 Unauthorized".to_string()),
+            &basic_auth(),
+            "https://mail.example.com/.well-known/jmap",
+        )
+        .to_string();
+
+        assert!(
+            message.contains("rejected the password for rob@example.com"),
+            "{message}"
+        );
+        assert!(message.contains("HTTP 401"), "{message}");
+        assert!(message.contains("token = "), "{message}");
+        assert!(!message.contains("s3cret"), "{message}");
+    }
+
+    #[test]
+    fn a_rejected_token_offers_the_password() {
+        let message = connect_error(
+            jmap_client::Error::Server("403 Forbidden".to_string()),
+            &bearer_auth(),
+            "https://api.fastmail.com/jmap/session",
+        )
+        .to_string();
+
+        assert!(message.contains("rejected the API token"), "{message}");
+        assert!(message.contains("password = "), "{message}");
+        assert!(!message.contains("an-api-token"), "{message}");
+    }
+
+    /// A failure that is not about the credentials keeps the server's own words.
+    #[test]
+    fn other_failures_are_reported_as_they_come() {
+        let message = connect_error(
+            jmap_client::Error::Server("503 Service Unavailable".to_string()),
+            &basic_auth(),
+            "https://mail.example.com",
+        )
+        .to_string();
+
+        assert!(message.contains("connecting to JMAP server"), "{message}");
+        assert!(message.contains("503"), "{message}");
+    }
+
+    /// Credentials a URL carries are stripped before they reach an error the UI
+    /// will print.
+    #[test]
+    fn a_url_with_userinfo_is_redacted_in_errors() {
+        let message = connect_error(
+            jmap_client::Error::Server("401 Unauthorized".to_string()),
+            &basic_auth(),
+            "https://rob:s3cret@mail.example.com/.well-known/jmap",
+        )
+        .to_string();
+
+        assert!(!message.contains("s3cret"), "{message}");
+    }
 
     /// Mailbox cache with the given `(id, name, kind)` entries; user mailboxes
     /// pass `None` as their kind.
