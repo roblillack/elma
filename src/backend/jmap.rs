@@ -91,14 +91,20 @@ impl MailBackend for JmapBackend {
     ) -> Result<(MailboxSnapshot, mpsc::Receiver<BackendEvent>)> {
         let (sender, receiver) = mpsc::channel();
 
-        {
-            let mut guard = self.inner.events.lock().unwrap();
-            *guard = Some(sender);
-        }
-
         let snapshot = self.inner.runtime.block_on(async {
-            self.inner.set_current_mailbox(mailbox).await;
+            self.inner.set_current_mailbox(mailbox);
             self.inner.stop_backfill().await;
+
+            // The new channel only goes live once the previous mailbox's
+            // backfill is gone.  Installing it earlier hands that backfill's
+            // in-flight batch -- fetched before it was cancelled, and carrying
+            // sequence numbers from the *old* mailbox -- to the folder we are
+            // switching to.
+            {
+                let mut guard = self.inner.events.lock().unwrap();
+                *guard = Some(sender);
+            }
+
             let sync = self
                 .inner
                 .sync_mailbox(mailbox)
@@ -191,7 +197,9 @@ struct JmapInner {
     state: AsyncMutex<JmapState>,
     identity: IdentityInfo,
     events: Mutex<Option<mpsc::Sender<BackendEvent>>>,
-    current_mailbox: AsyncMutex<MailboxKind>,
+    // Read by `emit_event` on every emission, so this is a plain mutex: the
+    // async one would force `emit_event` and its callers to become async.
+    current_mailbox: Mutex<MailboxKind>,
     event_handle: AsyncMutex<Option<JoinHandle<()>>>,
     event_cancel: AsyncMutex<Option<Arc<AtomicBool>>>,
     backfill_handle: AsyncMutex<Option<JoinHandle<()>>>,
@@ -228,7 +236,7 @@ impl JmapInner {
             state: AsyncMutex::new(JmapState::default()),
             identity,
             events: Mutex::new(None),
-            current_mailbox: AsyncMutex::new(MailboxKind::Inbox),
+            current_mailbox: Mutex::new(MailboxKind::Inbox),
             event_handle: AsyncMutex::new(None),
             event_cancel: AsyncMutex::new(None),
             backfill_handle: AsyncMutex::new(None),
@@ -236,9 +244,13 @@ impl JmapInner {
         }))
     }
 
-    async fn set_current_mailbox(&self, mailbox: MailboxKind) {
-        let mut guard = self.current_mailbox.lock().await;
+    fn set_current_mailbox(&self, mailbox: MailboxKind) {
+        let mut guard = self.current_mailbox.lock().unwrap();
         *guard = mailbox;
+    }
+
+    fn current_mailbox(&self) -> MailboxKind {
+        *self.current_mailbox.lock().unwrap()
     }
 
     async fn sync_mailbox(&self, mailbox: MailboxKind) -> Result<MailboxSync> {
@@ -342,10 +354,10 @@ impl JmapInner {
     }
 
     async fn refresh_current_mailbox(self: &Arc<Self>) -> Result<()> {
-        let mailbox = *self.current_mailbox.lock().await;
+        let mailbox = self.current_mailbox();
         self.stop_backfill().await;
         let sync = self.sync_mailbox(mailbox).await?;
-        self.emit_diff(sync);
+        self.emit_diff(mailbox, sync);
         self.start_backfill_if_needed(mailbox).await?;
         Ok(())
     }
@@ -570,19 +582,31 @@ impl JmapInner {
         }
     }
 
-    fn emit_diff(&self, sync: MailboxSync) {
+    fn emit_diff(&self, mailbox: MailboxKind, sync: MailboxSync) {
         for message in sync.added {
-            self.emit_event(BackendEvent::NewMessage(message));
+            self.emit_event(mailbox, BackendEvent::NewMessage(message));
         }
         for message in sync.updated {
-            self.emit_event(BackendEvent::MessageFlagsChanged(message));
+            self.emit_event(mailbox, BackendEvent::MessageFlagsChanged(message));
         }
         for id in sync.removed {
-            self.emit_event(BackendEvent::MessageDeleted(id));
+            self.emit_event(mailbox, BackendEvent::MessageDeleted(id));
         }
     }
 
-    fn emit_event(&self, event: BackendEvent) {
+    /// Hand `event` to the UI, but only while `mailbox` is still the one on
+    /// screen.
+    ///
+    /// Every event carries the mailbox it was produced for.  Tasks outlive the
+    /// folder that started them -- a backfill parked in a fetch, or the refresh
+    /// `apply_actions` spawns without any cancellation at all -- and the sender
+    /// is a single slot shared by all of them.  Without this check such a task
+    /// delivers messages, and sequence numbers derived from the old mailbox's
+    /// total, into whichever folder the user has since opened.
+    fn emit_event(&self, mailbox: MailboxKind, event: BackendEvent) {
+        if self.current_mailbox() != mailbox {
+            return;
+        }
         if let Some(sender) = self.events.lock().unwrap().as_ref() {
             let _ = sender.send(event);
         }
@@ -701,6 +725,14 @@ impl JmapInner {
                 start_position,
             } = page;
 
+            // The fetch above is a network round-trip, and the cancel flag is
+            // otherwise only read at the top of the loop.  Bail out here rather
+            // than fold a batch belonging to the mailbox we are leaving into the
+            // shared state.
+            if cancel.load(AtomicOrdering::SeqCst) {
+                break;
+            }
+
             if emails.is_empty() {
                 self.state.lock().await.set_more_available(false);
                 break;
@@ -776,7 +808,7 @@ impl JmapInner {
             }
 
             for message in emitted {
-                self.emit_event(BackendEvent::NewMessage(message));
+                self.emit_event(mailbox, BackendEvent::NewMessage(message));
             }
 
             if !more_pending {
