@@ -23,7 +23,7 @@ use async_imap::{
 use futures::TryStreamExt;
 use imap_proto::types::{
     AttributeValue, BodyContentCommon, BodyContentSinglePart, BodyParams, BodyStructure,
-    MailboxDatum, NameAttribute, Response,
+    MailboxDatum, NameAttribute, Response, Status,
 };
 use lettre::{
     Message as LettreEmail, SmtpTransport, Transport, message::Mailbox as LettreMailbox,
@@ -1049,6 +1049,9 @@ impl GmailInner {
             Ok(result) => result,
             Err(err) => {
                 drop(session_guard);
+                if is_connection_lost(&err) {
+                    self.discard_session().await;
+                }
                 let _ = self.start_idle_loop().await;
                 return Err(err);
             }
@@ -1074,7 +1077,17 @@ impl GmailInner {
             };
             match self.fetch_gmail_labels_command(session, &command).await {
                 Ok(exists) => label_exists = exists,
-                Err(err) => eprintln!("Gmail backfill label fetch error: {err:?}"),
+                Err(err) => {
+                    eprintln!("Gmail backfill label fetch error: {err:?}");
+                    // Labels are optional; a dead connection is not.  Carrying
+                    // on here is what sent an IDLE into a closed socket.
+                    if is_connection_lost(&err) {
+                        drop(session_guard);
+                        self.discard_session().await;
+                        let _ = self.start_idle_loop().await;
+                        return Err(err);
+                    }
+                }
             }
         }
 
@@ -1084,6 +1097,12 @@ impl GmailInner {
             .await
         {
             eprintln!("Gmail backfill EXISTS handling error: {err:?}");
+            if is_connection_lost(&err) {
+                drop(session_guard);
+                self.discard_session().await;
+                let _ = self.start_idle_loop().await;
+                return Err(err);
+            }
         }
 
         drop(session_guard);
@@ -1253,6 +1272,10 @@ impl GmailInner {
                         Some(highest_exists.map_or(*count, |prev: u32| prev.max(*count)));
                 }
                 Response::Done { tag: done_tag, .. } if done_tag == &tag => break,
+                Response::Data {
+                    status: Status::Bye,
+                    ..
+                } => return Err(ConnectionLost.into()),
                 _ => {}
             }
         }
@@ -1388,6 +1411,10 @@ impl GmailInner {
                     highest_exists =
                         Some(highest_exists.map_or(*count, |prev: u32| prev.max(*count)));
                 }
+                Response::Data {
+                    status: Status::Bye,
+                    ..
+                } => return Err(ConnectionLost.into()),
                 _ => {}
             }
         }
@@ -2105,6 +2132,17 @@ impl GmailInner {
         Ok(())
     }
 
+    /// Retire a session the server has hung up on.
+    ///
+    /// Leaving it in place is worse than having none: `ensure_connected` only
+    /// dials when the slot is empty, so the next task to pick the session up
+    /// sends its command into a closed socket, fails, and only reconnects
+    /// after that -- five seconds and two confusing errors later.
+    async fn discard_session(&self) {
+        let mut guard = self.session.lock().await;
+        *guard = None;
+    }
+
     async fn reinsert_session(&self, session: AsyncSession) {
         let mut guard = self.session.lock().await;
         *guard = Some(session);
@@ -2461,6 +2499,29 @@ fn parse_envelope_date(envelope: &imap_proto::types::Envelope<'_>) -> Option<Off
         let text = str::from_utf8(raw.as_ref()).ok()?;
         let ts = mailparse::dateparse(text).ok()?;
         OffsetDateTime::from_unix_timestamp(ts).ok()
+    })
+}
+
+/// The server hung up on us -- it sent `* BYE`, or the socket closed.
+///
+/// Carried as its own error type so callers can tell "this session is dead"
+/// apart from "this command failed", and retire the session rather than hand
+/// the corpse to the next task.
+#[derive(Debug)]
+struct ConnectionLost;
+
+impl std::fmt::Display for ConnectionLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the IMAP server closed the connection")
+    }
+}
+
+impl std::error::Error for ConnectionLost {}
+
+/// Does this error mean the session is gone rather than the command failed?
+fn is_connection_lost(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.is::<ConnectionLost>() || cause.downcast_ref::<std::io::Error>().is_some()
     })
 }
 
@@ -3353,6 +3414,42 @@ mod tests {
     // ---------------------------------------------------------------
     //  EXISTS bookkeeping
     // ---------------------------------------------------------------
+
+    // ---------------------------------------------------------------
+    //  Connection loss
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn a_bye_is_recognised_through_the_context_chain() {
+        // The read loops return `ConnectionLost` bare, but every caller adds
+        // context on the way up, so the check has to walk the chain.
+        let err = anyhow::Error::from(ConnectionLost)
+            .context("reading Gmail label response")
+            .context("fetching backfill range 100:200");
+
+        assert!(is_connection_lost(&err));
+    }
+
+    #[test]
+    fn a_socket_error_counts_as_connection_loss() {
+        // What a mid-command hangup actually looks like: rustls reports the
+        // missing close_notify as an io::Error.
+        let io = std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify",
+        );
+        let err = anyhow::Error::from(io).context("reading FETCH response");
+
+        assert!(is_connection_lost(&err));
+    }
+
+    #[test]
+    fn an_ordinary_failure_is_not_connection_loss() {
+        // A command the server rejected must not cost us the session.
+        let err = anyhow!("missing UID in fetch response").context("fetching backfill range 1:100");
+
+        assert!(!is_connection_lost(&err));
+    }
 
     #[test]
     fn max_exists_keeps_the_higher_announcement() {
