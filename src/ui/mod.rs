@@ -261,6 +261,10 @@ fn render_loading_overlay(
             "Connecting to the mail server".to_string(),
             "Signing in and opening the mailbox...".to_string(),
         ),
+        LoadPhase::Opening => (
+            "Opening the folder".to_string(),
+            "Fetching the message list...".to_string(),
+        ),
         LoadPhase::Receiving { loaded, total } => (
             "Receiving messages".to_string(),
             format!("{loaded} of {total} headers"),
@@ -2043,6 +2047,18 @@ mod tests {
         let border = buf.cell((border_col, top)).unwrap();
         assert_eq!(border.fg, super::Color::White);
         assert_eq!(border.bg, super::Color::Black);
+    }
+
+    /// Opening a folder on a live session must not claim to be connecting.
+    #[test]
+    fn opening_a_folder_does_not_read_as_a_reconnect() {
+        let screen = loading_screen(LoadPhase::Opening);
+        assert!(screen.contains("Opening the folder"), "{screen}");
+        assert!(screen.contains("Fetching the message list"), "{screen}");
+        assert!(
+            !screen.contains("Connecting"),
+            "a folder switch keeps the session, {screen}"
+        );
     }
 
     #[test]

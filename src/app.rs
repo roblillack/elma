@@ -224,9 +224,17 @@ struct MailboxLoaderState {
 /// until it has all of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LoadPhase {
-    /// Connecting, authenticating and asking for the mailbox. Nothing to show
-    /// yet, and on a cold start this is nearly all of the wait.
+    /// First contact with this account: opening a socket, authenticating and
+    /// asking for the mailbox. On a cold start this is nearly all of the wait.
     Connecting,
+    /// A folder being opened on an account that is already up.  Distinct from
+    /// [`Self::Connecting`] because saying "connecting" on every folder switch
+    /// reads as though the session were being dropped and rebuilt each time,
+    /// which is not what happens: the socket stays put and only the mailbox
+    /// changes.  True whether or not the backend has to quietly re-establish a
+    /// stale session underneath, because it describes the request, not the
+    /// transport.
+    Opening,
     /// The mailbox size is known and headers are arriving.
     Receiving { loaded: usize, total: usize },
     /// The load ended without producing anything; the message is the reason.
@@ -241,10 +249,6 @@ pub(crate) struct LoadingState {
 }
 
 impl LoadingState {
-    fn connecting() -> Self {
-        Self::in_phase(LoadPhase::Connecting)
-    }
-
     pub(crate) fn in_phase(phase: LoadPhase) -> Self {
         Self {
             phase,
@@ -384,6 +388,12 @@ pub struct AccountState {
     /// Whether a load has ever populated this account, so switching to one that
     /// failed on startup can retry rather than showing a permanently empty list.
     loaded: bool,
+    /// Whether the backend has ever answered for this account, which is the
+    /// point from which there is a session to reuse.  Earlier than `loaded`:
+    /// that one waits for the whole mailbox, this one only for the first sign
+    /// the server is there, which is what decides whether the next load is a
+    /// connect or just a folder change.
+    connected: bool,
     /// Message body being fetched for this account, if any.
     message_loader: Option<MessageLoadOperation>,
     scheduled_actions: Vec<Action>,
@@ -1531,6 +1541,7 @@ impl App {
                     mailbox_load_progress: None,
                     loading: None,
                     loaded: false,
+                    connected: false,
                     message_loader: None,
                     scheduled_actions: Vec::new(),
                     current_mailbox: MailboxKind::Inbox,
@@ -1879,7 +1890,14 @@ impl App {
                 total: PROGRESS_SEGMENTS,
                 completed: 0,
             });
-            account.loading = Some(LoadingState::connecting());
+            // An account the backend has already answered for is connected, so
+            // this is a folder being opened rather than a session being built.
+            let phase = if account.connected {
+                LoadPhase::Opening
+            } else {
+                LoadPhase::Connecting
+            };
+            account.loading = Some(LoadingState::in_phase(phase));
             // A body still arriving for the mailbox we are leaving is of no use.
             account.message_loader = None;
             account.message_view = None;
@@ -2167,6 +2185,9 @@ impl App {
         match update {
             MailboxLoadUpdate::Started { total } => {
                 let current = self.current_mailbox;
+                // The backend got far enough to answer, so there is a session
+                // from here on and the next folder change is not a reconnect.
+                self.connected = true;
                 self.mailbox.messages.clear();
                 if total > 0 {
                     ensure_placeholder_capacity(&mut self.mailbox.messages, total);
@@ -5827,6 +5848,7 @@ mod tests {
             mailbox_load_progress: None,
             loading: None,
             loaded: true,
+            connected: true,
             message_loader: None,
             scheduled_actions: vec![],
             current_mailbox: MailboxKind::Inbox,
@@ -7887,7 +7909,9 @@ mod tests {
             .loading_overlay()
             .expect("an empty list mid-switch must explain itself");
         assert_eq!(mailbox, MailboxKind::Archive);
-        assert_eq!(state.phase, LoadPhase::Connecting);
+        // Not `Connecting`: the session from the inbox load is still up, and
+        // claiming otherwise reads as though every folder switch reconnected.
+        assert_eq!(state.phase, LoadPhase::Opening);
 
         release.send(()).expect("release the archive load");
         pump_until(&mut app, "the archive to arrive", |app| {
