@@ -1114,7 +1114,6 @@ fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     let now = OffsetDateTime::now_utc();
     let widths = [
-        Constraint::Length(6),
         Constraint::Length(4),
         Constraint::Length(14),
         Constraint::Length(21),
@@ -1124,7 +1123,7 @@ fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let column_spacing = 1u16;
     let subject_column_width = area
         .width
-        .saturating_sub(6 + 4 + 14 + 21 + 5 + column_spacing * (widths.len() as u16 - 1));
+        .saturating_sub(4 + 14 + 21 + 5 + column_spacing * (widths.len() as u16 - 1));
 
     let selected_index = app.inbox_selected();
     let visible_rows = messages
@@ -1142,7 +1141,6 @@ fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             let style = style_for_row(&row);
             let subject_cell = build_subject_cell(&row, subject_column_width, highlighted);
             Row::new(vec![
-                Cell::from(row.sequence),
                 Cell::from(row.flags),
                 Cell::from(row.date),
                 Cell::from(row.sender),
@@ -1211,9 +1209,9 @@ fn build_subject_cell(
 
     let total_width = subject_width as usize;
     let base_subject = if row.subject.trim().is_empty() {
-        row.uid.clone()
+        String::from("(no subject)")
     } else {
-        format!("{} {}", row.uid, row.subject)
+        row.subject.clone()
     };
 
     let label_render = format_labels(&row.labels, total_width, highlighted);

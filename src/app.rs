@@ -5190,15 +5190,12 @@ impl App {
         now: OffsetDateTime,
     ) -> MessageRow {
         if message.is_placeholder() {
-            let seq = message.seq;
             return MessageRow {
-                sequence: format!("{:>5}", seq),
                 flags: "    ".to_string(),
                 date: "Loading".to_string(),
                 sender: padded_sender("Loading"),
                 size: String::new(),
-                uid: String::from("..."),
-                subject: format!("Loading message #{seq}..."),
+                subject: "Loading message...".to_string(),
                 labels: Vec::new(),
                 status: MessageStatus::Read,
                 starred: false,
@@ -5215,12 +5212,10 @@ impl App {
         };
 
         MessageRow {
-            sequence: format!("{:>5}", message.seq),
             flags: message.flag_string(),
             date: message.formatted_received(now),
             sender: padded_sender(&display_name),
             size: format_size(message.size),
-            uid: message.uid.to_string(),
             subject: message.subject.clone(),
             labels: message.labels.clone(),
             status: message.status,
@@ -5230,12 +5225,10 @@ impl App {
 }
 
 pub(crate) struct MessageRow {
-    pub(crate) sequence: String,
     pub(crate) flags: String,
     pub(crate) date: String,
     pub(crate) sender: String,
     pub(crate) size: String,
-    pub(crate) uid: String,
     pub(crate) subject: String,
     pub(crate) labels: Vec<String>,
     pub(crate) status: MessageStatus,
