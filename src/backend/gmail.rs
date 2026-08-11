@@ -642,6 +642,10 @@ const MAX_EXISTS_DRAIN_ROUNDS: usize = 4;
 /// How many times a backfill run redials *without a batch succeeding in
 /// between* before leaving the rest of the mailbox to the next attempt.
 const MAX_BACKFILL_RECONNECTS: u32 = 3;
+/// How long a backfill run may go without asking the server whether new mail
+/// has arrived.  Bounds how late a message shows up while backfill has IDLE
+/// switched off.
+const NEW_MAIL_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// TLS settings shared by every connection to Gmail.
 ///
@@ -1022,9 +1026,10 @@ impl GmailInner {
     /// Cycling it per batch cost an IDLE/DONE round trip and roughly 340ms of
     /// dead time per 100 messages -- on a 16k mailbox that was about half of
     /// all commands sent, and a fair bet for what provoked Gmail's `* BYE
-    /// System Error`.  Nothing is missed by staying out of IDLE: the batches'
-    /// own FETCH commands carry any EXISTS the server wants to announce, and
-    /// [`Self::drain_exists`] acts on it.
+    /// System Error`.
+    ///
+    /// Staying out of IDLE means new mail has to be asked for: Gmail does not
+    /// volunteer EXISTS during a FETCH.  See [`Self::poll_for_new_mail`].
     async fn backfill_loop(self: Arc<Self>, cancel: Arc<AtomicBool>) {
         if let Err(err) = self.pause_idle().await {
             eprintln!("Gmail backfill could not pause IDLE: {err:?}");
@@ -1039,15 +1044,51 @@ impl GmailInner {
         }
     }
 
+    /// Ask the server whether anything has arrived.
+    ///
+    /// Gmail does not volunteer EXISTS during a FETCH.  Across a full backfill
+    /// it stayed silent for 76 seconds and some 320 commands with a message
+    /// already waiting, then reported it 264ms after the client entered IDLE
+    /// -- entering IDLE is what flushes the announcement, not time spent
+    /// listening.  So while backfill keeps IDLE off, new mail has to be asked
+    /// for.  NOOP is what RFC 3501 offers (section 6.4.1): "a periodic poll
+    /// for new messages or message status updates during a period of
+    /// inactivity".
+    async fn poll_for_new_mail(&self) -> Result<()> {
+        let mut guard = self.session.lock().await;
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("IMAP session is not available"))?;
+
+        session
+            .noop()
+            .await
+            .context("polling for new mail with NOOP")?;
+
+        // `noop` answers through async-imap's own command path, which parks the
+        // untagged EXISTS in the unsolicited-response channel rather than
+        // handing it back; `drain_exists` reads it out of there.
+        self.drain_exists(session, None).await
+    }
+
     async fn run_backfill_batches(self: &Arc<Self>, cancel: &Arc<AtomicBool>) {
         // Counted consecutively and reset by every batch that lands, so the cap
         // catches a connection that will not stay up rather than a long run
         // that got unlucky a few times.
         let mut failed_reconnects = 0;
+        let mut last_poll = tokio_time::Instant::now();
 
         loop {
             if cancel.load(Ordering::SeqCst) {
                 return;
+            }
+
+            if last_poll.elapsed() >= NEW_MAIL_POLL_INTERVAL {
+                last_poll = tokio_time::Instant::now();
+                if let Err(err) = self.poll_for_new_mail().await {
+                    // Left for the next batch to trip over and reconnect on.
+                    eprintln!("Gmail backfill new-mail poll error: {err:?}");
+                }
             }
 
             let range = {
