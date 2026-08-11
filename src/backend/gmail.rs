@@ -639,6 +639,9 @@ const INTERNAL_DATE_FORMAT: &str = "%d-%b-%Y %H:%M:%S %z";
 /// How many times [`GmailInner::drain_exists`] re-enters
 /// [`GmailInner::handle_exists`] before leaving the rest to the IDLE loop.
 const MAX_EXISTS_DRAIN_ROUNDS: usize = 4;
+/// How many times a backfill run redials *without a batch succeeding in
+/// between* before leaving the rest of the mailbox to the next attempt.
+const MAX_BACKFILL_RECONNECTS: u32 = 3;
 
 /// TLS settings shared by every connection to Gmail.
 ///
@@ -690,6 +693,13 @@ struct GmailInner {
     idle_handle: AsyncMutex<Option<JoinHandle<()>>>,
     backfill_handle: AsyncMutex<Option<JoinHandle<()>>>,
     backfill_cancel: AsyncMutex<Option<Arc<AtomicBool>>>,
+    /// Set while a backfill run owns the IMAP session.
+    ///
+    /// Backfill holds IDLE down for its whole run rather than cycling it per
+    /// batch, so anything that would ordinarily restart IDLE afterwards -- an
+    /// action, say -- has to leave it alone until the run is done.  Without
+    /// this the next batch would find the session taken by a fresh IDLE task.
+    backfill_active: AtomicBool,
     /// Serialises action processing so that only one [`process_action`] call
     /// runs at a time.  Without this, concurrent batches (e.g. an immediate
     /// flag-change batch and a regular move batch) can race: one task's
@@ -767,6 +777,7 @@ impl GmailBackend {
                 idle_handle: AsyncMutex::new(None),
                 backfill_handle: AsyncMutex::new(None),
                 backfill_cancel: AsyncMutex::new(None),
+                backfill_active: AtomicBool::new(false),
                 action_lock: AsyncMutex::new(()),
             }),
         })
@@ -799,8 +810,11 @@ impl MailBackend for GmailBackend {
                 let mut current = self.inner.current_mailbox.lock().await;
                 *current = mailbox;
             }
-            self.inner.start_idle_loop().await?;
+            // Backfill first: when it has work it claims the session, and
+            // `start_idle_loop` then declines rather than starting an IDLE the
+            // backfill would immediately have to stop.
             self.inner.start_backfill_if_needed().await?;
+            self.inner.start_idle_loop().await?;
 
             Ok::<_, anyhow::Error>(MailboxSnapshot {
                 total: exists as usize,
@@ -853,8 +867,8 @@ impl MailBackend for GmailBackend {
             self.inner.drain_exists(session, label_exists).await?;
 
             drop(session_guard);
-            self.inner.start_idle_loop().await?;
             self.inner.start_backfill_if_needed().await?;
+            self.inner.start_idle_loop().await?;
 
             content.ok_or_else(|| anyhow!("message body not returned by server"))
         })
@@ -954,6 +968,9 @@ impl GmailInner {
         if let Some(cancel) = self.backfill_cancel.lock().await.take() {
             cancel.store(true, Ordering::SeqCst);
         }
+        // Cleared here too, not just where the run ends: the task may never
+        // have been spawned, and a stale flag would keep IDLE off for good.
+        self.backfill_active.store(false, Ordering::SeqCst);
         let handle = {
             let mut guard = self.backfill_handle.lock().await;
             guard.take()
@@ -984,6 +1001,10 @@ impl GmailInner {
             *cancel_guard = Some(Arc::clone(&cancel_flag));
         }
 
+        // Set before spawning, so a `start_idle_loop` racing the new task
+        // cannot slip a fresh IDLE in ahead of it.
+        self.backfill_active.store(true, Ordering::SeqCst);
+
         let this = Arc::clone(self);
         let handle = self.runtime.spawn(async move {
             this.backfill_loop(cancel_flag).await;
@@ -995,10 +1016,38 @@ impl GmailInner {
         Ok(())
     }
 
+    /// Work backwards through the mailbox, a batch at a time.
+    ///
+    /// IDLE is stopped once for the whole run instead of around every batch.
+    /// Cycling it per batch cost an IDLE/DONE round trip and roughly 340ms of
+    /// dead time per 100 messages -- on a 16k mailbox that was about half of
+    /// all commands sent, and a fair bet for what provoked Gmail's `* BYE
+    /// System Error`.  Nothing is missed by staying out of IDLE: the batches'
+    /// own FETCH commands carry any EXISTS the server wants to announce, and
+    /// [`Self::drain_exists`] acts on it.
     async fn backfill_loop(self: Arc<Self>, cancel: Arc<AtomicBool>) {
+        if let Err(err) = self.pause_idle().await {
+            eprintln!("Gmail backfill could not pause IDLE: {err:?}");
+        }
+
+        self.run_backfill_batches(&cancel).await;
+
+        // Before restarting IDLE, or `start_idle_loop` will decline.
+        self.backfill_active.store(false, Ordering::SeqCst);
+        if let Err(err) = self.start_idle_loop().await {
+            eprintln!("Gmail idle restart error: {err:?}");
+        }
+    }
+
+    async fn run_backfill_batches(self: &Arc<Self>, cancel: &Arc<AtomicBool>) {
+        // Counted consecutively and reset by every batch that lands, so the cap
+        // catches a connection that will not stay up rather than a long run
+        // that got unlucky a few times.
+        let mut failed_reconnects = 0;
+
         loop {
             if cancel.load(Ordering::SeqCst) {
-                break;
+                return;
             }
 
             let range = {
@@ -1007,12 +1056,34 @@ impl GmailInner {
             };
 
             let Some((start, end)) = range else {
-                break;
+                return;
             };
 
-            if let Err(err) = self.load_backfill_batch(start, end, &cancel).await {
-                eprintln!("Gmail backfill error: {err:?}");
-                break;
+            let err = match self.load_backfill_batch(start, end, cancel).await {
+                Ok(()) => {
+                    failed_reconnects = 0;
+                    continue;
+                }
+                Err(err) => err,
+            };
+
+            eprintln!("Gmail backfill error: {err:?}");
+
+            // Gmail hangs up on long backfills often enough that giving up on
+            // the first one would leave most of the mailbox unread.  Dial
+            // again and retry the same range -- `ensure_connected` re-selects
+            // the mailbox, so the sequence numbers still line up.
+            if !is_connection_lost(&err) || failed_reconnects >= MAX_BACKFILL_RECONNECTS {
+                return;
+            }
+
+            failed_reconnects += 1;
+            eprintln!(
+                "Gmail backfill: reconnecting ({failed_reconnects}/{MAX_BACKFILL_RECONNECTS})"
+            );
+            if let Err(err) = self.ensure_connected().await {
+                eprintln!("Gmail backfill reconnect error: {err:?}");
+                return;
             }
         }
     }
@@ -1027,7 +1098,6 @@ impl GmailInner {
             return Ok(());
         }
 
-        self.pause_idle().await?;
         let mut session_guard = self.session.lock().await;
         let session = session_guard
             .as_mut()
@@ -1052,7 +1122,6 @@ impl GmailInner {
                 if is_connection_lost(&err) {
                     self.discard_session().await;
                 }
-                let _ = self.start_idle_loop().await;
                 return Err(err);
             }
         };
@@ -1084,7 +1153,6 @@ impl GmailInner {
                     if is_connection_lost(&err) {
                         drop(session_guard);
                         self.discard_session().await;
-                        let _ = self.start_idle_loop().await;
                         return Err(err);
                     }
                 }
@@ -1100,13 +1168,11 @@ impl GmailInner {
             if is_connection_lost(&err) {
                 drop(session_guard);
                 self.discard_session().await;
-                let _ = self.start_idle_loop().await;
                 return Err(err);
             }
         }
 
         drop(session_guard);
-        let restart_result = self.start_idle_loop().await;
 
         // Re-read messages from state after labels have been applied,
         // so NewMessage events carry up-to-date importance and label data.
@@ -1119,7 +1185,7 @@ impl GmailInner {
             }
         }
 
-        restart_result
+        Ok(())
     }
 
     /// Resolve the IMAP mailbox name for `mailbox`.
@@ -1540,6 +1606,13 @@ impl GmailInner {
 
     /// Spawn the IDLE task that listens for new Gmail events.
     async fn start_idle_loop(self: &Arc<Self>) -> Result<()> {
+        // A backfill run owns the session until it finishes and restarts IDLE
+        // itself.  Starting one here would take the session out from under the
+        // next batch.
+        if self.backfill_active.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
         let mut handle_guard = self.idle_handle.lock().await;
         if handle_guard.is_some() {
             return Ok(());
