@@ -180,7 +180,7 @@ fn load_accounts_from_config() -> Result<Option<Vec<AccountDescriptor>>> {
 }
 
 fn build_account_from_config(mut config: AccountConfig, index: usize) -> Result<AccountDescriptor> {
-    let backend_name = config.r#type.to_ascii_lowercase();
+    let backend_name = config.backend.to_ascii_lowercase();
     match backend_name.as_str() {
         "gmail" => {
             let username = config
@@ -314,11 +314,11 @@ struct Config {
 #[derive(Deserialize)]
 struct AccountConfig {
     name: Option<String>,
-    /// Which backend serves the account.  `backend` is accepted as well: both
-    /// spellings have been documented, and a configuration that names the wrong
+    /// Which backend serves the account.  `type` is accepted as well: both
+    /// spellings have been documented, and a configuration that names the older
     /// one would otherwise fail to parse at all.
-    #[serde(alias = "backend")]
-    r#type: String,
+    #[serde(alias = "type")]
+    backend: String,
     email: Option<String>,
     password: Option<String>,
     username: Option<String>,
@@ -335,7 +335,7 @@ impl std::fmt::Debug for AccountConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AccountConfig")
             .field("name", &self.name)
-            .field("type", &self.r#type)
+            .field("backend", &self.backend)
             .field("email", &self.email)
             .field("password", &self.password.as_ref().map(|_| "***"))
             .field("username", &self.username)
@@ -434,7 +434,7 @@ mod tests {
         let setup = jmap_setup(
             r#"
             [[accounts]]
-            type = "jmap"
+            backend = "jmap"
             username = "rob@example.com"
             password = "s3cret"
             url = "https://mail.example.com"
@@ -457,7 +457,7 @@ mod tests {
         let setup = jmap_setup(
             r#"
             [[accounts]]
-            type = "jmap"
+            backend = "jmap"
             email = "rob@example.com"
             password = "s3cret"
             url = "https://mail.example.com"
@@ -477,7 +477,7 @@ mod tests {
         let setup = jmap_setup(
             r#"
             [[accounts]]
-            type = "jmap"
+            backend = "jmap"
             username = "rob@fastmail.com"
             token = "an-api-token"
             "#,
@@ -493,7 +493,7 @@ mod tests {
         let setup = jmap_setup(
             r#"
             [[accounts]]
-            type = "jmap"
+            backend = "jmap"
             username = "rob@fastmail.com"
             password = "s3cret"
             token = "an-api-token"
@@ -509,7 +509,7 @@ mod tests {
         let error = jmap_setup(
             r#"
             [[accounts]]
-            type = "jmap"
+            backend = "jmap"
             username = "rob@example.com"
             "#,
         )
@@ -533,7 +533,7 @@ mod tests {
             Some("https://phl.api.fastmail.com/jmap/session"),
         ] {
             let mut source = String::from(
-                "[[accounts]]\ntype = \"jmap\"\nusername = \"rob@fastmail.com\"\npassword = \"s3cret\"\n",
+                "[[accounts]]\nbackend = \"jmap\"\nusername = \"rob@fastmail.com\"\npassword = \"s3cret\"\n",
             );
             if let Some(url) = url {
                 source.push_str(&format!("url = \"{url}\"\n"));
@@ -555,7 +555,7 @@ mod tests {
         let setup = jmap_setup(
             r#"
             [[accounts]]
-            type = "jmap"
+            backend = "jmap"
             username = "rob@notfastmail.com"
             password = "s3cret"
             url = "https://jmap.notfastmail.com"
@@ -571,7 +571,7 @@ mod tests {
         let setup = jmap_setup(
             r#"
             [[accounts]]
-            type = "jmap"
+            backend = "jmap"
             username = "rob@example.com"
             password = "s3cret"
             url = "https://mail.example.com/.well-known/jmap"
@@ -587,7 +587,7 @@ mod tests {
         let setup = jmap_setup(
             r#"
             [[accounts]]
-            type = "jmap"
+            backend = "jmap"
             username = "rob@fastmail.com"
             token = "an-api-token"
             "#,
@@ -603,21 +603,20 @@ mod tests {
         }
     }
 
-    /// Both key spellings have been documented for the backend selector.
+    /// `backend` names the backend; `type`, which earlier configurations use,
+    /// is still understood.
     #[test]
-    fn account_type_is_also_spelled_backend() {
-        assert_eq!(
-            account(
-                r#"
-                [[accounts]]
-                backend = "jmap"
-                username = "rob@example.com"
-                password = "s3cret"
-                "#,
-            )
-            .r#type,
-            "jmap"
-        );
+    fn account_backend_is_also_spelled_type() {
+        for key in ["backend", "type"] {
+            assert_eq!(
+                account(&format!(
+                    "[[accounts]]\n{key} = \"jmap\"\nusername = \"rob@example.com\"\npassword = \"s3cret\"\n"
+                ))
+                .backend,
+                "jmap",
+                "`{key}` should select the backend"
+            );
+        }
     }
 
     #[test]
