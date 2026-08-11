@@ -18,6 +18,7 @@ mod debug_log;
 pub mod gmail;
 pub mod jmap;
 pub mod mock;
+pub mod oauth;
 
 /// Notifications that backends emit when something about the mailbox changes.
 ///

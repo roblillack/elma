@@ -48,3 +48,14 @@ shell-words = "1"
 tempfile = "3"
 mime_guess = "2"
 unicode-width = "0.2"
+# The OAuth sign-in talks HTTP on its own, next to the JMAP session. Version and
+# features are copied from what jmap-client asks for so both share one stack --
+# in particular *not* reqwest's `rustls` feature, which would force the
+# `aws-lc-rs` provider back into the build. See the note on jmap-client above.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
+serde_json = "1"
+base64 = "0.22"
+# SHA-256 and the CSPRNG behind PKCE, taken from the provider rustls is already
+# built with rather than a second crypto crate.
+ring = "0.17"
+url = "2"
