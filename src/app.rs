@@ -8,6 +8,7 @@
 use crate::backend::{
     ActionStatus, BackendEvent, MailBackend, OutgoingAttachment, OutgoingMessage,
 };
+use crate::clock;
 use crate::model::{
     Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
     MessageContentPart, MessageId, MessageStatus, format_size, padded_sender,
@@ -257,7 +258,7 @@ impl LoadingState {
     }
 
     pub(crate) fn elapsed(&self) -> std::time::Duration {
-        self.started.elapsed()
+        clock::elapsed(self.started)
     }
 }
 
@@ -523,7 +524,7 @@ impl SaveAttachmentDialog {
     pub(crate) fn active_operation(&self) -> Option<(&str, std::time::Duration)> {
         self.operation
             .as_ref()
-            .map(|op| (op.filename.as_str(), op.started.elapsed()))
+            .map(|op| (op.filename.as_str(), clock::elapsed(op.started)))
     }
 
     pub(crate) fn is_busy(&self) -> bool {
@@ -2781,14 +2782,14 @@ impl App {
     pub(crate) fn pending_message_load(&self) -> Option<(&str, std::time::Duration)> {
         self.message_loader
             .as_ref()
-            .map(|op| (op.label.as_str(), op.started.elapsed()))
+            .map(|op| (op.label.as_str(), clock::elapsed(op.started)))
     }
 
     /// Label and elapsed time of the send or draft save in flight.
     pub(crate) fn pending_outgoing(&self) -> Option<(&str, std::time::Duration)> {
         self.outgoing
             .as_ref()
-            .map(|op| (op.kind.label(), op.started.elapsed()))
+            .map(|op| (op.kind.label(), clock::elapsed(op.started)))
     }
 
     fn open_search(&mut self) {
@@ -5643,6 +5644,40 @@ fn parse_paste_paths(text: &str) -> Vec<String> {
     match shell_split(trimmed) {
         Ok(parts) if parts.len() > 1 => parts,
         _ => vec![trimmed.to_string()],
+    }
+}
+
+/// What the snapshot harness needs and the main loop does not: a way to tell
+/// when the worker threads are done, and a way to reach a phase of a load that
+/// is over too quickly to catch.  See [`crate::test_harness`].
+#[cfg(test)]
+impl App {
+    /// Whether any worker thread still owes an answer that would change the
+    /// screen.  A test drives [`Self::poll_backend_events`] until this is
+    /// false, the way the main loop polls every frame.
+    pub(crate) fn has_work_in_flight(&self) -> bool {
+        self.accounts.iter().any(|account| {
+            account.mailbox_loader.is_some()
+                || account.message_loader.is_some()
+                || !account.commit_batches.is_empty()
+        }) || self.outgoing.is_some()
+            || self
+                .save_attachment
+                .as_ref()
+                .is_some_and(|dialog| dialog.is_busy())
+    }
+
+    /// Put the visible account's running load into `phase`.
+    ///
+    /// The overlay's whole content is the phase it shows, but only the first
+    /// and the last -- connecting, and failing -- stay up long enough for a
+    /// test to catch: the moment the header count in `Receiving` is known, the
+    /// same poll delivers the messages that replace the overlay.  Setting the
+    /// phase is the only way to see what it looks like on the way past.
+    pub(crate) fn set_load_phase(&mut self, phase: LoadPhase) {
+        if let Some(loading) = self.current_account_mut().loading.as_mut() {
+            loading.phase = phase;
+        }
     }
 }
 

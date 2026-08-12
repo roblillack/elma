@@ -9,6 +9,7 @@ use crate::app::{
     LoadingState, MessageViewState, ProgressMode, SaveAttachmentDialog, SaveAttachmentFocus,
     ShortcutMenu, byte_index_for,
 };
+use crate::clock;
 use crate::model::{MailboxKind, MessageAttachment, MessageStatus, format_size};
 use crate::viewer;
 use ratatui::{
@@ -19,7 +20,6 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap},
 };
 use std::time::Duration;
-use time::OffsetDateTime;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const ACTION_BAR_BG: Color = Color::Rgb(211, 211, 211);
@@ -1112,7 +1112,7 @@ fn render_message_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     app.set_inbox_scroll_top(top);
 
-    let now = OffsetDateTime::now_utc();
+    let now = clock::now_utc();
     let widths = [
         Constraint::Length(4),
         Constraint::Length(14),

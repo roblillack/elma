@@ -7,6 +7,10 @@ authors = ["Rob Lillack <rob@lillack.net>"]
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/roblillack/elma"
+# The snapshots are half a megabyte of SVG that only `cargo test` ever reads,
+# and the tests that read them are `#[cfg(test)]`, so a published build never
+# misses them.
+exclude = ["src/snapshots"]
 
 [[bin]]
 name = "elma"
@@ -48,3 +52,12 @@ shell-words = "1"
 tempfile = "3"
 mime_guess = "2"
 unicode-width = "0.2"
+
+[dev-dependencies]
+# Drives the SVG snapshot tests in `src/snapshot_tests.rs`: review changed
+# frames with `cargo insta review`.
+insta = "1.43"
+# `macros` is what lets the fixture mailbox write its dates down as
+# `datetime!(2026-03-14 08:15 UTC)`. Only the tests need it, and dev-dependency
+# features stay out of a normal build.
+time = { version = "0.3", features = ["macros"] }

@@ -1,6 +1,9 @@
 mod app;
 mod backend;
+mod clock;
 mod model;
+#[cfg(test)]
+mod test_harness;
 mod ui;
 mod viewer;
 

@@ -252,3 +252,31 @@ files that came with it. Inline images stay behind on a forward as well: the
 quoted body no longer references them, so carrying them over would attach a
 signature logo to every forwarded newsletter.
 
+## Development
+
+`cargo test` runs the unit tests and the snapshot tests together.
+
+### Snapshot tests
+
+Every major view — message list, viewer, composer, search, the loading
+overlay, the mailbox and account choosers, the save-attachment dialog — is
+covered by a snapshot test that drives the real application through synthetic
+key events and renders the resulting terminal to SVG. The tests live in
+`src/snapshot_tests.rs`, the harness that runs them in `src/test_harness.rs`,
+and the frames themselves in `src/snapshots/*.snap.svg` — open one in a browser
+to see exactly what the client drew, colours and all.
+
+Nothing in a frame comes from the machine it was taken on: the mail comes from
+a fixture backend rather than the randomised mock one, and the clock the views
+read (`src/clock.rs`) is frozen for the duration of a test, so the dates in the
+message list and the seconds next to a throbber are the same on every run.
+
+A change to the UI therefore shows up as a changed frame. Review the difference
+with
+
+```bash
+cargo insta review        # cargo install cargo-insta
+```
+
+which shows each changed snapshot and writes back the ones you accept, or set
+`INSTA_UPDATE=always` to take the new frames unseen.

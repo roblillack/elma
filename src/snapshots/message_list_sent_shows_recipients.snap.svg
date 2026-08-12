@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="640" viewBox="0 0 1000 640" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="16px">
+<rect width="100%" height="100%" fill="#101010"/>
+<rect x="0" y="0" width="1000" height="20" fill="#d3d3d3"/>
+<text x="0" y="15" fill="#696969" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">^Q:Quit g:GoToMailbox G:Accounts c:Compose Enter:Open s:Star +/=:Important r:Reply y:Archive d:Delet</text>
+<text x="0" y="35" fill="#d8d8d8" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">     [Mar 11 12:12] billing@vendor.examp  1.9K  Payment scheduled                                   </text>
+<rect x="0" y="40" width="1000" height="20" fill="#d8d8d8"/>
+<text x="0" y="55" fill="#101010" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">     [Mar 13 18:40] mira.tomassi@example  4.2K  Re: Release notes for 0.3                           </text>
+<rect x="0" y="620" width="1000" height="20" fill="#d3d3d3"/>
+<text x="0" y="635" fill="#696969" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Personal • Sent — message 2/2, 0 scheduled actions, got 0 events — Opened Sent.                     </text>
+</svg>
