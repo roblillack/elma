@@ -4,16 +4,12 @@
 <text x="0" y="15" fill="#696969" textLength="930" lengthAdjust="spacingAndGlyphs" xml:space="preserve">^Q:Quit g:GoToMailbox G:Accounts c:Compose /:Search                                          </text>
 <rect x="930" y="0" width="70" height="20" fill="#d3d3d3"/>
 <text x="930" y="15" fill="#cc0000" textLength="70" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[     ]</text>
-<rect x="290" y="260" width="420" height="20" fill="#d3d3d3"/>
-<text x="290" y="275" fill="#696969" textLength="420" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌────────────────────────────────────────┐</text>
 <rect x="290" y="280" width="10" height="20" fill="#d3d3d3"/>
-<text x="290" y="295" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<rect x="300" y="280" width="10" height="20" fill="#d3d3d3"/>
-<rect x="310" y="280" width="160" height="20" fill="#d3d3d3"/>
-<text x="310" y="295" fill="#005c5e" textLength="160" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Personal • Inbox</text>
-<rect x="470" y="280" width="230" height="20" fill="#d3d3d3"/>
-<rect x="700" y="280" width="10" height="20" fill="#d3d3d3"/>
-<text x="700" y="295" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="290" y="295" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌</text>
+<rect x="300" y="280" width="180" height="20" fill="#d3d3d3"/>
+<text x="300" y="295" fill="#204a87" textLength="180" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> Personal • Inbox </text>
+<rect x="480" y="280" width="230" height="20" fill="#d3d3d3"/>
+<text x="480" y="295" fill="#696969" textLength="230" lengthAdjust="spacingAndGlyphs" xml:space="preserve">──────────────────────┐</text>
 <rect x="290" y="300" width="10" height="20" fill="#d3d3d3"/>
 <text x="290" y="315" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="300" y="300" width="400" height="20" fill="#d3d3d3"/>

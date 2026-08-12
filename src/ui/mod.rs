@@ -293,7 +293,6 @@ fn render_loading_overlay(
     };
 
     let failed = matches!(state.phase, LoadPhase::Failed(_));
-    let accent = if failed { surface.hot } else { surface.accent };
 
     let title = format!("{account} • {mailbox}");
     let elapsed = state.elapsed();
@@ -324,8 +323,9 @@ fn render_loading_overlay(
     // many rows it wraps to rather than clipping the half that says why.
     let text_width_available = width.saturating_sub(4).max(1) as usize;
     let detail_rows = text_width(&detail).div_ceil(text_width_available).max(1) as u16;
-    let height = (4 + detail_rows).min(area.height);
-    if height < 5 {
+    // Two borders and the status line, plus however far the detail wraps.
+    let height = (3 + detail_rows).min(area.height);
+    if height < 4 {
         return;
     }
 
@@ -334,11 +334,13 @@ fn render_loading_overlay(
     let popup = Rect::new(x, y, width, height);
 
     // Same surface as every other popup: the frame carries the popup background
-    // rather than letting the message list show through it.
+    // rather than letting the message list show through it.  The overlay takes
+    // no keys, so its frame carries a name and nothing else.
     let block = Block::default()
         .borders(Borders::ALL)
         .style(surface.style())
         .border_style(surface.border_style())
+        .title_top(surface.title(&title))
         .padding(Padding::horizontal(1));
     let inner = block.inner(popup);
 
@@ -349,17 +351,16 @@ fn render_loading_overlay(
         return;
     }
 
-    // With the frame plain, the accent is what marks a failure as one.
+    // The name in the frame says which mailbox is being waited on, so it is the
+    // headline underneath that has to say a failure is one.
     let status_style = if failed {
-        Style::default().fg(accent).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(surface.hot)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
     let lines = vec![
-        Line::from(Span::styled(
-            title,
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        )),
         Line::from(Span::styled(status, status_style)),
         Line::from(Span::styled(detail, surface.muted_style())),
     ];
@@ -410,7 +411,6 @@ fn render_search_popup(frame: &mut Frame<'_>, area: Rect, app: &App, surface: Su
     let margin_top: u16 = 1;
     let margin_right: u16 = 3;
 
-    let title = " Search ";
     let line1 = "Showing results for:";
     // 1 char padding on each side inside the border
     let inner_width = (line1.len() as u16).max(value.len() as u16) + 2;
@@ -434,32 +434,12 @@ fn render_search_popup(frame: &mut Frame<'_>, area: Rect, app: &App, surface: Su
     let menu_style = Style::default().bg(surface.bg).fg(surface.border);
     let text_style = Style::default().fg(surface.fg);
 
-    let key_style = Style::default()
-        .fg(surface.hot)
-        .add_modifier(Modifier::BOLD);
-    let sep_style = Style::default().fg(surface.border);
-
-    let bottom_title = Line::from(vec![
-        Span::styled("/", key_style),
-        Span::styled(":", sep_style),
-        Span::styled("Change", text_style),
-        Span::raw("  "),
-        Span::styled("Esc", key_style),
-        Span::styled(":", sep_style),
-        Span::styled("Clear", text_style),
-    ]);
-
     let block = Block::default()
         .borders(Borders::ALL)
         .style(menu_style)
         .border_style(surface.border_style())
-        .title_top(Line::styled(
-            title,
-            Style::default()
-                .fg(surface.heading)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .title_bottom(bottom_title)
+        .title_top(surface.title("Search"))
+        .title_bottom(surface.key_hints(&[("/", "Change"), ("Esc", "Clear")]))
         .padding(Padding::horizontal(1));
 
     let value_style = text_style.add_modifier(Modifier::BOLD);
@@ -527,7 +507,11 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
     let block = Block::default()
         .borders(Borders::ALL)
         .style(surface.style())
-        .border_style(surface.border_style());
+        .border_style(surface.border_style())
+        .title_top(surface.title(app.compose_title()))
+        // Whatever covers the dialog has the keys, so the dialog stops
+        // offering its own -- the same rule that empties them mid-send.
+        .title_bottom(surface.key_hints(if covered { &[] } else { app.compose_keys() }));
     let inner = block.inner(modal_area);
 
     frame.render_widget(Clear, modal_area);
@@ -547,10 +531,11 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
         (attachment_count as u16).saturating_add(1).min(6)
     };
 
+    // The name and the keys live in the frame, so the first row inside the
+    // dialog is the first field.
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
             Constraint::Length(4),
             Constraint::Length(attachments_height),
             Constraint::Min(4),
@@ -558,11 +543,6 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
             Constraint::Length(1),
         ])
         .split(inner);
-
-    let header = Paragraph::new(app.compose_action_bar())
-        .style(surface.style())
-        .alignment(Alignment::Center);
-    frame.render_widget(header, layout[0]);
 
     let field_rows = Layout::default()
         .direction(Direction::Vertical)
@@ -572,7 +552,7 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
             Constraint::Length(1),
             Constraint::Length(1),
         ])
-        .split(layout[1]);
+        .split(layout[0]);
 
     let mut cursor_pos = None;
 
@@ -594,10 +574,10 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
 
     if attachments_height > 0 {
         let state = app.compose_state().expect("compose state should exist");
-        render_compose_attachments(frame, layout[2], state, surface);
+        render_compose_attachments(frame, layout[1], state, surface);
     }
 
-    render_compose_body(frame, layout[3], app, surface);
+    render_compose_body(frame, layout[2], app, surface);
 
     // While the backend has the message the whole view is read-only, so nothing
     // offers focus: no lit button, no cursor.
@@ -608,15 +588,14 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
 
     {
         let state = app.compose_state().expect("compose state should exist");
-        render_compose_buttons(frame, layout[4], state, busy, surface);
+        render_compose_buttons(frame, layout[3], state, busy, surface);
     }
 
+    // The frame lists the keys, so the line under the buttons is left with what
+    // no key can tell the user.
     let status_text = pending_outgoing
         .or_else(|| app.compose_status_line().map(|text| text.to_string()))
-        .unwrap_or_else(|| {
-            "Tab to move between fields; Enter activates a button. Drop a file on the terminal to attach it."
-                .to_string()
-        });
+        .unwrap_or_else(|| "Drop a file on the terminal to attach it.".to_string());
     let status = Paragraph::new(status_text)
         .style(if busy {
             surface.style().fg(surface.key)
@@ -624,7 +603,7 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
             surface.style()
         })
         .alignment(Alignment::Center);
-    frame.render_widget(status, layout[5]);
+    frame.render_widget(status, layout[4]);
 
     if let Some(prompt) = app
         .compose_state()
@@ -775,13 +754,8 @@ fn render_attachment_prompt(
         .borders(Borders::ALL)
         .style(surface.style())
         .border_style(surface.border_style())
-        .title_top(Line::styled(" Attach file ", surface.label_style()))
-        .title_bottom(Line::from(vec![
-            Span::styled("Enter", surface.key_style()),
-            Span::raw(": attach  "),
-            Span::styled("Esc", surface.key_style()),
-            Span::raw(": cancel"),
-        ]));
+        .title_top(surface.title("Attach file"))
+        .title_bottom(surface.key_hints(&[("Enter", "Attach"), ("Esc", "Cancel")]));
     let inner = block.inner(area);
 
     frame.render_widget(Clear, area);
@@ -841,24 +815,16 @@ fn render_large_attachment_prompt(
     let y = modal_area.y + modal_area.height.saturating_sub(height) / 2;
     let area = Rect::new(x, y, width, height);
 
-    // A question about a limit, so the frame and the title take the key colour
-    // rather than the ordinary label one: this is the warning, not a form.
+    // A question about a limit rather than a form, so the frame is drawn in the
+    // warning colour -- but the name and the keys read the same as every other
+    // dialog's.
     let warning = surface.key_style().add_modifier(Modifier::BOLD);
     let block = Block::default()
         .borders(Borders::ALL)
         .style(surface.style())
         .border_style(surface.key_style())
-        .title_top(Line::styled(" Large attachment ", warning))
-        .title_bottom(Line::from(vec![
-            Span::styled("Enter", surface.key_style()),
-            Span::raw("/"),
-            Span::styled("y", surface.key_style()),
-            Span::raw(": attach  "),
-            Span::styled("Esc", surface.key_style()),
-            Span::raw("/"),
-            Span::styled("n", surface.key_style()),
-            Span::raw(": skip"),
-        ]));
+        .title_top(surface.title("Large attachment"))
+        .title_bottom(surface.key_hints(&[("Enter/y", "Attach"), ("Esc/n", "Skip")]));
     let inner = block.inner(area);
 
     frame.render_widget(Clear, area);
@@ -1423,10 +1389,14 @@ fn text_width(value: &str) -> usize {
 }
 
 fn render_shortcut_menu(frame: &mut Frame<'_>, menu: &ShortcutMenu, surface: Surface) {
-    let title = format!(" {} ", menu.title());
+    let title = surface.title(menu.title());
 
     let mut lines = Vec::new();
-    let key_style = surface.key_style().add_modifier(Modifier::BOLD);
+    // The menu is a column of key hints, so its keys are lit the way the ones
+    // along the bottom of a dialog frame are.
+    let key_style = Style::default()
+        .fg(surface.hot)
+        .add_modifier(Modifier::BOLD);
 
     for entry in menu.entries() {
         let line = Line::from(vec![
@@ -1442,7 +1412,7 @@ fn render_shortcut_menu(frame: &mut Frame<'_>, menu: &ShortcutMenu, surface: Sur
         .map(|line| line.width() as u16)
         .max()
         .unwrap_or(0);
-    let inner_width = content_width.max(title.len() as u16);
+    let inner_width = content_width.max(title.width() as u16);
     let inner_height = lines.len() as u16;
 
     if inner_width == 0 || inner_height == 0 {
@@ -1465,7 +1435,7 @@ fn render_shortcut_menu(frame: &mut Frame<'_>, menu: &ShortcutMenu, surface: Sur
         .borders(Borders::ALL)
         .style(surface.style())
         .border_style(surface.border_style())
-        .title_top(Line::styled(title, surface.label_style()));
+        .title_top(title);
 
     frame.render_widget(Clear, area);
     let paragraph = Paragraph::new(lines)
@@ -1504,14 +1474,12 @@ fn render_save_attachment_dialog(
         .borders(Borders::ALL)
         .border_style(surface.border_style())
         .style(surface.style())
-        .title_top(Line::styled(" Save attachment ", surface.label_style()))
-        .title_bottom(Line::from(vec![
-            Span::styled("Tab", surface.key_style()),
-            Span::raw(": switch focus  "),
-            Span::styled("Enter", surface.key_style()),
-            Span::raw(": save  "),
-            Span::styled("Esc", surface.key_style()),
-            Span::raw(": cancel"),
+        .title_top(surface.title("Save attachment"))
+        .title_bottom(surface.key_hints(&[
+            ("Tab", "Switch focus"),
+            ("Up/Down", "Pick"),
+            ("Enter", "Save"),
+            ("Esc", "Cancel"),
         ]));
     let inner = block.inner(area);
 
@@ -1650,9 +1618,9 @@ fn render_save_attachment_dialog(
             ),
         ])
     } else {
-        let status_text = dialog.status().map(|s| s.to_string()).unwrap_or_else(|| {
-            "Tab to change focus, Up/Down to pick an attachment, Enter to save.".to_string()
-        });
+        // The keys are in the frame, so this row stays clear until there is
+        // something to report about a save.
+        let status_text = dialog.status().unwrap_or_default().to_string();
         Line::from(Span::styled(status_text, surface.muted_style()))
     };
     frame.render_widget(
@@ -2031,7 +1999,9 @@ mod tests {
         use ratatui::{Terminal, backend::TestBackend};
 
         let state = LoadingState::in_phase(LoadPhase::Connecting);
-        let mut terminal = Terminal::new(TestBackend::new(70, 15)).expect("terminal");
+        // Four rows of overlay want an even number of rows around them for the
+        // margins above and below to come out equal.
+        let mut terminal = Terminal::new(TestBackend::new(70, 16)).expect("terminal");
         terminal
             .draw(|frame| {
                 let area = frame.area();

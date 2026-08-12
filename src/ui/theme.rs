@@ -22,6 +22,7 @@
 //! on the dark surfaces, its dark ones on the light surface.
 
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 
 /// Which of its two backgrounds the terminal is showing behind the client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,14 +52,14 @@ pub struct Surface {
     /// The frame around the popup -- a step back from `fg`, so the box reads as
     /// a container rather than as more text.
     pub border: Color,
-    /// Titles and field labels.
+    /// Field labels inside a dialog: `To:`, `Folder:`, `Attachments (3):`.
     pub accent: Color,
-    /// The search popup's title, which is a heading of a different kind: it
-    /// names a filter rather than a dialog.
+    /// The name of a dialog, in the top of its frame.  See [`Surface::title`].
     pub heading: Color,
-    /// Keys the user can press, and the value of whichever field has focus.
+    /// The value of whichever field has focus, and a warning that is not yet an
+    /// error.
     pub key: Color,
-    /// Errors, and the keys of the search popup's own two shortcuts.
+    /// Keys the user can press, and errors.
     pub hot: Color,
     /// Placeholders and help text: present, but not competing with `fg`.
     pub muted: Color,
@@ -86,7 +87,9 @@ const INK: Surface = Surface {
     accent: Color::Cyan,
     heading: Color::LightBlue,
     key: Color::Yellow,
-    hot: Color::Red,
+    // Tango's bright scarlet.  The normal one is dark enough against black that
+    // a lit key reads as a smudge.
+    hot: Color::LightRed,
     // Tango Aluminium 4.  Brighter than the DarkGray placeholders used to be,
     // which on black were barely there.
     muted: Color::Rgb(136, 138, 133),
@@ -187,6 +190,40 @@ impl Surface {
             .fg(self.select_fg)
             .bg(self.select_bg)
             .add_modifier(Modifier::BOLD)
+    }
+
+    /// A dialog's name, for the top of its frame.
+    ///
+    /// Every popup that has a name wears it the same way -- in the frame rather
+    /// than on a line of its own -- so that the first row inside a dialog is
+    /// always its content.
+    pub fn title(self, name: &str) -> Line<'static> {
+        Line::styled(
+            format!(" {name} "),
+            Style::new().fg(self.heading).add_modifier(Modifier::BOLD),
+        )
+    }
+
+    /// The keys a dialog takes, for the bottom of its frame: `Enter:Save
+    /// Esc:Cancel`, the key lit and the action beside it.
+    ///
+    /// Reads as the action bar does, which is where a user looks for keys
+    /// everywhere else in the client.
+    pub fn key_hints(self, hints: &[(&str, &str)]) -> Line<'static> {
+        let key_style = Style::new().fg(self.hot).add_modifier(Modifier::BOLD);
+        let separator_style = Style::new().fg(self.border);
+        let action_style = Style::new().fg(self.fg);
+
+        let mut spans = Vec::with_capacity(hints.len() * 4);
+        for (key, action) in hints {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled((*key).to_string(), key_style));
+            spans.push(Span::styled(":", separator_style));
+            spans.push(Span::styled((*action).to_string(), action_style));
+        }
+        Line::from(spans)
     }
 }
 

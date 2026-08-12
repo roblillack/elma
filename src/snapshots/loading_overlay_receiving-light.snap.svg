@@ -4,16 +4,12 @@
 <text x="0" y="15" fill="#696969" textLength="930" lengthAdjust="spacingAndGlyphs" xml:space="preserve">^Q:Quit g:GoToMailbox G:Accounts c:Compose /:Search                                          </text>
 <rect x="930" y="0" width="70" height="20" fill="#d3d3d3"/>
 <text x="930" y="15" fill="#cc0000" textLength="70" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[     ]</text>
-<rect x="340" y="260" width="310" height="20" fill="#2e3436"/>
-<text x="340" y="275" fill="#d3d3d3" textLength="310" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌─────────────────────────────┐</text>
 <rect x="340" y="280" width="10" height="20" fill="#2e3436"/>
-<text x="340" y="295" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<rect x="350" y="280" width="10" height="20" fill="#2e3436"/>
-<rect x="360" y="280" width="160" height="20" fill="#2e3436"/>
-<text x="360" y="295" fill="#06989a" textLength="160" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Personal • Inbox</text>
-<rect x="520" y="280" width="120" height="20" fill="#2e3436"/>
-<rect x="640" y="280" width="10" height="20" fill="#2e3436"/>
-<text x="640" y="295" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="340" y="295" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌</text>
+<rect x="350" y="280" width="180" height="20" fill="#2e3436"/>
+<text x="350" y="295" fill="#729fcf" textLength="180" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> Personal • Inbox </text>
+<rect x="530" y="280" width="120" height="20" fill="#2e3436"/>
+<text x="530" y="295" fill="#d3d3d3" textLength="120" lengthAdjust="spacingAndGlyphs" xml:space="preserve">───────────┐</text>
 <rect x="340" y="300" width="10" height="20" fill="#2e3436"/>
 <text x="340" y="315" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="350" y="300" width="290" height="20" fill="#2e3436"/>

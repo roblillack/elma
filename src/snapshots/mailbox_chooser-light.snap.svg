@@ -28,14 +28,14 @@
 <rect x="0" y="420" width="10" height="20" fill="#2e3436"/>
 <text x="0" y="435" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌</text>
 <rect x="10" y="420" width="70" height="20" fill="#2e3436"/>
-<text x="10" y="435" fill="#06989a" textLength="70" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> Go to </text>
+<text x="10" y="435" fill="#729fcf" textLength="70" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> Go to </text>
 <rect x="80" y="420" width="70" height="20" fill="#2e3436"/>
 <text x="80" y="435" fill="#d3d3d3" textLength="70" lengthAdjust="spacingAndGlyphs" xml:space="preserve">──────┐</text>
 <rect x="0" y="440" width="10" height="20" fill="#2e3436"/>
 <text x="0" y="455" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="10" y="440" width="10" height="20" fill="#2e3436"/>
 <rect x="20" y="440" width="10" height="20" fill="#2e3436"/>
-<text x="20" y="455" fill="#c4a000" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">i</text>
+<text x="20" y="455" fill="#ef2929" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">i</text>
 <rect x="30" y="440" width="110" height="20" fill="#2e3436"/>
 <text x="30" y="455" fill="#eeeeec" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  Inbox    </text>
 <rect x="140" y="440" width="10" height="20" fill="#2e3436"/>
@@ -44,7 +44,7 @@
 <text x="0" y="475" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="10" y="460" width="10" height="20" fill="#2e3436"/>
 <rect x="20" y="460" width="10" height="20" fill="#2e3436"/>
-<text x="20" y="475" fill="#c4a000" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">s</text>
+<text x="20" y="475" fill="#ef2929" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">s</text>
 <rect x="30" y="460" width="110" height="20" fill="#2e3436"/>
 <text x="30" y="475" fill="#eeeeec" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  Starred  </text>
 <rect x="140" y="460" width="10" height="20" fill="#2e3436"/>
@@ -53,7 +53,7 @@
 <text x="0" y="495" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="10" y="480" width="10" height="20" fill="#2e3436"/>
 <rect x="20" y="480" width="10" height="20" fill="#2e3436"/>
-<text x="20" y="495" fill="#c4a000" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">I</text>
+<text x="20" y="495" fill="#ef2929" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">I</text>
 <rect x="30" y="480" width="110" height="20" fill="#2e3436"/>
 <text x="30" y="495" fill="#eeeeec" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  Important</text>
 <rect x="140" y="480" width="10" height="20" fill="#2e3436"/>
@@ -62,7 +62,7 @@
 <text x="0" y="515" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="10" y="500" width="10" height="20" fill="#2e3436"/>
 <rect x="20" y="500" width="10" height="20" fill="#2e3436"/>
-<text x="20" y="515" fill="#c4a000" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">t</text>
+<text x="20" y="515" fill="#ef2929" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">t</text>
 <rect x="30" y="500" width="110" height="20" fill="#2e3436"/>
 <text x="30" y="515" fill="#eeeeec" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  Sent     </text>
 <rect x="140" y="500" width="10" height="20" fill="#2e3436"/>
@@ -71,7 +71,7 @@
 <text x="0" y="535" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="10" y="520" width="10" height="20" fill="#2e3436"/>
 <rect x="20" y="520" width="10" height="20" fill="#2e3436"/>
-<text x="20" y="535" fill="#c4a000" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">d</text>
+<text x="20" y="535" fill="#ef2929" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">d</text>
 <rect x="30" y="520" width="110" height="20" fill="#2e3436"/>
 <text x="30" y="535" fill="#eeeeec" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  Drafts   </text>
 <rect x="140" y="520" width="10" height="20" fill="#2e3436"/>
@@ -80,7 +80,7 @@
 <text x="0" y="555" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="10" y="540" width="10" height="20" fill="#2e3436"/>
 <rect x="20" y="540" width="10" height="20" fill="#2e3436"/>
-<text x="20" y="555" fill="#c4a000" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">a</text>
+<text x="20" y="555" fill="#ef2929" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">a</text>
 <rect x="30" y="540" width="110" height="20" fill="#2e3436"/>
 <text x="30" y="555" fill="#eeeeec" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  Archive  </text>
 <rect x="140" y="540" width="10" height="20" fill="#2e3436"/>
@@ -89,7 +89,7 @@
 <text x="0" y="575" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="10" y="560" width="10" height="20" fill="#2e3436"/>
 <rect x="20" y="560" width="10" height="20" fill="#2e3436"/>
-<text x="20" y="575" fill="#c4a000" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">S</text>
+<text x="20" y="575" fill="#ef2929" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">S</text>
 <rect x="30" y="560" width="110" height="20" fill="#2e3436"/>
 <text x="30" y="575" fill="#eeeeec" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  Spam     </text>
 <rect x="140" y="560" width="10" height="20" fill="#2e3436"/>
@@ -98,7 +98,7 @@
 <text x="0" y="595" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="10" y="580" width="10" height="20" fill="#2e3436"/>
 <rect x="20" y="580" width="10" height="20" fill="#2e3436"/>
-<text x="20" y="595" fill="#c4a000" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">T</text>
+<text x="20" y="595" fill="#ef2929" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">T</text>
 <rect x="30" y="580" width="110" height="20" fill="#2e3436"/>
 <text x="30" y="595" fill="#eeeeec" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  Trash    </text>
 <rect x="140" y="580" width="10" height="20" fill="#2e3436"/>

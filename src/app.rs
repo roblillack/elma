@@ -2742,16 +2742,28 @@ impl App {
         self.compose.as_mut()
     }
 
-    pub(crate) fn compose_action_bar(&self) -> String {
-        let label = match self.compose.as_ref().and_then(|state| state.draft_id()) {
+    /// What the compose dialog is called, for the top of its frame.
+    pub(crate) fn compose_title(&self) -> &'static str {
+        match self.compose.as_ref().and_then(|state| state.draft_id()) {
             Some(_) => "Edit Draft",
             None => "Compose",
-        };
-        // Do not advertise keys that are locked out while the backend has the message.
-        if let Some((operation, _)) = self.pending_outgoing() {
-            return format!("{label} - {operation}...");
         }
-        format!("{label} - Tab:Next Shift+Tab:Prev Esc:Cancel Enter:Activate")
+    }
+
+    /// The keys compose takes, for the bottom of its frame.
+    ///
+    /// Empty while the backend has the message: every key is locked out until
+    /// the send comes back, and the wait is what the status line is saying.
+    pub(crate) fn compose_keys(&self) -> &'static [(&'static str, &'static str)] {
+        if self.pending_outgoing().is_some() {
+            return &[];
+        }
+        &[
+            ("Tab", "Next"),
+            ("Shift+Tab", "Prev"),
+            ("Esc", "Cancel"),
+            ("Enter", "Activate"),
+        ]
     }
 
     pub(crate) fn compose_status_line(&self) -> Option<&str> {
@@ -7543,10 +7555,14 @@ mod tests {
             app.compose.is_some(),
             "compose stays open until the backend confirms"
         );
+        assert_eq!(
+            app.pending_outgoing().map(|(operation, _)| operation),
+            Some("Sending message"),
+            "the status line has to say what the wait is for"
+        );
         assert!(
-            app.compose_action_bar().contains("Sending message"),
-            "the header has to say what the wait is for, got {:?}",
-            app.compose_action_bar()
+            app.compose_keys().is_empty(),
+            "no key works while the backend has the message, so none is offered"
         );
 
         release.send(()).expect("release the backend");
