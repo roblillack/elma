@@ -12,79 +12,94 @@
 <text x="0" y="195" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">- terms.txt (text/plain, 1.1K)                                                                      </text>
 <text x="0" y="215" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">- logo.png (image/png, 2.4K, inline)                                                                </text>
 <rect x="100" y="220" width="10" height="20" fill="#2e3436"/>
-<text x="100" y="235" fill="#06989a" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌</text>
+<text x="100" y="235" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌</text>
 <rect x="110" y="220" width="170" height="20" fill="#2e3436"/>
-<text x="110" y="235" fill="#06989a" textLength="170" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> Save attachment </text>
+<text x="110" y="235" fill="#729fcf" textLength="170" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> Save attachment </text>
 <rect x="280" y="220" width="620" height="20" fill="#2e3436"/>
-<text x="280" y="235" fill="#06989a" textLength="620" lengthAdjust="spacingAndGlyphs" xml:space="preserve">─────────────────────────────────────────────────────────────┐</text>
+<text x="280" y="235" fill="#d3d3d3" textLength="620" lengthAdjust="spacingAndGlyphs" xml:space="preserve">─────────────────────────────────────────────────────────────┐</text>
 <rect x="100" y="240" width="10" height="20" fill="#2e3436"/>
-<text x="100" y="255" fill="#06989a" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="100" y="255" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="110" y="240" width="70" height="20" fill="#2e3436"/>
 <text x="110" y="255" fill="#06989a" textLength="70" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Folder:</text>
 <rect x="180" y="240" width="710" height="20" fill="#2e3436"/>
 <rect x="890" y="240" width="10" height="20" fill="#2e3436"/>
-<text x="890" y="255" fill="#06989a" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="890" y="255" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="100" y="260" width="10" height="20" fill="#2e3436"/>
-<text x="100" y="275" fill="#06989a" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="100" y="275" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="110" y="260" width="10" height="20" fill="#2e3436"/>
 <rect x="120" y="260" width="190" height="20" fill="#555753"/>
 <text x="120" y="275" fill="#c4a000" textLength="190" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">/home/rob/Downloads</text>
 <rect x="310" y="260" width="580" height="20" fill="#2e3436"/>
 <rect x="890" y="260" width="10" height="20" fill="#2e3436"/>
-<text x="890" y="275" fill="#06989a" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="890" y="275" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="100" y="280" width="10" height="20" fill="#2e3436"/>
-<text x="100" y="295" fill="#06989a" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="100" y="295" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="110" y="280" width="780" height="20" fill="#2e3436"/>
 <rect x="890" y="280" width="10" height="20" fill="#2e3436"/>
-<text x="890" y="295" fill="#06989a" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="890" y="295" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="100" y="300" width="10" height="20" fill="#2e3436"/>
-<text x="100" y="315" fill="#06989a" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="100" y="315" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="110" y="300" width="160" height="20" fill="#2e3436"/>
 <text x="110" y="315" fill="#06989a" textLength="160" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Attachments (3):</text>
 <rect x="270" y="300" width="620" height="20" fill="#2e3436"/>
 <rect x="890" y="300" width="10" height="20" fill="#2e3436"/>
-<text x="890" y="315" fill="#06989a" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="890" y="315" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="100" y="320" width="10" height="20" fill="#2e3436"/>
-<text x="100" y="335" fill="#06989a" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="100" y="335" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="110" y="320" width="470" height="20" fill="#555753"/>
 <text x="110" y="335" fill="#eeeeec" textLength="470" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▶ invoice-2026-0342.pdf  (application/pdf, 14K)</text>
 <rect x="580" y="320" width="310" height="20" fill="#2e3436"/>
 <rect x="890" y="320" width="10" height="20" fill="#2e3436"/>
-<text x="890" y="335" fill="#06989a" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="890" y="335" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="100" y="340" width="10" height="20" fill="#2e3436"/>
-<text x="100" y="355" fill="#06989a" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="100" y="355" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="110" y="340" width="780" height="20" fill="#2e3436"/>
 <text x="110" y="355" fill="#eeeeec" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  terms.txt  (text/plain, 1.1K)                                               </text>
 <rect x="890" y="340" width="10" height="20" fill="#2e3436"/>
-<text x="890" y="355" fill="#06989a" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="890" y="355" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="100" y="360" width="10" height="20" fill="#2e3436"/>
-<text x="100" y="375" fill="#06989a" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="100" y="375" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="110" y="360" width="780" height="20" fill="#2e3436"/>
 <text x="110" y="375" fill="#eeeeec" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  logo.png  (image/png, 2.4K, inline)                                         </text>
 <rect x="890" y="360" width="10" height="20" fill="#2e3436"/>
-<text x="890" y="375" fill="#06989a" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="890" y="375" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="0" y="395" fill="#2e3436" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Dear custo</text>
 <rect x="100" y="380" width="10" height="20" fill="#2e3436"/>
-<text x="100" y="395" fill="#06989a" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<rect x="110" y="380" width="660" height="20" fill="#2e3436"/>
-<text x="110" y="395" fill="#555753" textLength="660" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Tab to change focus, Up/Down to pick an attachment, Enter to save.</text>
-<rect x="770" y="380" width="120" height="20" fill="#2e3436"/>
+<text x="100" y="395" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="380" width="780" height="20" fill="#2e3436"/>
 <rect x="890" y="380" width="10" height="20" fill="#2e3436"/>
-<text x="890" y="395" fill="#06989a" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="890" y="395" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="100" y="400" width="10" height="20" fill="#2e3436"/>
-<text x="100" y="415" fill="#06989a" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└</text>
+<text x="100" y="415" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└</text>
 <rect x="110" y="400" width="30" height="20" fill="#2e3436"/>
-<text x="110" y="415" fill="#c4a000" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Tab</text>
-<rect x="140" y="400" width="160" height="20" fill="#2e3436"/>
-<text x="140" y="415" fill="#06989a" textLength="160" lengthAdjust="spacingAndGlyphs" xml:space="preserve">: switch focus  </text>
-<rect x="300" y="400" width="50" height="20" fill="#2e3436"/>
-<text x="300" y="415" fill="#c4a000" textLength="50" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Enter</text>
-<rect x="350" y="400" width="80" height="20" fill="#2e3436"/>
-<text x="350" y="415" fill="#06989a" textLength="80" lengthAdjust="spacingAndGlyphs" xml:space="preserve">: save  </text>
-<rect x="430" y="400" width="30" height="20" fill="#2e3436"/>
-<text x="430" y="415" fill="#c4a000" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Esc</text>
-<rect x="460" y="400" width="440" height="20" fill="#2e3436"/>
-<text x="460" y="415" fill="#06989a" textLength="440" lengthAdjust="spacingAndGlyphs" xml:space="preserve">: cancel───────────────────────────────────┘</text>
+<text x="110" y="415" fill="#ef2929" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Tab</text>
+<rect x="140" y="400" width="10" height="20" fill="#2e3436"/>
+<text x="140" y="415" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
+<rect x="150" y="400" width="120" height="20" fill="#2e3436"/>
+<text x="150" y="415" fill="#eeeeec" textLength="120" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Switch focus</text>
+<rect x="270" y="400" width="20" height="20" fill="#2e3436"/>
+<rect x="290" y="400" width="70" height="20" fill="#2e3436"/>
+<text x="290" y="415" fill="#ef2929" textLength="70" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Up/Down</text>
+<rect x="360" y="400" width="10" height="20" fill="#2e3436"/>
+<text x="360" y="415" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
+<rect x="370" y="400" width="40" height="20" fill="#2e3436"/>
+<text x="370" y="415" fill="#eeeeec" textLength="40" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Pick</text>
+<rect x="410" y="400" width="20" height="20" fill="#2e3436"/>
+<rect x="430" y="400" width="50" height="20" fill="#2e3436"/>
+<text x="430" y="415" fill="#ef2929" textLength="50" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Enter</text>
+<rect x="480" y="400" width="10" height="20" fill="#2e3436"/>
+<text x="480" y="415" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
+<rect x="490" y="400" width="40" height="20" fill="#2e3436"/>
+<text x="490" y="415" fill="#eeeeec" textLength="40" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Save</text>
+<rect x="530" y="400" width="20" height="20" fill="#2e3436"/>
+<rect x="550" y="400" width="30" height="20" fill="#2e3436"/>
+<text x="550" y="415" fill="#ef2929" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Esc</text>
+<rect x="580" y="400" width="10" height="20" fill="#2e3436"/>
+<text x="580" y="415" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
+<rect x="590" y="400" width="60" height="20" fill="#2e3436"/>
+<text x="590" y="415" fill="#eeeeec" textLength="60" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Cancel</text>
+<rect x="650" y="400" width="250" height="20" fill="#2e3436"/>
+<text x="650" y="415" fill="#d3d3d3" textLength="250" lengthAdjust="spacingAndGlyphs" xml:space="preserve">────────────────────────┘</text>
 <text x="0" y="435" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">your invoice for February 2026 is attached as a PDF. The total is 1,248.00 EUR,                     </text>
 <text x="0" y="455" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">payable within 14 days.                                                                             </text>
 <text x="0" y="495" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> • Hosting, February 2026 — 899.00 EUR                                                              </text>

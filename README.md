@@ -120,6 +120,40 @@ cryptography provider that needs cmake and a C compiler to build — a build
 dependency Elma does without on purpose. The two should converge once that is
 resolved upstream (tracking issue: https://github.com/stalwartlabs/jmap-client/issues/34).
 
+### Colours
+
+Elma draws its popups — compose, the dialogs, the shortcut menus — on a surface
+of their own, and which surface reads as “this window has the keys” depends on
+what the terminal puts behind it. On a light terminal the focused popup is dark
+and whatever it covers is light grey; on a dark terminal the focused popup is
+light grey and what it covers is dark grey. Either way the box taking your
+keystrokes is the one that stands out.
+
+Which of the two the terminal is showing is worked out at startup, by asking the
+terminal for its background colour (the `OSC 11` query). Terminals that do not
+answer fall back to the `COLORFGBG` environment variable, and then to assuming a
+dark background. Say so in `~/.elmarc` to skip the question:
+
+```toml
+# "dark", "light", "mono", or "auto" to ask the terminal. Default: auto.
+theme = "light"
+```
+
+#### Without colour
+
+`--no-color` draws the whole interface in bold, faint, italics, underlining and
+reverse video instead — one theme that reads on a light terminal and a dark one
+alike, for monochrome terminals, for terminals whose palette you would rather
+Elma left alone, and for anyone who prefers it. The bars are reverse video,
+unread messages are bold, a deleted one is struck through, and the popup with
+the keys is the one framed in heavy lines while whatever it covers goes faint.
+
+The [`NO_COLOR`](https://no-color.org) environment variable does the same thing,
+and does it whatever `theme` says in the configuration file: the terminal
+library drops every colour Elma writes under `NO_COLOR` regardless, so the
+alternative would be a colour theme with its colours taken away. `theme =
+"mono"` asks for it permanently.
+
 ### General use
 
 Elma presents a terminal-based email client interface with a focus on keyboard navigation and

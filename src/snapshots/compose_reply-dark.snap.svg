@@ -10,97 +10,197 @@
 <text x="640" y="35" fill="#d3d7cf" textLength="360" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Holiday schedule for next year     </text>
 <text x="0" y="55" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve" text-decoration="line-through" opacity="0.6">D    [Mar 07 13:37] tickets@support.exam  3.4K  Ticket #4711 has been closed                        </text>
 <text x="0" y="75" fill="#75507b" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">!    [Mar </text>
-<text x="100" y="75" fill="#d3d7cf" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌──────────────────────────────────────────────────────────────────────────────┐</text>
+<rect x="100" y="60" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="75" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌</text>
+<rect x="110" y="60" width="90" height="20" fill="#d3d3d3"/>
+<text x="110" y="75" fill="#204a87" textLength="90" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> Compose </text>
+<rect x="200" y="60" width="700" height="20" fill="#d3d3d3"/>
+<text x="200" y="75" fill="#696969" textLength="700" lengthAdjust="spacingAndGlyphs" xml:space="preserve">─────────────────────────────────────────────────────────────────────┐</text>
 <text x="0" y="95" fill="#008b8b" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-style="italic">A    [Mar </text>
-<text x="100" y="95" fill="#d3d7cf" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="110" y="95" fill="#eeeeec" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve">          Compose - Tab:Next Shift+Tab:Prev Esc:Cancel Enter:Activate         </text>
-<text x="890" y="95" fill="#d3d7cf" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="0" y="115" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">     [Mar │</text>
-<text x="110" y="115" fill="#06989a" textLength="40" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">To: </text>
-<text x="150" y="115" fill="#eeeeec" textLength="740" lengthAdjust="spacingAndGlyphs" xml:space="preserve">billing@vendor.example                                                    </text>
-<text x="890" y="115" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│          </text>
-<text x="0" y="135" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> ○   [Mar │</text>
-<text x="110" y="135" fill="#06989a" textLength="40" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Cc: </text>
-<text x="150" y="135" fill="#555753" textLength="70" lengthAdjust="spacingAndGlyphs" xml:space="preserve">&lt;empty&gt;</text>
-<text x="890" y="135" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│          </text>
-<text x="0" y="155" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  →@ [Mar │</text>
-<text x="110" y="155" fill="#06989a" textLength="50" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Bcc: </text>
-<text x="160" y="155" fill="#555753" textLength="70" lengthAdjust="spacingAndGlyphs" xml:space="preserve">&lt;empty&gt;</text>
-<text x="890" y="155" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│          </text>
+<rect x="100" y="80" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="95" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="80" width="40" height="20" fill="#d3d3d3"/>
+<text x="110" y="95" fill="#005c5e" textLength="40" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">To: </text>
+<rect x="150" y="80" width="740" height="20" fill="#d3d3d3"/>
+<text x="150" y="95" fill="#2e3436" textLength="740" lengthAdjust="spacingAndGlyphs" xml:space="preserve">billing@vendor.example                                                    </text>
+<rect x="890" y="80" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="95" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="0" y="115" fill="#d3d7cf" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve">     [Mar </text>
+<rect x="100" y="100" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="115" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="100" width="40" height="20" fill="#d3d3d3"/>
+<text x="110" y="115" fill="#005c5e" textLength="40" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Cc: </text>
+<rect x="150" y="100" width="70" height="20" fill="#d3d3d3"/>
+<text x="150" y="115" fill="#555753" textLength="70" lengthAdjust="spacingAndGlyphs" xml:space="preserve">&lt;empty&gt;</text>
+<rect x="220" y="100" width="670" height="20" fill="#d3d3d3"/>
+<rect x="890" y="100" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="115" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="0" y="135" fill="#d3d7cf" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> ○   [Mar </text>
+<rect x="100" y="120" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="135" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="120" width="50" height="20" fill="#d3d3d3"/>
+<text x="110" y="135" fill="#005c5e" textLength="50" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Bcc: </text>
+<rect x="160" y="120" width="70" height="20" fill="#d3d3d3"/>
+<text x="160" y="135" fill="#555753" textLength="70" lengthAdjust="spacingAndGlyphs" xml:space="preserve">&lt;empty&gt;</text>
+<rect x="230" y="120" width="660" height="20" fill="#d3d3d3"/>
+<rect x="890" y="120" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="135" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="0" y="155" fill="#d3d7cf" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  →@ [Mar </text>
+<rect x="100" y="140" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="155" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="140" width="90" height="20" fill="#d3d3d3"/>
+<text x="110" y="155" fill="#005c5e" textLength="90" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Subject: </text>
+<rect x="200" y="140" width="690" height="20" fill="#d3d3d3"/>
+<text x="200" y="155" fill="#2e3436" textLength="690" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Re: Invoice 2026-0342 for February                                   </text>
+<rect x="890" y="140" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="155" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="0" y="175" fill="#d3d7cf" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> *   [Mar </text>
-<text x="100" y="175" fill="#d3d7cf" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="110" y="175" fill="#06989a" textLength="90" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Subject: </text>
-<text x="200" y="175" fill="#eeeeec" textLength="690" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Re: Invoice 2026-0342 for February                                   </text>
-<text x="890" y="175" fill="#d3d7cf" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="0" y="195" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  ↩  [Mar │</text>
-<rect x="110" y="180" width="780" height="20" fill="#555753"/>
-<text x="890" y="195" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│eek       </text>
+<rect x="100" y="160" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="175" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="160" width="780" height="20" fill="#babdb6"/>
+<rect x="890" y="160" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="175" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="0" y="195" fill="#d3d7cf" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  ↩  [Mar </text>
+<rect x="100" y="180" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="195" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="180" width="780" height="20" fill="#babdb6"/>
+<rect x="890" y="180" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="195" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="900" y="195" fill="#d3d7cf" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve">eek       </text>
 <text x="0" y="215" fill="#cc0000" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve">N    [Mar </text>
-<text x="100" y="215" fill="#d3d7cf" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<rect x="110" y="200" width="780" height="20" fill="#555753"/>
-<text x="890" y="215" fill="#d3d7cf" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="100" y="200" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="215" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="200" width="780" height="20" fill="#babdb6"/>
+<text x="110" y="215" fill="#8f5902" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">On Sat, 14 Mar 2026 08:15:00 +0000, billing@vendor.example wrote:             </text>
+<rect x="890" y="200" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="215" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="0" y="220" width="100" height="20" fill="#cc0000"/>
 <text x="0" y="235" fill="#2e3436" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">N⊛ @ [Mar </text>
-<text x="100" y="235" fill="#d3d7cf" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<rect x="110" y="220" width="780" height="20" fill="#555753"/>
-<text x="110" y="235" fill="#c4a000" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">On Sat, 14 Mar 2026 08:15:00 +0000, billing@vendor.example wrote:             </text>
-<text x="890" y="235" fill="#d3d7cf" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="100" y="220" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="235" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="220" width="780" height="20" fill="#babdb6"/>
+<rect x="890" y="220" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="235" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="900" y="220" width="100" height="20" fill="#cc0000"/>
 <text x="900" y="235" fill="#2e3436" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">bruary    </text>
-<text x="0" y="255" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">          │</text>
-<rect x="110" y="240" width="780" height="20" fill="#555753"/>
-<text x="890" y="255" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│          </text>
-<text x="0" y="275" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">          │</text>
-<rect x="110" y="260" width="780" height="20" fill="#555753"/>
-<text x="890" y="275" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│          </text>
-<text x="0" y="295" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">          │</text>
-<rect x="110" y="280" width="780" height="20" fill="#555753"/>
-<text x="890" y="295" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│          </text>
-<text x="0" y="315" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">          │</text>
-<rect x="110" y="300" width="780" height="20" fill="#555753"/>
-<text x="110" y="315" fill="#c4a000" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">|                                                                             </text>
-<text x="890" y="315" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│          </text>
-<text x="0" y="335" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">          │</text>
-<rect x="110" y="320" width="780" height="20" fill="#555753"/>
-<text x="110" y="335" fill="#c4a000" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">|                                                                             </text>
-<text x="890" y="335" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│          </text>
-<text x="0" y="355" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">          │</text>
-<rect x="110" y="340" width="780" height="20" fill="#555753"/>
-<text x="110" y="355" fill="#c4a000" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">|                                                                             </text>
-<text x="890" y="355" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│          </text>
-<text x="0" y="375" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">          │</text>
-<rect x="110" y="360" width="780" height="20" fill="#555753"/>
-<text x="110" y="375" fill="#c4a000" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">|                              Invoice 2026-0342                              </text>
-<text x="890" y="375" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│          </text>
-<text x="0" y="395" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">          │</text>
-<rect x="110" y="380" width="780" height="20" fill="#555753"/>
-<text x="110" y="395" fill="#c4a000" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">|                                                                             </text>
-<text x="890" y="395" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│          </text>
-<text x="0" y="415" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">          │</text>
-<rect x="110" y="400" width="780" height="20" fill="#555753"/>
-<text x="110" y="415" fill="#c4a000" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">|                                                                             </text>
-<text x="890" y="415" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│          </text>
-<text x="0" y="435" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">          │</text>
-<rect x="110" y="420" width="780" height="20" fill="#555753"/>
-<text x="110" y="435" fill="#c4a000" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">|                                                                             </text>
-<text x="890" y="435" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│          </text>
-<text x="0" y="455" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">          │</text>
-<rect x="110" y="440" width="780" height="20" fill="#555753"/>
-<text x="110" y="455" fill="#c4a000" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">| Dear customer,                                                              </text>
-<text x="890" y="455" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│          </text>
-<text x="0" y="475" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">          │</text>
-<rect x="110" y="460" width="780" height="20" fill="#555753"/>
-<text x="110" y="475" fill="#c4a000" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">|                                                                             </text>
-<text x="890" y="475" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│          </text>
-<text x="0" y="495" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">          │</text>
-<text x="110" y="495" fill="#eeeeec" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve">        [Attach file...]   [Cancel]   [Edit message]   [Draft]   [Send]       </text>
-<text x="890" y="495" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│          </text>
-<text x="0" y="515" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">          │</text>
-<text x="890" y="515" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│          </text>
-<text x="0" y="535" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">          │</text>
-<text x="110" y="535" fill="#eeeeec" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Tab to move between fields; Enter activates a button. Drop a file on the termi</text>
-<text x="890" y="535" fill="#d3d7cf" textLength="110" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│          </text>
-<text x="0" y="555" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">          └──────────────────────────────────────────────────────────────────────────────┘          </text>
+<rect x="100" y="240" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="255" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="240" width="780" height="20" fill="#babdb6"/>
+<rect x="890" y="240" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="255" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="100" y="260" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="275" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="260" width="780" height="20" fill="#babdb6"/>
+<rect x="890" y="260" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="275" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="100" y="280" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="295" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="280" width="780" height="20" fill="#babdb6"/>
+<text x="110" y="295" fill="#8f5902" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">|                                                                             </text>
+<rect x="890" y="280" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="295" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="100" y="300" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="315" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="300" width="780" height="20" fill="#babdb6"/>
+<text x="110" y="315" fill="#8f5902" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">|                                                                             </text>
+<rect x="890" y="300" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="315" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="100" y="320" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="335" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="320" width="780" height="20" fill="#babdb6"/>
+<text x="110" y="335" fill="#8f5902" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">|                                                                             </text>
+<rect x="890" y="320" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="335" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="100" y="340" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="355" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="340" width="780" height="20" fill="#babdb6"/>
+<text x="110" y="355" fill="#8f5902" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">|                              Invoice 2026-0342                              </text>
+<rect x="890" y="340" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="355" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="100" y="360" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="375" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="360" width="780" height="20" fill="#babdb6"/>
+<text x="110" y="375" fill="#8f5902" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">|                                                                             </text>
+<rect x="890" y="360" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="375" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="100" y="380" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="395" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="380" width="780" height="20" fill="#babdb6"/>
+<text x="110" y="395" fill="#8f5902" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">|                                                                             </text>
+<rect x="890" y="380" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="395" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="100" y="400" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="415" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="400" width="780" height="20" fill="#babdb6"/>
+<text x="110" y="415" fill="#8f5902" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">|                                                                             </text>
+<rect x="890" y="400" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="415" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="100" y="420" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="435" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="420" width="780" height="20" fill="#babdb6"/>
+<text x="110" y="435" fill="#8f5902" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">| Dear customer,                                                              </text>
+<rect x="890" y="420" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="435" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="100" y="440" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="455" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="440" width="780" height="20" fill="#babdb6"/>
+<text x="110" y="455" fill="#8f5902" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">|                                                                             </text>
+<rect x="890" y="440" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="455" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="100" y="460" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="475" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="460" width="780" height="20" fill="#babdb6"/>
+<text x="110" y="475" fill="#8f5902" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">| your invoice for February 2026 is attached as a PDF. The total is 1,248.00  </text>
+<rect x="890" y="460" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="475" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="100" y="480" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="495" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="480" width="780" height="20" fill="#d3d3d3"/>
+<text x="110" y="495" fill="#2e3436" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve">        [Attach file...]   [Cancel]   [Edit message]   [Draft]   [Send]       </text>
+<rect x="890" y="480" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="495" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="100" y="500" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="515" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="500" width="780" height="20" fill="#d3d3d3"/>
+<rect x="890" y="500" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="515" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="100" y="520" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="535" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="110" y="520" width="780" height="20" fill="#d3d3d3"/>
+<text x="110" y="535" fill="#2e3436" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve">                   Drop a file on the terminal to attach it.                  </text>
+<rect x="890" y="520" width="10" height="20" fill="#d3d3d3"/>
+<text x="890" y="535" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="100" y="540" width="10" height="20" fill="#d3d3d3"/>
+<text x="100" y="555" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└</text>
+<rect x="110" y="540" width="30" height="20" fill="#d3d3d3"/>
+<text x="110" y="555" fill="#a40000" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Tab</text>
+<rect x="140" y="540" width="10" height="20" fill="#d3d3d3"/>
+<text x="140" y="555" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
+<rect x="150" y="540" width="40" height="20" fill="#d3d3d3"/>
+<text x="150" y="555" fill="#2e3436" textLength="40" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Next</text>
+<rect x="190" y="540" width="20" height="20" fill="#d3d3d3"/>
+<rect x="210" y="540" width="90" height="20" fill="#d3d3d3"/>
+<text x="210" y="555" fill="#a40000" textLength="90" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Shift+Tab</text>
+<rect x="300" y="540" width="10" height="20" fill="#d3d3d3"/>
+<text x="300" y="555" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
+<rect x="310" y="540" width="40" height="20" fill="#d3d3d3"/>
+<text x="310" y="555" fill="#2e3436" textLength="40" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Prev</text>
+<rect x="350" y="540" width="20" height="20" fill="#d3d3d3"/>
+<rect x="370" y="540" width="30" height="20" fill="#d3d3d3"/>
+<text x="370" y="555" fill="#a40000" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Esc</text>
+<rect x="400" y="540" width="10" height="20" fill="#d3d3d3"/>
+<text x="400" y="555" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
+<rect x="410" y="540" width="60" height="20" fill="#d3d3d3"/>
+<text x="410" y="555" fill="#2e3436" textLength="60" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Cancel</text>
+<rect x="470" y="540" width="20" height="20" fill="#d3d3d3"/>
+<rect x="490" y="540" width="50" height="20" fill="#d3d3d3"/>
+<text x="490" y="555" fill="#a40000" textLength="50" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Enter</text>
+<rect x="540" y="540" width="10" height="20" fill="#d3d3d3"/>
+<text x="540" y="555" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
+<rect x="550" y="540" width="80" height="20" fill="#d3d3d3"/>
+<text x="550" y="555" fill="#2e3436" textLength="80" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Activate</text>
+<rect x="630" y="540" width="270" height="20" fill="#d3d3d3"/>
+<text x="630" y="555" fill="#696969" textLength="270" lengthAdjust="spacingAndGlyphs" xml:space="preserve">──────────────────────────┘</text>
 <rect x="0" y="620" width="1000" height="20" fill="#d3d3d3"/>
 <text x="0" y="635" fill="#696969" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Personal • Inbox — message 11/11, 0 scheduled actions, got 0 events — Replying to 'Invoice 2026-0342</text>
 </svg>

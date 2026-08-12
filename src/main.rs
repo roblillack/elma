@@ -2,6 +2,7 @@ mod app;
 mod backend;
 mod clock;
 mod model;
+mod terminal;
 #[cfg(test)]
 mod test_harness;
 mod ui;
@@ -14,15 +15,10 @@ use crate::backend::{
     jmap::{JmapAuth, JmapBackend, JmapConfig},
     mock::MockBackend,
 };
+use crate::terminal::ThemePreference;
 use anyhow::{Context, Result, anyhow};
-use crossterm::{
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use ratatui::{Terminal, prelude::CrosstermBackend};
+use crossterm::event::{self, Event};
 use serde::Deserialize;
-use std::io::{self, Stdout};
 use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
 const TICK_RATE: Duration = Duration::from_millis(100);
@@ -34,10 +30,12 @@ const DEFAULT_JMAP_SESSION_URL: &str = "https://api.fastmail.com/jmap/session";
 fn main() -> Result<()> {
     let args = std::env::args().skip(1);
     let mut demo_mode = false;
+    let mut no_colour = false;
 
     for arg in args {
         match arg.as_str() {
             "-D" | "--demo" => demo_mode = true,
+            "--no-color" | "--no-colour" => no_colour = true,
             "-h" | "--help" => {
                 print_usage();
                 return Ok(());
@@ -50,14 +48,22 @@ fn main() -> Result<()> {
         }
     }
 
-    let accounts = load_accounts(demo_mode)?;
+    let config = load_config()?;
+    let theme = ThemePreference::resolve(
+        no_colour,
+        config.as_ref().and_then(|config| config.theme.as_deref()),
+        terminal::no_colour_in_env(),
+    )
+    .with_context(|| format!("invalid theme in {}", config_path_display()))?;
+    let accounts = load_accounts(demo_mode, config)?;
 
     let mut app = App::new(accounts).context("failed to initialize application state")?;
-    run(&mut app).context("failed while running application loop")
+    run(&mut app, theme).context("failed while running application loop")
 }
 
-fn run(app: &mut App) -> Result<()> {
-    let mut terminal = init_terminal().context("failed to set up terminal")?;
+fn run(app: &mut App, theme_preference: ThemePreference) -> Result<()> {
+    let (mut terminal, theme) =
+        terminal::init(theme_preference).context("failed to set up terminal")?;
     let result = loop {
         app.poll_backend_events();
 
@@ -70,7 +76,7 @@ fn run(app: &mut App) -> Result<()> {
         }
 
         terminal
-            .draw(|frame| ui::render(frame, app))
+            .draw(|frame| ui::render(frame, app, theme))
             .context("failed to render frame")?;
 
         if app.should_quit() {
@@ -90,28 +96,8 @@ fn run(app: &mut App) -> Result<()> {
         }
     };
 
-    restore_terminal(terminal)?;
+    terminal::restore(terminal)?;
     result
-}
-
-fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
-    enable_raw_mode().context("failed to enable raw mode")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
-        .context("failed to enter alternate screen")?;
-    let backend = CrosstermBackend::new(stdout);
-    Terminal::new(backend).context("failed to create terminal instance")
-}
-
-fn restore_terminal(mut terminal: Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-    disable_raw_mode().context("failed to disable raw mode")?;
-    execute!(
-        terminal.backend_mut(),
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    )
-    .context("failed to leave alternate screen")?;
-    terminal.show_cursor().context("failed to show cursor")
 }
 
 fn print_usage() {
@@ -121,11 +107,13 @@ fn print_usage() {
     println!("    elma-rs [OPTIONS]");
     println!();
     println!("OPTIONS:");
-    println!("    -D, --demo    Run with the built-in mock backend (default)");
-    println!("    -h, --help    Show this help message");
+    println!("    -D, --demo      Run with the built-in mock backend (default)");
+    println!("        --no-color  Draw without colour, in bold and reverse video only");
+    println!("                    (also honours the NO_COLOR environment variable)");
+    println!("    -h, --help      Show this help message");
 }
 
-fn load_accounts(demo_mode: bool) -> Result<Vec<AccountDescriptor>> {
+fn load_accounts(demo_mode: bool, config: Option<Config>) -> Result<Vec<AccountDescriptor>> {
     if demo_mode {
         return Ok(vec![AccountDescriptor::new(
             "Demo",
@@ -133,7 +121,7 @@ fn load_accounts(demo_mode: bool) -> Result<Vec<AccountDescriptor>> {
         )]);
     }
 
-    match load_accounts_from_config()? {
+    match accounts_from_config(config)? {
         Some(accounts) if !accounts.is_empty() => Ok(accounts),
         Some(_) => {
             eprintln!(
@@ -156,7 +144,12 @@ fn load_accounts(demo_mode: bool) -> Result<Vec<AccountDescriptor>> {
     }
 }
 
-fn load_accounts_from_config() -> Result<Option<Vec<AccountDescriptor>>> {
+/// Read and parse `~/.elmarc`, if there is one.
+///
+/// Everything the file configures is worked out from the one value this
+/// returns, so a run cannot end up reading it twice and disagreeing with
+/// itself.
+fn load_config() -> Result<Option<Config>> {
     let path = match config_path() {
         Some(path) => path,
         None => return Ok(None),
@@ -168,8 +161,15 @@ fn load_accounts_from_config() -> Result<Option<Vec<AccountDescriptor>>> {
 
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("unable to read configuration file {}", path.display()))?;
-    let config: Config = toml::from_str(&raw)
+    let config = toml::from_str(&raw)
         .with_context(|| format!("unable to parse configuration file {}", path.display()))?;
+    Ok(Some(config))
+}
+
+fn accounts_from_config(config: Option<Config>) -> Result<Option<Vec<AccountDescriptor>>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
 
     if let Some(entries) = config.accounts {
         let mut accounts = Vec::new();
@@ -308,8 +308,18 @@ fn config_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".elmarc"))
 }
 
+/// Where the configuration would be, for an error message about what is in it.
+fn config_path_display() -> String {
+    config_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| ".elmarc".to_string())
+}
+
 #[derive(Debug, Deserialize)]
 struct Config {
+    /// `dark`, `light`, `mono` for no colour at all, or `auto` to ask the
+    /// terminal -- which is the default.
+    theme: Option<String>,
     #[serde(alias = "accounts")]
     accounts: Option<Vec<AccountConfig>>,
 }
