@@ -1,19 +1,20 @@
 # Elma – Electronic Mail Agent
 
-[![Build Status](https://github.com/roblillack/elma/workflows/build-lint-test/badge.svg?branch=master)](https://github.com/roblillack/elma/actions)
+[![Build Status](https://github.com/roblillack/elma/workflows/build-lint-test/badge.svg)](https://github.com/roblillack/elma/actions)
 [![Crates.io](https://img.shields.io/crates/v/elma-tui)](https://crates.io/crates/elma-tui)
 
-Elma is a Ratatui-based terminal mail user agent. It focuses on keyboard-driven
-navigation and efficiency, inspired by tools like Mutt, Pine, and Elm, while
-offering a modern feature set out-of-the-box, including:
+Elma is a Ratatui-based terminal mail user agent. It focuses on keyboard-driven navigation and efficiency, inspired by tools like Mutt, Pine, and Elm, while
+offering a modern feature set out-of-the-box.
+
+![Elma triaging a morning's mail: archiving, deleting and reporting spam, then committing the lot, saving an invoice's PDF and answering a colleague with the document she asked for attached](demo.gif)
+
+Features include:
 
 - Crisp HTML email rendering,
 - Server-side search, spam handling, and draft management,
-- Support for special-use mailboxes and labels, like starring and marking as
-  important,
+- Support for special-use mailboxes and labels, like starring and marking as important,
 - Multiple account support,
-- Attachments: an at-a-glance indicator in the message list, saving to disk,
-  and attaching files when composing,
+- Attachments: an at-a-glance indicator in the message list, saving to disk, and attaching files when composing,
 - Scheduled message actions (archive/delete),
 - Extensibility for additional backends.
 
@@ -192,7 +193,7 @@ Message status is indicated by a four symbol character prefix in the message lis
 - `!` schedules the message to move to spam.
 - `u` unschedules a pending action (delete/archive/spam/move-to-inbox), or toggles unread/read state on normal messages.
 - `s` toggles the star flag. In the message list `S` does the same; in the
-  message viewer `S` opens the *Save attachment* dialog instead (see
+  message viewer `S` opens the _Save attachment_ dialog instead (see
   [Attachments](#attachments)).
 - `c` composes a new message; `r` replies, `a` replies to all, and `f` forwards
   the selected or open message.
@@ -217,7 +218,7 @@ Messages that carry attachments are marked with `@` in the message list (see
 [Email flags](#email-flags)); opening one lists them above the body with their
 type and size.
 
-**Saving.** `S` in the message viewer opens the *Save attachment* dialog.
+**Saving.** `S` in the message viewer opens the _Save attachment_ dialog.
 `Tab` switches between the attachment list and the target folder, `Up`/`Down`
 pick an attachment, and `Enter` writes it. Images the body embeds are listed
 too, marked `inline` — the message list ignores them, but a photo sent that way
@@ -228,7 +229,7 @@ Backends that hand out attachment bodies on demand (JMAP) download in the
 background, so the dialog stays responsive; `Esc` closes it and cancels the
 save before anything is written.
 
-**Attaching.** In the compose view, `Tab` to the *Attach* button and press
+**Attaching.** In the compose view, `Tab` to the _Attach_ button and press
 `Enter` (or `a`) to get a path prompt; `~` and shell-style escapes are
 understood. Dropping files onto the terminal works too — Elma treats a paste
 as a file drop when every item in it is an absolute path that exists, and as
@@ -252,3 +253,61 @@ files that came with it. Inline images stay behind on a forward as well: the
 quoted body no longer references them, so carrying them over would attach a
 signature logo to every forwarded newsletter.
 
+## Development
+
+`cargo test` runs the unit tests and the snapshot tests together.
+
+### Snapshot tests
+
+Every major view — message list, viewer, composer, search, the loading
+overlay, the mailbox and account choosers, the save-attachment dialog — is
+covered by a snapshot test that drives the real application through synthetic
+key events and renders the resulting terminal to SVG. The tests live in
+`src/snapshot_tests.rs`, the harness that runs them in `src/test_harness.rs`,
+and the frames themselves in `src/snapshots/*.snap.svg` — open one in a browser
+to see exactly what the client drew, colours and all.
+
+Each view is snapshotted twice, as `<view>-dark.snap.svg` and
+`<view>-light.snap.svg`, in the classic **Tango Dark** and **Tango Light** the
+Ubuntu-era GNOME Terminal shipped and most emulators copied. The pair differs
+only in the two colours the terminal supplies rather than Elma — Tango Light is
+`#2e3436` text on `#eeeeec`, Tango Dark the same two the other way round — and
+uses one and the same 16-colour Tango palette, which is how the scheme is
+defined. Anything Elma colours itself is therefore identical in both frames,
+and the pair shows at a glance which of those choices stop working when the
+terminal is not the one you happen to use.
+
+Nothing in a frame comes from the machine it was taken on: the mail comes from
+a fixture backend rather than the randomised mock one, and the clock the views
+read (`src/clock.rs`) is frozen for the duration of a test, so the dates in the
+message list and the seconds next to a throbber are the same on every run.
+
+A change to the UI therefore shows up as a changed frame. Review the difference
+with
+
+```bash
+cargo insta review        # cargo install cargo-insta
+```
+
+which shows each changed snapshot and writes back the ones you accept, or set
+`INSTA_UPDATE=always` to take the new frames unseen.
+
+### The demo GIF
+
+The animation at the top of this file is recorded through the same harness, by
+a script that presses keys: triage a morning's mail and commit the scheduled
+actions, open the invoice that is left and save its PDF, then answer the
+colleague who asked for a document with that document attached, archive her
+message and commit that too. The story is `examples/demo/main.rs`, the mail it
+works through `examples/demo/mailbox.rs`, and the camera that rasterises the
+SVG frames into a GIF `examples/demo/recorder.rs` — which is also where the
+recorded terminal theme is chosen. Re-record it with
+
+```bash
+cargo run --release --example demo --features recorder
+```
+
+Because it is the real client throughout — real event handling, real rendering,
+real backend threads — the recording cannot drift away from what Elma does; a
+changed view simply shows up in the next take. Set `ELMA_DEMO_FRAMES=<dir>` to
+also dump every frame as a PNG while working on the script.

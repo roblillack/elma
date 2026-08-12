@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="640" viewBox="0 0 1000 640" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="16px">
+<rect width="100%" height="100%" fill="#2e3436"/>
+<rect x="0" y="0" width="930" height="20" fill="#d3d3d3"/>
+<text x="0" y="15" fill="#696969" textLength="930" lengthAdjust="spacingAndGlyphs" xml:space="preserve">^Q:Quit g:GoToMailbox G:Accounts c:Compose Enter:Open s:Unstar -:NotImportant r:Reply y:Archi</text>
+<rect x="930" y="0" width="70" height="20" fill="#d3d3d3"/>
+<text x="930" y="15" fill="#cc0000" textLength="70" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[#### ]</text>
+<text x="0" y="35" fill="#d3d7cf" textLength="480" lengthAdjust="spacingAndGlyphs" xml:space="preserve">     [Dec 24, 2025] hr@example.com         12K  </text>
+<rect x="480" y="20" width="90" height="20" fill="#404040"/>
+<text x="480" y="35" fill="#eeeeec" textLength="90" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[Archive]</text>
+<rect x="580" y="20" width="60" height="20" fill="#e0e0e0"/>
+<text x="580" y="35" fill="#2e3436" textLength="60" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[Work]</text>
+<text x="640" y="35" fill="#d3d7cf" textLength="360" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Holiday schedule for next year     </text>
+<text x="0" y="55" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve" text-decoration="line-through" opacity="0.6">D    [Mar 07 13:37] tickets@support.exam  3.4K  Ticket #4711 has been closed                        </text>
+<text x="0" y="75" fill="#75507b" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">!    [Mar 08 22:18] deals@shop.example     61K  LAST CHANCE: 80% off everything!!!                  </text>
+<text x="0" y="95" fill="#008b8b" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-style="italic">A    [Mar 09 08:05] no-reply@calendar.ex  8.9K  Invitation: Sprint review @ Fri Mar 20              </text>
+<text x="0" y="115" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">     [Mar 10 16:45] newsletter@rustweekl  134K  This Week in Rust #612                              </text>
+<text x="0" y="135" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> ○   [Mar 11 09:00] security@bank.exampl  5.6K  Unusual sign-in attempt blocked                     </text>
+<text x="0" y="155" fill="#d3d7cf" textLength="480" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  →@ [Mar 12 11:20] reservations@hotel.e   96K  </text>
+<rect x="480" y="140" width="80" height="20" fill="#e0e0e0"/>
+<text x="480" y="155" fill="#2e3436" textLength="80" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[Travel]</text>
+<text x="560" y="155" fill="#d3d7cf" textLength="440" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Your booking confirmation                  </text>
+<text x="0" y="175" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> *   [Mar 13 15:30] anna@example.com      2.1K  Lunch on Thursday?                                  </text>
+<text x="0" y="195" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  ↩  [Mar 13 19:04] dev-list@ratatui.exa   42K  [dev] Widget layout changes landing next week       </text>
+<text x="0" y="215" fill="#cc0000" textLength="480" lengthAdjust="spacingAndGlyphs" xml:space="preserve">N    [Mar 14 07:52] mira.tomassi@example  7.3K  </text>
+<rect x="480" y="200" width="60" height="20" fill="#e0e0e0"/>
+<text x="480" y="215" fill="#2e3436" textLength="60" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[Work]</text>
+<text x="540" y="215" fill="#cc0000" textLength="460" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Re: Release notes for 0.3                    </text>
+<rect x="0" y="220" width="1000" height="20" fill="#cc0000"/>
+<text x="0" y="235" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">N⊛ @ [Mar 14 08:15] billing@vendor.examp   18K  [Invoices] [Work] Invoice 2026-0342 for February    </text>
+<text x="0" y="255" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">     Loading        Loading                     Loading message...                                  </text>
+<text x="0" y="275" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">     Loading        Loading                     Loading message...                                  </text>
+<text x="0" y="295" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">     Loading        Loading                     Loading message...                                  </text>
+<text x="0" y="315" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">     Loading        Loading                     Loading message...                                  </text>
+<text x="0" y="335" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">     Loading        Loading                     Loading message...                                  </text>
+<text x="0" y="355" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">     Loading        Loading                     Loading message...                                  </text>
+<text x="0" y="375" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">     Loading        Loading                     Loading message...                                  </text>
+<rect x="0" y="620" width="1000" height="20" fill="#d3d3d3"/>
+<text x="0" y="635" fill="#696969" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Personal • Inbox — message 11/18, 0 scheduled actions, got 0 events — Loaded 11/18 messages in Inbox</text>
+</svg>
