@@ -5647,13 +5647,17 @@ fn parse_paste_paths(text: &str) -> Vec<String> {
     }
 }
 
-/// What the snapshot harness needs and the main loop does not: a way to tell
-/// when the worker threads are done, and a way to reach a phase of a load that
-/// is over too quickly to catch.  See [`crate::test_harness`].
-#[cfg(test)]
+/// What the snapshot harness needs and the main loop does not.  See
+/// [`crate::test_harness`].
+///
+/// A `recorder` build of the binary compiles this without using it -- the
+/// harness that calls it lives in the demo example, which is its own crate --
+/// so dead code is expected there and only there.
+#[cfg(any(test, feature = "recorder"))]
+#[cfg_attr(not(test), allow(dead_code))]
 impl App {
     /// Whether any worker thread still owes an answer that would change the
-    /// screen.  A test drives [`Self::poll_backend_events`] until this is
+    /// screen.  The harness drives [`Self::poll_backend_events`] until this is
     /// false, the way the main loop polls every frame.
     pub(crate) fn has_work_in_flight(&self) -> bool {
         self.accounts.iter().any(|account| {
@@ -5666,7 +5670,11 @@ impl App {
                 .as_ref()
                 .is_some_and(|dialog| dialog.is_busy())
     }
+}
 
+/// Reaching a phase of a mailbox load that is over too quickly to catch.
+#[cfg(test)]
+impl App {
     /// Put the visible account's running load into `phase`.
     ///
     /// The overlay's whole content is the phase it shows, but only the first

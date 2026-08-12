@@ -7,14 +7,29 @@ authors = ["Rob Lillack <rob@lillack.net>"]
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/roblillack/elma"
-# The snapshots are half a megabyte of SVG that only `cargo test` ever reads,
-# and the tests that read them are `#[cfg(test)]`, so a published build never
-# misses them.
-exclude = ["src/snapshots"]
+# Neither the snapshot frames nor the recording made from them are read by
+# anything a published build compiles: the tests that read the first are
+# `#[cfg(test)]`, and the second is a picture for the README.
+exclude = ["src/snapshots", "demo.gif"]
 
 [[bin]]
 name = "elma"
 path = "src/main.rs"
+
+# Records `demo.gif`. Behind a feature because it drives the client through the
+# test harness, which a normal build has no reason to compile:
+#
+#     cargo run --release --example demo --features recorder
+[[example]]
+name = "demo"
+path = "examples/demo/main.rs"
+required-features = ["recorder"]
+
+[features]
+# Compiles the headless test harness outside of `cfg(test)`, so the demo
+# example can drive the client without a terminal and record the README's GIF
+# from the same SVG frames the snapshot tests compare.
+recorder = []
 
 [dependencies]
 anyhow = "1"
@@ -61,3 +76,7 @@ insta = "1.43"
 # `datetime!(2026-03-14 08:15 UTC)`. Only the tests need it, and dev-dependency
 # features stay out of a normal build.
 time = { version = "0.3", features = ["macros"] }
+# The demo recorder's two halves: resvg rasterises the harness's SVG frames,
+# gif encodes them into the README's animation.
+gif = "0.14"
+resvg = "0.47"

@@ -297,13 +297,14 @@ impl TestApp {
     /// Render the current frame to SVG, as a terminal with `theme`'s default
     /// colours would show it.
     pub(crate) fn svg(&mut self, theme: TerminalTheme) -> String {
+        self.svg_with(CellMetrics::default(), theme)
+    }
+
+    /// Render the current frame to SVG with custom cell geometry, which the
+    /// demo recorder uses to tighten the rows.
+    pub(crate) fn svg_with(&mut self, metrics: CellMetrics, theme: TerminalTheme) -> String {
         let cursor = self.cursor();
-        buffer_to_svg(
-            self.terminal.backend().buffer(),
-            cursor,
-            CellMetrics::default(),
-            theme,
-        )
+        buffer_to_svg(self.terminal.backend().buffer(), cursor, metrics, theme)
     }
 }
 
@@ -1044,5 +1045,9 @@ twelve?</p></body></html>"#
     contents
 }
 
+// Not merely dead in a `recorder` build, where the demo compiles this harness
+// into itself: the tests below need `insta`, which is a dev-dependency and so
+// is not there to link against.
+#[cfg(test)]
 #[path = "snapshot_tests.rs"]
 mod snapshot_tests;
