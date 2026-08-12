@@ -68,6 +68,11 @@ tempfile = "3"
 mime_guess = "2"
 unicode-width = "0.2"
 
+# Only for `poll(2)` on stdin, which is what puts a timeout on the terminal's
+# answer to the background-colour query. See src/terminal.rs.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Drives the SVG snapshot tests in `src/snapshot_tests.rs`: review changed
 # frames with `cargo insta review`.

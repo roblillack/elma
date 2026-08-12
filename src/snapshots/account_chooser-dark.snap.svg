@@ -25,22 +25,41 @@
 <text x="540" y="215" fill="#cc0000" textLength="460" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Re: Release notes for 0.3                    </text>
 <rect x="0" y="220" width="1000" height="20" fill="#d3d3d3"/>
 <text x="0" y="235" fill="#696969" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">N⊛ @ [Mar 14 08:15] billing@vendor.examp   18K  [Invoices] [Work] Invoice 2026-0342 for February    </text>
-<text x="0" y="535" fill="#d3d7cf" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌</text>
-<text x="10" y="535" fill="#06989a" textLength="150" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> Go to account </text>
-<text x="160" y="535" fill="#d3d7cf" textLength="840" lengthAdjust="spacingAndGlyphs" xml:space="preserve">─────────┐                                                                          </text>
-<text x="0" y="555" fill="#d3d7cf" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="20" y="555" fill="#c4a000" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">1</text>
-<text x="30" y="555" fill="#eeeeec" textLength="220" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  Personal (current)  </text>
-<text x="250" y="555" fill="#d3d7cf" textLength="750" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│                                                                          </text>
-<text x="0" y="575" fill="#d3d7cf" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="20" y="575" fill="#c4a000" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">2</text>
-<text x="30" y="575" fill="#eeeeec" textLength="220" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  Work                </text>
-<text x="250" y="575" fill="#d3d7cf" textLength="750" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│                                                                          </text>
-<text x="0" y="595" fill="#d3d7cf" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="20" y="595" fill="#c4a000" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">3</text>
-<text x="30" y="595" fill="#eeeeec" textLength="220" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  rob@fastmail.example</text>
-<text x="250" y="595" fill="#d3d7cf" textLength="750" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│                                                                          </text>
-<text x="0" y="615" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└────────────────────────┘                                                                          </text>
+<rect x="0" y="520" width="10" height="20" fill="#d3d3d3"/>
+<text x="0" y="535" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌</text>
+<rect x="10" y="520" width="150" height="20" fill="#d3d3d3"/>
+<text x="10" y="535" fill="#005c5e" textLength="150" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> Go to account </text>
+<rect x="160" y="520" width="100" height="20" fill="#d3d3d3"/>
+<text x="160" y="535" fill="#696969" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve">─────────┐</text>
+<rect x="0" y="540" width="10" height="20" fill="#d3d3d3"/>
+<text x="0" y="555" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="10" y="540" width="10" height="20" fill="#d3d3d3"/>
+<rect x="20" y="540" width="10" height="20" fill="#d3d3d3"/>
+<text x="20" y="555" fill="#8f5902" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">1</text>
+<rect x="30" y="540" width="220" height="20" fill="#d3d3d3"/>
+<text x="30" y="555" fill="#2e3436" textLength="220" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  Personal (current)  </text>
+<rect x="250" y="540" width="10" height="20" fill="#d3d3d3"/>
+<text x="250" y="555" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="0" y="560" width="10" height="20" fill="#d3d3d3"/>
+<text x="0" y="575" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="10" y="560" width="10" height="20" fill="#d3d3d3"/>
+<rect x="20" y="560" width="10" height="20" fill="#d3d3d3"/>
+<text x="20" y="575" fill="#8f5902" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">2</text>
+<rect x="30" y="560" width="220" height="20" fill="#d3d3d3"/>
+<text x="30" y="575" fill="#2e3436" textLength="220" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  Work                </text>
+<rect x="250" y="560" width="10" height="20" fill="#d3d3d3"/>
+<text x="250" y="575" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="0" y="580" width="10" height="20" fill="#d3d3d3"/>
+<text x="0" y="595" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="10" y="580" width="10" height="20" fill="#d3d3d3"/>
+<rect x="20" y="580" width="10" height="20" fill="#d3d3d3"/>
+<text x="20" y="595" fill="#8f5902" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">3</text>
+<rect x="30" y="580" width="220" height="20" fill="#d3d3d3"/>
+<text x="30" y="595" fill="#2e3436" textLength="220" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  rob@fastmail.example</text>
+<rect x="250" y="580" width="10" height="20" fill="#d3d3d3"/>
+<text x="250" y="595" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="0" y="600" width="260" height="20" fill="#d3d3d3"/>
+<text x="0" y="615" fill="#696969" textLength="260" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└────────────────────────┘</text>
 <rect x="0" y="620" width="1000" height="20" fill="#d3d3d3"/>
 <text x="0" y="635" fill="#696969" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Personal • Inbox — message 11/11, 0 scheduled actions, got 0 events — Switch account: press the high</text>
 </svg>

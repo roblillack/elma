@@ -6742,7 +6742,7 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
         terminal
-            .draw(|frame| crate::ui::render(frame, app))
+            .draw(|frame| crate::ui::render(frame, app, crate::ui::Theme::Dark))
             .expect("draw");
 
         let buffer = terminal.backend().buffer().clone();

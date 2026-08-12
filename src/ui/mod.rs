@@ -22,6 +22,11 @@ use ratatui::{
 use std::time::Duration;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+mod theme;
+
+use theme::Surface;
+pub use theme::Theme;
+
 const ACTION_BAR_BG: Color = Color::Rgb(211, 211, 211);
 const ACTION_BAR_FG: Color = Color::Rgb(105, 105, 105);
 const ARCHIVED_FG: Color = Color::Rgb(0, 139, 139);
@@ -29,8 +34,6 @@ const LABEL_SPECIAL_BG: Color = Color::Rgb(64, 64, 64);
 const LABEL_SPECIAL_FG: Color = Color::White;
 const LABEL_DEFAULT_BG: Color = Color::Rgb(224, 224, 224);
 const LABEL_DEFAULT_FG: Color = Color::Black;
-/// Base style shared by every popup surface (compose, dialogs, prompts).
-const POPUP_STYLE: Style = Style::new().bg(Color::Black).fg(Color::White);
 
 /// Visible window of a single-line text field, plus the cursor's column in it.
 ///
@@ -73,29 +76,36 @@ fn text_field_view(value: &str, cursor: usize, width: u16) -> (&str, u16) {
 }
 
 /// Render the entire UI based on the currently active view.
-pub fn render(frame: &mut Frame<'_>, app: &mut App) {
+///
+/// `theme` says what the terminal puts behind the frame, which is what decides
+/// how a popup has to be coloured to read as focused -- see [`self::theme`].
+pub fn render(frame: &mut Frame<'_>, app: &mut App, theme: Theme) {
+    // A shortcut menu is drawn last and takes the next key, so whatever it is
+    // drawn over steps back.
+    let menu_open = app.shortcut_menu().is_some();
+
     if app.compose_state().is_some() {
-        render_inbox(frame, app);
-        render_compose(frame, app);
+        render_inbox(frame, app, theme);
+        render_compose(frame, app, theme, menu_open);
         if let Some(menu) = app.shortcut_menu() {
-            render_shortcut_menu(frame, menu);
+            render_shortcut_menu(frame, menu, theme.focused());
         }
         return;
     }
 
     match app.active_view() {
-        ActiveView::Mailbox => render_inbox(frame, app),
-        ActiveView::Message => render_message(frame, app),
-        ActiveView::Compose => render_compose(frame, app),
+        ActiveView::Mailbox => render_inbox(frame, app, theme),
+        ActiveView::Message => render_message(frame, app, theme),
+        ActiveView::Compose => render_compose(frame, app, theme, menu_open),
     }
 
     if let Some(menu) = app.shortcut_menu() {
-        render_shortcut_menu(frame, menu);
+        render_shortcut_menu(frame, menu, theme.focused());
     }
 
     if let Some(dialog) = app.save_attachment_dialog() {
         let attachments = app.save_attachment_attachments();
-        let cursor = render_save_attachment_dialog(frame, dialog, attachments);
+        let cursor = render_save_attachment_dialog(frame, dialog, attachments, theme.focused());
         if let Some((x, y)) = cursor {
             frame.set_cursor_position((x, y));
         }
@@ -175,7 +185,7 @@ fn render_action_bar(
 }
 
 /// Render the inbox list together with action and status bars.
-fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
+fn render_inbox(frame: &mut Frame<'_>, app: &mut App, theme: Theme) {
     let search_focused = app.search_state().is_some_and(|s| s.2);
     let layout = if search_focused {
         Layout::default()
@@ -212,11 +222,20 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App) {
 
     // Render unfocused search as a popup overlay in the top-right of the message area.
     if !search_focused {
-        render_search_popup(frame, message_area, app);
+        render_search_popup(frame, message_area, app, theme.covered());
     }
 
     if let Some((account, mailbox, state)) = app.loading_overlay() {
-        render_loading_overlay(frame, message_area, account, mailbox, state);
+        // Nothing else is up while the list is still empty, so the overlay is
+        // what the user is looking at even though it takes no keys.
+        render_loading_overlay(
+            frame,
+            message_area,
+            account,
+            mailbox,
+            state,
+            theme.focused(),
+        );
     }
 
     let mut info_text = app.inbox_info_bar();
@@ -255,6 +274,7 @@ fn render_loading_overlay(
     account: &str,
     mailbox: MailboxKind,
     state: &LoadingState,
+    surface: Surface,
 ) {
     let (headline, detail) = match &state.phase {
         LoadPhase::Connecting => (
@@ -273,7 +293,7 @@ fn render_loading_overlay(
     };
 
     let failed = matches!(state.phase, LoadPhase::Failed(_));
-    let accent = if failed { Color::Red } else { Color::Cyan };
+    let accent = if failed { surface.hot } else { surface.accent };
 
     let title = format!("{account} • {mailbox}");
     let elapsed = state.elapsed();
@@ -313,12 +333,12 @@ fn render_loading_overlay(
     let y = area.y + area.height.saturating_sub(height) / 2;
     let popup = Rect::new(x, y, width, height);
 
-    // Same surface as every other popup: the frame carries the black background
+    // Same surface as every other popup: the frame carries the popup background
     // rather than letting the message list show through it.
     let block = Block::default()
         .borders(Borders::ALL)
-        .style(POPUP_STYLE)
-        .border_style(POPUP_STYLE)
+        .style(surface.style())
+        .border_style(surface.border_style())
         .padding(Padding::horizontal(1));
     let inner = block.inner(popup);
 
@@ -341,12 +361,12 @@ fn render_loading_overlay(
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(status, status_style)),
-        Line::from(Span::styled(detail, Style::default().fg(Color::Gray))),
+        Line::from(Span::styled(detail, surface.muted_style())),
     ];
 
     frame.render_widget(
         Paragraph::new(lines)
-            .style(POPUP_STYLE)
+            .style(surface.style())
             .wrap(Wrap { trim: true }),
         inner,
     );
@@ -367,7 +387,7 @@ fn render_search_panel(frame: &mut Frame<'_>, area: Rect, app: &App) -> Option<(
         Span::raw(label),
         Span::raw(before_cursor),
         Span::raw(after_cursor),
-        Span::styled(help, Style::default().fg(Color::DarkGray)),
+        Span::styled(help, Style::default().fg(theme::MUTED_ON_TERMINAL)),
     ];
     let paragraph = Paragraph::new(Line::from(spans));
     frame.render_widget(paragraph, area);
@@ -379,7 +399,10 @@ fn render_search_panel(frame: &mut Frame<'_>, area: Rect, app: &App) -> Option<(
 }
 
 /// Render the search panel as a popup overlay in the top-right of `area`.
-fn render_search_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
+///
+/// Always drawn on the covered surface: it reports a filter that is still in
+/// force, and the keys are going to the message list underneath it.
+fn render_search_popup(frame: &mut Frame<'_>, area: Rect, app: &App, surface: Surface) {
     let Some((value, _cursor, _focused)) = app.search_state() else {
         return;
     };
@@ -406,41 +429,43 @@ fn render_search_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let y = area.y + margin_top;
     let popup_area = Rect::new(x, y, width, height);
 
-    let menu_style = Style::default().bg(ACTION_BAR_BG).fg(ACTION_BAR_FG);
-    let dark_fg = Style::default().fg(Color::Black);
+    // The label rows carry the surface's own text colour; the frame and the
+    // separators between key and action stay a step back from it.
+    let menu_style = Style::default().bg(surface.bg).fg(surface.border);
+    let text_style = Style::default().fg(surface.fg);
 
-    let key_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
-    let sep_style = Style::default().fg(ACTION_BAR_FG);
+    let key_style = Style::default()
+        .fg(surface.hot)
+        .add_modifier(Modifier::BOLD);
+    let sep_style = Style::default().fg(surface.border);
 
     let bottom_title = Line::from(vec![
         Span::styled("/", key_style),
         Span::styled(":", sep_style),
-        Span::styled("Change", dark_fg),
+        Span::styled("Change", text_style),
         Span::raw("  "),
         Span::styled("Esc", key_style),
         Span::styled(":", sep_style),
-        Span::styled("Clear", dark_fg),
+        Span::styled("Clear", text_style),
     ]);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .style(menu_style)
-        .border_style(Style::default().fg(ACTION_BAR_FG))
+        .border_style(surface.border_style())
         .title_top(Line::styled(
             title,
             Style::default()
-                .fg(Color::Blue)
+                .fg(surface.heading)
                 .add_modifier(Modifier::BOLD),
         ))
         .title_bottom(bottom_title)
         .padding(Padding::horizontal(1));
 
-    let value_style = Style::default()
-        .fg(Color::Black)
-        .add_modifier(Modifier::BOLD);
+    let value_style = text_style.add_modifier(Modifier::BOLD);
 
     let lines = vec![
-        Line::from(Span::styled(line1, dark_fg)),
+        Line::from(Span::styled(line1, text_style)),
         Line::from(Span::styled(value, value_style)),
     ];
 
@@ -449,11 +474,27 @@ fn render_search_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
+/// Render the compose dialog.
+///
+/// `covered_by_menu` says whether a shortcut menu is going to be drawn on top;
+/// the two prompts compose puts up itself are found here.  Either way the
+/// dialog steps back to the covered surface, so the box taking keys is the one
+/// that stands out.
+fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by_menu: bool) {
     if app.compose_state().is_none() {
-        render_inbox(frame, app);
+        render_inbox(frame, app, theme);
         return;
     }
+
+    let covered = covered_by_menu
+        || app.compose_state().is_some_and(|state| {
+            state.attachment_prompt().is_some() || state.large_attachment_question().is_some()
+        });
+    let surface = if covered {
+        theme.covered()
+    } else {
+        theme.focused()
+    };
 
     let frame_area = frame.area();
     let dialog_width = if frame_area.width >= 90 {
@@ -485,8 +526,8 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .style(POPUP_STYLE)
-        .border_style(Style::default().fg(Color::Gray));
+        .style(surface.style())
+        .border_style(surface.border_style());
     let inner = block.inner(modal_area);
 
     frame.render_widget(Clear, modal_area);
@@ -519,7 +560,7 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
         .split(inner);
 
     let header = Paragraph::new(app.compose_action_bar())
-        .style(POPUP_STYLE)
+        .style(surface.style())
         .alignment(Alignment::Center);
     frame.render_widget(header, layout[0]);
 
@@ -544,19 +585,19 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
             (field_rows[3], "Subject", ComposeField::Subject),
         ] {
             if cursor_pos.is_none() {
-                cursor_pos = render_compose_field(frame, area, state, label, field);
+                cursor_pos = render_compose_field(frame, area, state, label, field, surface);
             } else {
-                render_compose_field(frame, area, state, label, field);
+                render_compose_field(frame, area, state, label, field, surface);
             }
         }
     }
 
     if attachments_height > 0 {
         let state = app.compose_state().expect("compose state should exist");
-        render_compose_attachments(frame, layout[2], state);
+        render_compose_attachments(frame, layout[2], state, surface);
     }
 
-    render_compose_body(frame, layout[3], app);
+    render_compose_body(frame, layout[3], app, surface);
 
     // While the backend has the message the whole view is read-only, so nothing
     // offers focus: no lit button, no cursor.
@@ -567,7 +608,7 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
 
     {
         let state = app.compose_state().expect("compose state should exist");
-        render_compose_buttons(frame, layout[4], state, busy);
+        render_compose_buttons(frame, layout[4], state, busy, surface);
     }
 
     let status_text = pending_outgoing
@@ -578,9 +619,9 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
         });
     let status = Paragraph::new(status_text)
         .style(if busy {
-            POPUP_STYLE.fg(Color::Yellow)
+            surface.style().fg(surface.key)
         } else {
-            POPUP_STYLE
+            surface.style()
         })
         .alignment(Alignment::Center);
     frame.render_widget(status, layout[5]);
@@ -589,7 +630,8 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
         .compose_state()
         .and_then(|state| state.attachment_prompt().map(|(v, c)| (v.to_string(), c)))
     {
-        let prompt_cursor = render_attachment_prompt(frame, modal_area, &prompt.0, prompt.1);
+        let prompt_cursor =
+            render_attachment_prompt(frame, modal_area, &prompt.0, prompt.1, theme.focused());
         if let Some(pos) = prompt_cursor {
             cursor_pos = Some(pos);
         }
@@ -599,7 +641,7 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
         .compose_state()
         .and_then(|state| state.large_attachment_question())
     {
-        render_large_attachment_prompt(frame, modal_area, &name, size, projected);
+        render_large_attachment_prompt(frame, modal_area, &name, size, projected, theme.focused());
         // The question owns the view until it is answered; nothing underneath
         // it takes typing, so nothing underneath it shows a caret.
         cursor_pos = None;
@@ -614,7 +656,12 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
-fn render_compose_attachments(frame: &mut Frame<'_>, area: Rect, state: &ComposeState) {
+fn render_compose_attachments(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &ComposeState,
+    surface: Surface,
+) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -623,10 +670,8 @@ fn render_compose_attachments(frame: &mut Frame<'_>, area: Rect, state: &Compose
     let attachments = state.attachments();
     let selected = state.attachment_selected();
 
-    let label_style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    let muted = Style::default().fg(Color::DarkGray);
+    let label_style = surface.label_style();
+    let muted = surface.muted_style();
 
     let header = Paragraph::new(Line::from(vec![
         Span::styled(format!("Attachments ({}):", attachments.len()), label_style),
@@ -637,11 +682,11 @@ fn render_compose_attachments(frame: &mut Frame<'_>, area: Rect, state: &Compose
                 "  message size {}",
                 format_size(state.message_size()).trim()
             ),
-            Style::default().fg(Color::White),
+            Style::default().fg(surface.fg),
         ),
         Span::styled("  [Del/Backspace to remove]", muted),
     ]))
-    .style(POPUP_STYLE);
+    .style(surface.style());
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)])
@@ -674,12 +719,9 @@ fn render_compose_attachments(frame: &mut Frame<'_>, area: Rect, state: &Compose
         let attachment = &attachments[attachment_idx];
         let is_selected = Some(attachment_idx) == selected;
         let row_style = if focused && is_selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
+            surface.select_style()
         } else if is_selected {
-            Style::default().bg(Color::DarkGray)
+            Style::default().bg(surface.field_bg)
         } else {
             Style::default()
         };
@@ -691,13 +733,13 @@ fn render_compose_attachments(frame: &mut Frame<'_>, area: Rect, state: &Compose
             size = format_size(attachment.size()).trim()
         );
         let line = Line::from(Span::styled(text, row_style));
-        let paragraph = Paragraph::new(line).style(POPUP_STYLE);
+        let paragraph = Paragraph::new(line).style(surface.style());
         frame.render_widget(paragraph, *area);
     }
 
     if total == 0 {
         let placeholder =
-            Paragraph::new(Line::from(Span::styled("(none)", muted))).style(POPUP_STYLE);
+            Paragraph::new(Line::from(Span::styled("(none)", muted))).style(surface.style());
         if let Some(area) = entry_rows.first() {
             frame.render_widget(placeholder, *area);
         }
@@ -709,6 +751,7 @@ fn render_attachment_prompt(
     modal_area: Rect,
     value: &str,
     cursor: usize,
+    surface: Surface,
 ) -> Option<(u16, u16)> {
     let min_width: u16 = 50;
     let width = modal_area
@@ -730,17 +773,13 @@ fn render_attachment_prompt(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title_top(Line::styled(
-            " Attach file ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ))
+        .style(surface.style())
+        .border_style(surface.border_style())
+        .title_top(Line::styled(" Attach file ", surface.label_style()))
         .title_bottom(Line::from(vec![
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::styled("Enter", surface.key_style()),
             Span::raw(": attach  "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled("Esc", surface.key_style()),
             Span::raw(": cancel"),
         ]));
     let inner = block.inner(area);
@@ -758,20 +797,13 @@ fn render_attachment_prompt(
         text_field_view(value, cursor, inner.width.saturating_sub(label_width));
 
     let line = Line::from(vec![
-        Span::styled(
-            label,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(label, surface.label_style()),
         Span::styled(
             visible.to_string(),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            surface.key_style().add_modifier(Modifier::BOLD),
         ),
     ]);
-    let paragraph = Paragraph::new(line).style(POPUP_STYLE);
+    let paragraph = Paragraph::new(line).style(surface.style());
     frame.render_widget(paragraph, inner);
 
     let max_x = inner.x + inner.width.saturating_sub(1);
@@ -789,6 +821,7 @@ fn render_large_attachment_prompt(
     name: &str,
     size: usize,
     projected: usize,
+    surface: Surface,
 ) {
     let min_width: u16 = 50;
     let width = modal_area
@@ -808,23 +841,22 @@ fn render_large_attachment_prompt(
     let y = modal_area.y + modal_area.height.saturating_sub(height) / 2;
     let area = Rect::new(x, y, width, height);
 
+    // A question about a limit, so the frame and the title take the key colour
+    // rather than the ordinary label one: this is the warning, not a form.
+    let warning = surface.key_style().add_modifier(Modifier::BOLD);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .title_top(Line::styled(
-            " Large attachment ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ))
+        .style(surface.style())
+        .border_style(surface.key_style())
+        .title_top(Line::styled(" Large attachment ", warning))
         .title_bottom(Line::from(vec![
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::styled("Enter", surface.key_style()),
             Span::raw("/"),
-            Span::styled("y", Style::default().fg(Color::Yellow)),
+            Span::styled("y", surface.key_style()),
             Span::raw(": attach  "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled("Esc", surface.key_style()),
             Span::raw("/"),
-            Span::styled("n", Style::default().fg(Color::Yellow)),
+            Span::styled("n", surface.key_style()),
             Span::raw(": skip"),
         ]));
     let inner = block.inner(area);
@@ -839,19 +871,14 @@ fn render_large_attachment_prompt(
     // The size leads the second line rather than trailing the name, so a long
     // name being clipped cannot take the number with it.
     let lines = vec![
-        Line::from(Span::styled(
-            name.to_string(),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )),
+        Line::from(Span::styled(name.to_string(), warning)),
         Line::from(Span::raw(format!(
             "{}. Attach anyway? Message would be {}.",
             format_size(size).trim(),
             format_size(projected).trim()
         ))),
     ];
-    frame.render_widget(Paragraph::new(lines).style(POPUP_STYLE), inner);
+    frame.render_widget(Paragraph::new(lines).style(surface.style()), inner);
 }
 
 fn render_compose_field(
@@ -860,6 +887,7 @@ fn render_compose_field(
     state: &ComposeState,
     label: &str,
     field: ComposeField,
+    surface: Surface,
 ) -> Option<(u16, u16)> {
     if area.height == 0 || area.width == 0 {
         return None;
@@ -869,16 +897,12 @@ fn render_compose_field(
     let (value, cursor) = state.field_data(field);
 
     let label_text = format!("{label}: ");
-    let label_style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    let placeholder_style = Style::default().fg(Color::DarkGray);
+    let label_style = surface.label_style();
+    let placeholder_style = surface.muted_style();
     let value_style = if focused {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
+        surface.key_style().add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(surface.fg)
     };
 
     let label_width = label_text.width() as u16;
@@ -896,9 +920,9 @@ fn render_compose_field(
     }
 
     let base_style = if focused {
-        Style::default().bg(Color::DarkGray)
+        surface.style().bg(surface.field_bg)
     } else {
-        Style::default().bg(Color::Black)
+        surface.style()
     };
 
     let paragraph = Paragraph::new(Line::from(spans)).style(base_style);
@@ -914,7 +938,7 @@ fn render_compose_field(
     Some((cursor_x, area.y))
 }
 
-fn render_compose_body(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+fn render_compose_body(frame: &mut Frame<'_>, area: Rect, app: &mut App, surface: Surface) {
     if area.height == 0 || area.width == 0 {
         if let Some(state) = app.compose_state_mut() {
             state.set_body_view_height(0);
@@ -930,10 +954,8 @@ fn render_compose_body(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
         let focused = state.is_body_focused();
         if state.body().is_empty() {
-            let placeholder = Line::styled(
-                "Press [Edit message] to compose.",
-                Style::default().fg(Color::DarkGray),
-            );
+            let placeholder =
+                Line::styled("Press [Edit message] to compose.", surface.muted_style());
             (focused, vec![placeholder])
         } else {
             match viewer::render_document(state.body(), area.width) {
@@ -946,7 +968,7 @@ fn render_compose_body(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     focused,
                     vec![Line::styled(
                         format!("Failed to render message body: {err}"),
-                        Style::default().fg(Color::Red),
+                        Style::default().fg(surface.hot),
                     )],
                 ),
             }
@@ -989,12 +1011,13 @@ fn render_compose_body(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 
     let base_style = if focused {
-        Style::default()
-            .fg(Color::Yellow)
-            .bg(Color::DarkGray)
+        surface
+            .style()
+            .fg(surface.key)
+            .bg(surface.field_bg)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White).bg(Color::Black)
+        surface.style()
     };
 
     let paragraph = Paragraph::new(lines)
@@ -1003,7 +1026,13 @@ fn render_compose_body(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_compose_buttons(frame: &mut Frame<'_>, area: Rect, state: &ComposeState, disabled: bool) {
+fn render_compose_buttons(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &ComposeState,
+    disabled: bool,
+    surface: Surface,
+) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -1022,40 +1051,31 @@ fn render_compose_buttons(frame: &mut Frame<'_>, area: Rect, state: &ComposeStat
             spans.push(Span::raw("   "));
         }
         if disabled {
-            spans.push(Span::styled(
-                format!("[{label}]"),
-                Style::default().fg(Color::DarkGray),
-            ));
+            spans.push(Span::styled(format!("[{label}]"), surface.muted_style()));
             continue;
         }
         let focused = matches!(state.focus(), ComposeFocus::Button(active) if active == *button);
         if focused {
-            spans.push(Span::styled(
-                format!("[{label}]"),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            spans.push(Span::styled(format!("[{label}]"), surface.select_style()));
         } else {
             spans.push(Span::styled(
                 format!("[{label}]"),
-                Style::default().fg(Color::White),
+                Style::default().fg(surface.fg),
             ));
         }
     }
 
     let paragraph = Paragraph::new(Line::from(spans))
-        .style(Style::default().bg(Color::Black))
+        .style(surface.style())
         .alignment(Alignment::Center);
 
     frame.render_widget(paragraph, area);
 }
 
 /// Render the message view, falling back to the inbox if no message is open.
-fn render_message(frame: &mut Frame<'_>, app: &mut App) {
+fn render_message(frame: &mut Frame<'_>, app: &mut App, theme: Theme) {
     let Some(view) = app.message_view() else {
-        render_inbox(frame, app);
+        render_inbox(frame, app, theme);
         return;
     };
 
@@ -1402,13 +1422,11 @@ fn text_width(value: &str) -> usize {
     value.chars().count()
 }
 
-fn render_shortcut_menu(frame: &mut Frame<'_>, menu: &ShortcutMenu) {
+fn render_shortcut_menu(frame: &mut Frame<'_>, menu: &ShortcutMenu, surface: Surface) {
     let title = format!(" {} ", menu.title());
 
     let mut lines = Vec::new();
-    let key_style = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
+    let key_style = surface.key_style().add_modifier(Modifier::BOLD);
 
     for entry in menu.entries() {
         let line = Line::from(vec![
@@ -1445,18 +1463,13 @@ fn render_shortcut_menu(frame: &mut Frame<'_>, menu: &ShortcutMenu) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .style(POPUP_STYLE)
-        .border_style(Style::default().fg(Color::Gray))
-        .title_top(Line::styled(
-            title,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
+        .style(surface.style())
+        .border_style(surface.border_style())
+        .title_top(Line::styled(title, surface.label_style()));
 
     frame.render_widget(Clear, area);
     let paragraph = Paragraph::new(lines)
-        .style(POPUP_STYLE)
+        .style(surface.style())
         .block(block)
         .wrap(Wrap { trim: false });
 
@@ -1467,6 +1480,7 @@ fn render_save_attachment_dialog(
     frame: &mut Frame<'_>,
     dialog: &SaveAttachmentDialog,
     attachments: &[MessageAttachment],
+    surface: Surface,
 ) -> Option<(u16, u16)> {
     let frame_area = frame.area();
     let width = frame_area.width.min(80).max(30.min(frame_area.width));
@@ -1488,20 +1502,15 @@ fn render_save_attachment_dialog(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(POPUP_STYLE)
-        .title_top(Line::styled(
-            " Save attachment ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ))
+        .border_style(surface.border_style())
+        .style(surface.style())
+        .title_top(Line::styled(" Save attachment ", surface.label_style()))
         .title_bottom(Line::from(vec![
-            Span::styled("Tab", Style::default().fg(Color::Yellow)),
+            Span::styled("Tab", surface.key_style()),
             Span::raw(": switch focus  "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::styled("Enter", surface.key_style()),
             Span::raw(": save  "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled("Esc", surface.key_style()),
             Span::raw(": cancel"),
         ]));
     let inner = block.inner(area);
@@ -1525,12 +1534,10 @@ fn render_save_attachment_dialog(
         ])
         .split(inner);
 
-    let label_style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
+    let label_style = surface.label_style();
 
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled("Folder:", label_style))).style(POPUP_STYLE),
+        Paragraph::new(Line::from(Span::styled("Folder:", label_style))).style(surface.style()),
         layout[0],
     );
 
@@ -1544,27 +1551,27 @@ fn render_save_attachment_dialog(
         layout[1].width.saturating_sub(folder_indent),
     );
     let folder_style = if folder_focused {
-        Style::default()
-            .fg(Color::Yellow)
-            .bg(Color::DarkGray)
+        surface
+            .key_style()
+            .bg(surface.field_bg)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(surface.fg)
     };
     let folder_text = if folder_value.is_empty() {
-        Span::styled("<empty>", Style::default().fg(Color::DarkGray))
+        Span::styled("<empty>", surface.muted_style())
     } else {
         Span::styled(folder_visible.to_string(), folder_style)
     };
     frame.render_widget(
-        Paragraph::new(Line::from(vec![Span::raw(" "), folder_text])).style(POPUP_STYLE),
+        Paragraph::new(Line::from(vec![Span::raw(" "), folder_text])).style(surface.style()),
         layout[1],
     );
 
     let list_focused = matches!(dialog.focus(), SaveAttachmentFocus::List);
     let list_header = format!("Attachments ({}):", attachments.len());
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(list_header, label_style))).style(POPUP_STYLE),
+        Paragraph::new(Line::from(Span::styled(list_header, label_style))).style(surface.style()),
         layout[3],
     );
 
@@ -1589,11 +1596,8 @@ fn render_save_attachment_dialog(
         if total == 0 {
             if let Some(area) = rows.first() {
                 frame.render_widget(
-                    Paragraph::new(Line::from(Span::styled(
-                        "(none)",
-                        Style::default().fg(Color::DarkGray),
-                    )))
-                    .style(POPUP_STYLE),
+                    Paragraph::new(Line::from(Span::styled("(none)", surface.muted_style())))
+                        .style(surface.style()),
                     *area,
                 );
             }
@@ -1605,12 +1609,9 @@ fn render_save_attachment_dialog(
                 let attachment = &attachments[attachment_idx];
                 let is_selected = attachment_idx == selected;
                 let row_style = if list_focused && is_selected {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
+                    surface.select_style()
                 } else if is_selected {
-                    Style::default().bg(Color::DarkGray)
+                    Style::default().bg(surface.field_bg)
                 } else {
                     Style::default()
                 };
@@ -1628,7 +1629,8 @@ fn render_save_attachment_dialog(
                     inline = if attachment.inline { ", inline" } else { "" }
                 );
                 frame.render_widget(
-                    Paragraph::new(Line::from(Span::styled(text, row_style))).style(POPUP_STYLE),
+                    Paragraph::new(Line::from(Span::styled(text, row_style)))
+                        .style(surface.style()),
                     *area,
                 );
             }
@@ -1639,26 +1641,24 @@ fn render_save_attachment_dialog(
         Line::from(vec![
             Span::styled(
                 spinner_frame(elapsed).to_string(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                surface.key_style().add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
             Span::styled(
                 format!("Saving '{filename}' ({:.1}s)...", elapsed.as_secs_f32()),
-                Style::default().fg(Color::Yellow),
+                surface.key_style(),
             ),
         ])
     } else {
         let status_text = dialog.status().map(|s| s.to_string()).unwrap_or_else(|| {
             "Tab to change focus, Up/Down to pick an attachment, Enter to save.".to_string()
         });
-        Line::from(Span::styled(
-            status_text,
-            Style::default().fg(Color::DarkGray),
-        ))
+        Line::from(Span::styled(status_text, surface.muted_style()))
     };
-    frame.render_widget(Paragraph::new(status_line).style(POPUP_STYLE), layout[5]);
+    frame.render_widget(
+        Paragraph::new(status_line).style(surface.style()),
+        layout[5],
+    );
 
     if folder_focused && !dialog.is_busy() {
         let max_x = layout[1].x + layout[1].width.saturating_sub(1);
@@ -1867,7 +1867,12 @@ fn plain_text(content: &crate::model::MessageContent) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LoadPhase, LoadingState, MailboxKind, text_field_view};
+    use super::{LoadPhase, LoadingState, MailboxKind, Surface, Theme, text_field_view};
+
+    /// What a popup with focus is drawn on for these tests.  Which theme it
+    /// comes from does not matter to anything asserted here -- only that every
+    /// popup is asked for one and honours it.
+    const SURFACE: Surface = Theme::Light.focused();
 
     #[test]
     fn text_field_view_shows_the_whole_value_when_it_fits() {
@@ -1911,7 +1916,7 @@ mod tests {
             terminal
                 .draw(|frame| {
                     let area = frame.area();
-                    super::render_attachment_prompt(frame, area, path, cursor);
+                    super::render_attachment_prompt(frame, area, path, cursor, SURFACE);
                 })
                 .expect("draw");
         }
@@ -1936,6 +1941,7 @@ mod tests {
                     "holiday.mov",
                     24_000_000,
                     33_000_000,
+                    SURFACE,
                 );
             })
             .expect("draw");
@@ -1972,6 +1978,7 @@ mod tests {
                         "holiday.mov",
                         24_000_000,
                         33_000_000,
+                        SURFACE,
                     );
                 })
                 .expect("draw");
@@ -1987,7 +1994,14 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                super::render_loading_overlay(frame, area, "Work", MailboxKind::Inbox, &state);
+                super::render_loading_overlay(
+                    frame,
+                    area,
+                    "Work",
+                    MailboxKind::Inbox,
+                    &state,
+                    SURFACE,
+                );
             })
             .expect("draw");
 
@@ -2021,7 +2035,14 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                super::render_loading_overlay(frame, area, "Vizzlo", MailboxKind::Inbox, &state);
+                super::render_loading_overlay(
+                    frame,
+                    area,
+                    "Vizzlo",
+                    MailboxKind::Inbox,
+                    &state,
+                    SURFACE,
+                );
             })
             .expect("draw");
         let buf = terminal.backend().buffer().clone();
@@ -2043,8 +2064,8 @@ mod tests {
             .find(|&col| buf.cell((col, top)).unwrap().symbol() != " ")
             .expect("a border cell");
         let border = buf.cell((border_col, top)).unwrap();
-        assert_eq!(border.fg, super::Color::White);
-        assert_eq!(border.bg, super::Color::Black);
+        assert_eq!(border.fg, SURFACE.border);
+        assert_eq!(border.bg, SURFACE.bg);
     }
 
     /// Opening a folder on a live session must not claim to be connecting.
@@ -2089,7 +2110,14 @@ mod tests {
             terminal
                 .draw(|frame| {
                     let area = frame.area();
-                    super::render_loading_overlay(frame, area, "Work", MailboxKind::Inbox, &state);
+                    super::render_loading_overlay(
+                        frame,
+                        area,
+                        "Work",
+                        MailboxKind::Inbox,
+                        &state,
+                        SURFACE,
+                    );
                 })
                 .expect("draw");
         }

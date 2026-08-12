@@ -5,23 +5,31 @@
 <rect x="930" y="0" width="70" height="20" fill="#d3d3d3"/>
 <text x="930" y="15" fill="#cc0000" textLength="70" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[     ]</text>
 <rect x="290" y="260" width="420" height="20" fill="#2e3436"/>
-<text x="290" y="275" fill="#eeeeec" textLength="420" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌────────────────────────────────────────┐</text>
-<rect x="290" y="280" width="20" height="20" fill="#2e3436"/>
-<text x="290" y="295" fill="#eeeeec" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│ </text>
+<text x="290" y="275" fill="#d3d3d3" textLength="420" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌────────────────────────────────────────┐</text>
+<rect x="290" y="280" width="10" height="20" fill="#2e3436"/>
+<text x="290" y="295" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="300" y="280" width="10" height="20" fill="#2e3436"/>
 <rect x="310" y="280" width="160" height="20" fill="#2e3436"/>
 <text x="310" y="295" fill="#06989a" textLength="160" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Personal • Inbox</text>
-<rect x="470" y="280" width="240" height="20" fill="#2e3436"/>
-<text x="470" y="295" fill="#eeeeec" textLength="240" lengthAdjust="spacingAndGlyphs" xml:space="preserve">                       │</text>
-<rect x="290" y="300" width="420" height="20" fill="#2e3436"/>
-<text x="290" y="315" fill="#eeeeec" textLength="420" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│ ⠴ Connecting to the mail server (0.4s) │</text>
-<rect x="290" y="320" width="20" height="20" fill="#2e3436"/>
-<text x="290" y="335" fill="#eeeeec" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│ </text>
+<rect x="470" y="280" width="230" height="20" fill="#2e3436"/>
+<rect x="700" y="280" width="10" height="20" fill="#2e3436"/>
+<text x="700" y="295" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="290" y="300" width="10" height="20" fill="#2e3436"/>
+<text x="290" y="315" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="300" y="300" width="400" height="20" fill="#2e3436"/>
+<text x="300" y="315" fill="#eeeeec" textLength="400" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> ⠴ Connecting to the mail server (0.4s) </text>
+<rect x="700" y="300" width="10" height="20" fill="#2e3436"/>
+<text x="700" y="315" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="290" y="320" width="10" height="20" fill="#2e3436"/>
+<text x="290" y="335" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="300" y="320" width="10" height="20" fill="#2e3436"/>
 <rect x="310" y="320" width="370" height="20" fill="#2e3436"/>
-<text x="310" y="335" fill="#d3d7cf" textLength="370" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Signing in and opening the mailbox...</text>
-<rect x="680" y="320" width="30" height="20" fill="#2e3436"/>
-<text x="680" y="335" fill="#eeeeec" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  │</text>
+<text x="310" y="335" fill="#888a85" textLength="370" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Signing in and opening the mailbox...</text>
+<rect x="680" y="320" width="20" height="20" fill="#2e3436"/>
+<rect x="700" y="320" width="10" height="20" fill="#2e3436"/>
+<text x="700" y="335" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="290" y="340" width="420" height="20" fill="#2e3436"/>
-<text x="290" y="355" fill="#eeeeec" textLength="420" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└────────────────────────────────────────┘</text>
+<text x="290" y="355" fill="#d3d3d3" textLength="420" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└────────────────────────────────────────┘</text>
 <rect x="0" y="620" width="1000" height="20" fill="#d3d3d3"/>
 <text x="0" y="635" fill="#696969" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Personal • Inbox — message -/0, 0 scheduled actions, got 0 events — Loading Inbox...                </text>
 </svg>

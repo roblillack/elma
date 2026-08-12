@@ -732,6 +732,7 @@ dependencies = [
  "insta",
  "jmap-client",
  "lettre",
+ "libc",
  "mailparse",
  "mime_guess",
  "ratatui",

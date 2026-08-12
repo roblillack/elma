@@ -3,27 +3,33 @@
 <rect x="0" y="0" width="1000" height="20" fill="#d3d3d3"/>
 <text x="0" y="15" fill="#696969" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">^Q:Quit g:GoToMailbox G:Accounts c:Compose /:Search                                                 </text>
 <rect x="180" y="260" width="630" height="20" fill="#2e3436"/>
-<text x="180" y="275" fill="#eeeeec" textLength="630" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌─────────────────────────────────────────────────────────────┐</text>
-<rect x="180" y="280" width="20" height="20" fill="#2e3436"/>
-<text x="180" y="295" fill="#eeeeec" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│ </text>
+<text x="180" y="275" fill="#d3d3d3" textLength="630" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌─────────────────────────────────────────────────────────────┐</text>
+<rect x="180" y="280" width="10" height="20" fill="#2e3436"/>
+<text x="180" y="295" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="190" y="280" width="10" height="20" fill="#2e3436"/>
 <rect x="200" y="280" width="160" height="20" fill="#2e3436"/>
 <text x="200" y="295" fill="#cc0000" textLength="160" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Personal • Inbox</text>
-<rect x="360" y="280" width="450" height="20" fill="#2e3436"/>
-<text x="360" y="295" fill="#eeeeec" textLength="450" lengthAdjust="spacingAndGlyphs" xml:space="preserve">                                            │</text>
-<rect x="180" y="300" width="20" height="20" fill="#2e3436"/>
-<text x="180" y="315" fill="#eeeeec" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│ </text>
+<rect x="360" y="280" width="440" height="20" fill="#2e3436"/>
+<rect x="800" y="280" width="10" height="20" fill="#2e3436"/>
+<text x="800" y="295" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="180" y="300" width="10" height="20" fill="#2e3436"/>
+<text x="180" y="315" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="190" y="300" width="10" height="20" fill="#2e3436"/>
 <rect x="200" y="300" width="270" height="20" fill="#2e3436"/>
 <text x="200" y="315" fill="#cc0000" textLength="270" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Could not open this mailbox</text>
-<rect x="470" y="300" width="340" height="20" fill="#2e3436"/>
-<text x="470" y="315" fill="#eeeeec" textLength="340" lengthAdjust="spacingAndGlyphs" xml:space="preserve">                                 │</text>
-<rect x="180" y="320" width="20" height="20" fill="#2e3436"/>
-<text x="180" y="335" fill="#eeeeec" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│ </text>
+<rect x="470" y="300" width="330" height="20" fill="#2e3436"/>
+<rect x="800" y="300" width="10" height="20" fill="#2e3436"/>
+<text x="800" y="315" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="180" y="320" width="10" height="20" fill="#2e3436"/>
+<text x="180" y="335" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="190" y="320" width="10" height="20" fill="#2e3436"/>
 <rect x="200" y="320" width="590" height="20" fill="#2e3436"/>
-<text x="200" y="335" fill="#d3d7cf" textLength="590" lengthAdjust="spacingAndGlyphs" xml:space="preserve">login failed: the server rejected the app-specific password</text>
-<rect x="790" y="320" width="20" height="20" fill="#2e3436"/>
-<text x="790" y="335" fill="#eeeeec" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> │</text>
+<text x="200" y="335" fill="#888a85" textLength="590" lengthAdjust="spacingAndGlyphs" xml:space="preserve">login failed: the server rejected the app-specific password</text>
+<rect x="790" y="320" width="10" height="20" fill="#2e3436"/>
+<rect x="800" y="320" width="10" height="20" fill="#2e3436"/>
+<text x="800" y="335" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="180" y="340" width="630" height="20" fill="#2e3436"/>
-<text x="180" y="355" fill="#eeeeec" textLength="630" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└─────────────────────────────────────────────────────────────┘</text>
+<text x="180" y="355" fill="#d3d3d3" textLength="630" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└─────────────────────────────────────────────────────────────┘</text>
 <rect x="0" y="620" width="1000" height="20" fill="#d3d3d3"/>
 <text x="0" y="635" fill="#696969" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Personal • Inbox — message -/0, 0 scheduled actions, got 0 events — Failed to load Inbox: login fail</text>
 </svg>

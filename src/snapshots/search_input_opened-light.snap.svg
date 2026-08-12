@@ -28,6 +28,6 @@
 <rect x="0" y="600" width="1000" height="20" fill="#d3d3d3"/>
 <text x="0" y="615" fill="#696969" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Personal • Inbox — 11 matches of 11 messages, message 11/11, 0 scheduled — Loaded 11/11 messages in </text>
 <text x="0" y="635" fill="#2e3436" textLength="60" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Find: </text>
-<text x="60" y="635" fill="#555753" textLength="650" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> (input search terms; press &lt;Enter&gt; to activate, &lt;Esc&gt; to cancel)</text>
+<text x="60" y="635" fill="#888a85" textLength="650" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> (input search terms; press &lt;Enter&gt; to activate, &lt;Esc&gt; to cancel)</text>
 <rect x="60" y="620" width="10" height="20" fill="#2e3436" fill-opacity="0.4"/>
 </svg>

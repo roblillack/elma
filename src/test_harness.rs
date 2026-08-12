@@ -101,6 +101,16 @@ impl TerminalTheme {
         }
     }
 
+    /// The palette the client paints with on this terminal.  A frame is drawn
+    /// again for each theme before it is snapshotted, since which colours read
+    /// as focused depends on what is behind them.
+    pub(crate) fn ui_theme(self) -> ui::Theme {
+        match self {
+            Self::Dark => ui::Theme::Dark,
+            Self::Light => ui::Theme::Light,
+        }
+    }
+
     /// The terminal's own text colour: Tango's Aluminium 2 on dark, Aluminium 6
     /// on light.
     fn fg(self) -> &'static str {
@@ -191,6 +201,11 @@ impl TestApp {
     /// Render one frame.  Every method that feeds the app an event redraws
     /// afterwards, the way the main loop does.
     pub(crate) fn draw(&mut self) {
+        self.draw_in(ui::Theme::Dark);
+    }
+
+    /// Render one frame as the client would on a `theme` terminal.
+    pub(crate) fn draw_in(&mut self, theme: ui::Theme) {
         // ratatui hands the backend a cursor position only for a frame that
         // asked for one, so a sentinel written beforehand survives exactly
         // when the view places no caret -- which is what tells the two apart
@@ -201,7 +216,7 @@ impl TestApp {
             .expect("reset the test cursor");
         let app = &mut self.app;
         self.terminal
-            .draw(|frame| ui::render(frame, app))
+            .draw(|frame| ui::render(frame, app, theme))
             .expect("draw frame");
     }
 
@@ -302,7 +317,12 @@ impl TestApp {
 
     /// Render the current frame to SVG with custom cell geometry, which the
     /// demo recorder uses to tighten the rows.
+    ///
+    /// The frame is drawn again first: the client picks its popup colours by
+    /// what the terminal puts behind them, so the same state is a different
+    /// buffer on a dark terminal than on a light one.
     pub(crate) fn svg_with(&mut self, metrics: CellMetrics, theme: TerminalTheme) -> String {
+        self.draw_in(theme.ui_theme());
         let cursor = self.cursor();
         buffer_to_svg(self.terminal.backend().buffer(), cursor, metrics, theme)
     }
