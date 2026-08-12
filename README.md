@@ -135,9 +135,24 @@ answer fall back to the `COLORFGBG` environment variable, and then to assuming a
 dark background. Say so in `~/.elmarc` to skip the question:
 
 ```toml
-# "dark", "light", or "auto" to ask the terminal. Default: auto.
+# "dark", "light", "mono", or "auto" to ask the terminal. Default: auto.
 theme = "light"
 ```
+
+#### Without colour
+
+`--no-color` draws the whole interface in bold, faint, italics, underlining and
+reverse video instead — one theme that reads on a light terminal and a dark one
+alike, for monochrome terminals, for terminals whose palette you would rather
+Elma left alone, and for anyone who prefers it. The bars are reverse video,
+unread messages are bold, a deleted one is struck through, and the popup with
+the keys is the one framed in heavy lines while whatever it covers goes faint.
+
+The [`NO_COLOR`](https://no-color.org) environment variable does the same thing,
+and does it whatever `theme` says in the configuration file: the terminal
+library drops every colour Elma writes under `NO_COLOR` regardless, so the
+alternative would be a colour theme with its colours taken away. `theme =
+"mono"` asks for it permanently.
 
 ### General use
 

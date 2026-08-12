@@ -30,10 +30,12 @@ const DEFAULT_JMAP_SESSION_URL: &str = "https://api.fastmail.com/jmap/session";
 fn main() -> Result<()> {
     let args = std::env::args().skip(1);
     let mut demo_mode = false;
+    let mut no_colour = false;
 
     for arg in args {
         match arg.as_str() {
             "-D" | "--demo" => demo_mode = true,
+            "--no-color" | "--no-colour" => no_colour = true,
             "-h" | "--help" => {
                 print_usage();
                 return Ok(());
@@ -47,11 +49,12 @@ fn main() -> Result<()> {
     }
 
     let config = load_config()?;
-    let theme = match config.as_ref().and_then(|config| config.theme.as_deref()) {
-        Some(value) => ThemePreference::parse(value)
-            .with_context(|| format!("invalid theme in {}", config_path_display()))?,
-        None => ThemePreference::default(),
-    };
+    let theme = ThemePreference::resolve(
+        no_colour,
+        config.as_ref().and_then(|config| config.theme.as_deref()),
+        terminal::no_colour_in_env(),
+    )
+    .with_context(|| format!("invalid theme in {}", config_path_display()))?;
     let accounts = load_accounts(demo_mode, config)?;
 
     let mut app = App::new(accounts).context("failed to initialize application state")?;
@@ -104,8 +107,10 @@ fn print_usage() {
     println!("    elma-rs [OPTIONS]");
     println!();
     println!("OPTIONS:");
-    println!("    -D, --demo    Run with the built-in mock backend (default)");
-    println!("    -h, --help    Show this help message");
+    println!("    -D, --demo      Run with the built-in mock backend (default)");
+    println!("        --no-color  Draw without colour, in bold and reverse video only");
+    println!("                    (also honours the NO_COLOR environment variable)");
+    println!("    -h, --help      Show this help message");
 }
 
 fn load_accounts(demo_mode: bool, config: Option<Config>) -> Result<Vec<AccountDescriptor>> {
@@ -312,7 +317,8 @@ fn config_path_display() -> String {
 
 #[derive(Debug, Deserialize)]
 struct Config {
-    /// `dark`, `light`, or `auto` to ask the terminal -- which is the default.
+    /// `dark`, `light`, `mono` for no colour at all, or `auto` to ask the
+    /// terminal -- which is the default.
     theme: Option<String>,
     #[serde(alias = "accounts")]
     accounts: Option<Vec<AccountConfig>>,

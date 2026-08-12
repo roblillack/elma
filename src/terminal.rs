@@ -11,7 +11,9 @@
 //!
 //! Two fallbacks stand behind the query, and the configuration stands in front
 //! of it: `theme = "dark"` or `"light"` in `~/.elmarc` skips the handshake
-//! entirely.
+//! entirely.  So does anything that asks for no colour at all -- `--no-color`,
+//! `NO_COLOR`, `theme = "mono"` -- since what the background is does not matter
+//! to a client that is not going to paint anything over it.
 
 use std::io::{self, IsTerminal, Read, Stdout, Write};
 use std::time::{Duration, Instant};
@@ -59,11 +61,51 @@ impl ThemePreference {
             "auto" | "" => Ok(Self::Auto),
             "dark" => Ok(Self::Fixed(Theme::Dark)),
             "light" => Ok(Self::Fixed(Theme::Light)),
+            "mono" | "monochrome" => Ok(Self::Fixed(Theme::Mono)),
             other => Err(anyhow::anyhow!(
-                "theme: expected \"dark\", \"light\" or \"auto\", found \"{other}\""
+                "theme: expected \"dark\", \"light\", \"mono\" or \"auto\", found \"{other}\""
             )),
         }
     }
+
+    /// Settle what the command line, the configuration file and the
+    /// environment between them are asking for.
+    ///
+    /// Either way of asking for no colour wins over a `theme` in the file, and
+    /// not only out of deference to the convention: crossterm honours
+    /// `NO_COLOR` itself and drops every colour the client writes under it, so
+    /// a configured `theme = "dark"` could not put the colours back -- it could
+    /// only ask for a dark theme's layout to be drawn with its palette
+    /// stripped, which is the one combination that reads worse than either.
+    ///
+    /// A misspelt theme is still reported rather than swallowed, so that
+    /// running with `NO_COLOR` set does not quietly hide a typo that will
+    /// surface on some other machine.
+    pub fn resolve(
+        no_colour_flag: bool,
+        configured: Option<&str>,
+        no_colour_env: bool,
+    ) -> Result<Self> {
+        let preference = match configured {
+            Some(value) => Self::parse(value)?,
+            None => Self::default(),
+        };
+
+        if no_colour_flag || no_colour_env {
+            return Ok(Self::Fixed(Theme::Mono));
+        }
+
+        Ok(preference)
+    }
+}
+
+/// Whether the environment asks for no colour.
+///
+/// The `NO_COLOR` convention (<https://no-color.org>): any value at all, as
+/// long as it is not the empty string, means every program that would add
+/// colour should not.
+pub fn no_colour_in_env() -> bool {
+    std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
 }
 
 /// Enter raw mode and the alternate screen, and report the theme to draw in.
@@ -282,6 +324,52 @@ mod tests {
     fn an_unknown_theme_is_rejected() {
         let error = ThemePreference::parse("solarized").expect_err("unknown theme");
         assert!(error.to_string().contains("solarized"), "{error}");
+    }
+
+    /// Either way of saying "no colour" says it, whatever else is configured:
+    /// under `NO_COLOR` crossterm drops the colours anyway, so a theme that
+    /// depends on them would only come out half-drawn.
+    #[test]
+    fn asking_for_no_colour_is_asking_for_the_monochrome_theme() {
+        assert_eq!(
+            ThemePreference::parse("mono").unwrap(),
+            ThemePreference::Fixed(Theme::Mono)
+        );
+
+        for configured in [None, Some("dark"), Some("light"), Some("auto")] {
+            for (flag, env) in [(true, false), (false, true), (true, true)] {
+                assert_eq!(
+                    ThemePreference::resolve(flag, configured, env).unwrap(),
+                    ThemePreference::Fixed(Theme::Mono),
+                    "{configured:?} with --no-color={flag} and NO_COLOR={env}"
+                );
+            }
+        }
+    }
+
+    /// With nobody asking for anything else, the file decides and an empty file
+    /// leaves it to the terminal.
+    #[test]
+    fn the_configured_theme_decides_when_colour_is_allowed() {
+        assert_eq!(
+            ThemePreference::resolve(false, Some("light"), false).unwrap(),
+            ThemePreference::Fixed(Theme::Light)
+        );
+        assert_eq!(
+            ThemePreference::resolve(false, None, false).unwrap(),
+            ThemePreference::Auto
+        );
+    }
+
+    /// A typo is worth reporting however the run was started: hiding it under
+    /// `NO_COLOR` would leave it to surface on some other machine.
+    #[test]
+    fn a_misspelt_theme_survives_resolution() {
+        for (flag, env) in [(false, false), (false, true), (true, true)] {
+            let error =
+                ThemePreference::resolve(flag, Some("greyscale"), env).expect_err("unknown theme");
+            assert!(error.to_string().contains("greyscale"), "{error}");
+        }
     }
 
     #[test]

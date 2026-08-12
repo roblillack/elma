@@ -15,6 +15,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use super::{FixtureBackend, TerminalTheme, TestApp, account};
 use crate::app::LoadPhase;
 use crate::model::MailboxKind;
+use crate::ui;
 
 /// Terminal geometry every snapshot is taken at: wide enough for the message
 /// list's five columns, tall enough for the compose dialog to sit inside the
@@ -32,16 +33,33 @@ const HEIGHT: u16 = 32;
 fn assert_svg(name: &str, app: &mut TestApp) {
     for theme in TerminalTheme::ALL {
         let svg = app.svg(theme);
-        let mut settings = insta::Settings::clone_current();
-        settings.set_prepend_module_to_snapshot(false);
-        settings.set_omit_expression(true);
-        settings.bind(|| {
-            insta::assert_binary_snapshot!(
-                format!("{name}-{}.svg", theme.name()).as_str(),
-                svg.into_bytes()
-            );
-        });
+        write_svg(name, theme, svg);
     }
+}
+
+/// Snapshot the current frame as the client draws it for a user who has asked
+/// for no colour, once per terminal theme.
+///
+/// Both terminals again, and for the same reason twice over: the monochrome
+/// theme's whole claim is that bold, faint and reverse video say what colour
+/// says, on a background it never has to know.
+fn assert_mono_svg(name: &str, app: &mut TestApp) {
+    for theme in TerminalTheme::ALL {
+        let svg = app.svg_in_palette(ui::Theme::Mono, theme);
+        write_svg(name, theme, svg);
+    }
+}
+
+fn write_svg(name: &str, theme: TerminalTheme, svg: String) {
+    let mut settings = insta::Settings::clone_current();
+    settings.set_prepend_module_to_snapshot(false);
+    settings.set_omit_expression(true);
+    settings.bind(|| {
+        insta::assert_binary_snapshot!(
+            format!("{name}-{}.svg", theme.name()).as_str(),
+            svg.into_bytes()
+        );
+    });
 }
 
 /// The standard app: one account on the fixture inbox, fully loaded.
@@ -486,4 +504,146 @@ fn account_switched() {
     app.char('2');
     assert_on_screen(&app, "Work");
     assert_svg("account_switched", &mut app);
+}
+
+// -- Without colour --------------------------------------------------------
+
+/// The list as `--color=never` would have it: the bars in reverse video, the
+/// unread messages bold, the archived one in italics, the deleted one struck
+/// through, and the labels told apart by which of them is a chip.
+#[test]
+fn mono_message_list() {
+    let mut app = inbox();
+    assert_mono_svg("mono_message_list", &mut app);
+}
+
+/// The bars with something on them: a mailbox still arriving puts the
+/// read-progress indicator in the corner of a bar that is itself reverse video.
+#[test]
+fn mono_message_list_while_backfilling() {
+    let mut app = TestApp::new(
+        WIDTH,
+        HEIGHT,
+        vec![account(
+            "Personal",
+            FixtureBackend::backfilling(MailboxKind::Inbox, 18),
+        )],
+    );
+    assert_on_screen(&app, "Loading message...");
+    assert_mono_svg("mono_message_list_while_backfilling", &mut app);
+}
+
+/// Two popups, one on top of the other, without a colour between them: the
+/// prompt taking keys is framed in heavy lines and the dialog underneath it
+/// goes faint, name, fields, buttons and all.
+#[test]
+fn mono_compose_under_a_prompt() {
+    let mut app = inbox();
+    app.char('c');
+    focus_attach_button(&mut app);
+    app.key(KeyCode::Enter);
+    assert_on_screen(&app, "Path:");
+    assert_mono_svg("mono_compose_under_a_prompt", &mut app);
+}
+
+/// A search still in force, reported by a popup that has no keys: faint, in a
+/// light frame, over a list that has them.
+#[test]
+fn mono_search_results() {
+    let mut app = inbox();
+    app.char('/');
+    app.type_text("invoice");
+    app.key(KeyCode::Enter);
+    assert_on_screen(&app, "Showing results for:");
+    assert_mono_svg("mono_search_results", &mut app);
+}
+
+/// A dialog with everything in it: a name, a field with the caret in it, a
+/// list with a selection, and the keys along the bottom of the frame.
+#[test]
+fn mono_save_attachment_dialog() {
+    let mut app = message_view();
+    app.key_with(KeyCode::Char('S'), KeyModifiers::SHIFT);
+    app.key(KeyCode::Tab); // onto the folder field
+    app.clear_field();
+    app.type_text("/home/rob/Downloads");
+    assert_mono_svg("mono_save_attachment_dialog_folder_focused", &mut app);
+
+    app.key(KeyCode::Tab); // back onto the list
+    assert_mono_svg("mono_save_attachment_dialog", &mut app);
+}
+
+/// Not one colour anywhere in the interface, in any state of it.
+///
+/// The palette module holds itself to this, but it can only speak for the
+/// styles it hands out: a call site that named a colour of its own would slip
+/// past it, and would then be drawn against a terminal whose own two colours
+/// the client has deliberately not asked about.
+#[test]
+fn nothing_in_the_monochrome_theme_names_a_colour() {
+    let mut app = inbox();
+    assert_colourless(&mut app, "the message list");
+
+    app.char('g');
+    assert_colourless(&mut app, "the mailbox chooser");
+    app.key(KeyCode::Esc);
+
+    app.char('/');
+    app.type_text("invoice");
+    assert_colourless(&mut app, "the search prompt");
+    app.key(KeyCode::Enter);
+    assert_colourless(&mut app, "a filtered list");
+    app.key(KeyCode::Esc);
+
+    app.char('c');
+    focus_attach_button(&mut app);
+    app.key(KeyCode::Enter);
+    assert_colourless(&mut app, "the composer under a prompt");
+    app.key(KeyCode::Esc);
+    app.key(KeyCode::Esc);
+
+    let mut app = message_view();
+    assert_colourless(&mut app, "the message viewer");
+    app.key_with(KeyCode::Char('S'), KeyModifiers::SHIFT);
+    assert_colourless(&mut app, "the save dialog");
+
+    // A load that failed and one still running: between them they cover the
+    // error colour and the progress indicator.
+    let mut app = TestApp::new(
+        WIDTH,
+        HEIGHT,
+        vec![account(
+            "Personal",
+            FixtureBackend::failing("connection refused"),
+        )],
+    );
+    assert_colourless(&mut app, "a failed load");
+
+    let mut app = TestApp::new(
+        WIDTH,
+        HEIGHT,
+        vec![account(
+            "Personal",
+            FixtureBackend::backfilling(MailboxKind::Inbox, 18),
+        )],
+    );
+    assert_colourless(&mut app, "a mailbox still arriving");
+}
+
+/// Draw the current state in the monochrome palette and check that every cell
+/// leaves its colours to the terminal.
+fn assert_colourless(app: &mut TestApp, what: &str) {
+    use ratatui::style::Color;
+
+    app.draw_in(ui::Theme::Mono);
+    for cell in app.buffer().content() {
+        for (role, colour) in [("foreground", cell.fg), ("background", cell.bg)] {
+            assert_eq!(
+                colour,
+                Color::Reset,
+                "{what}: {:?} asks for a {role} of {colour:?}",
+                cell.symbol()
+            );
+        }
+    }
 }

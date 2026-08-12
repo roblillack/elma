@@ -295,6 +295,12 @@ impl TestApp {
         }
     }
 
+    /// The cells the last frame left behind, for a test that has to look at
+    /// how they are styled rather than at what they say.
+    pub(crate) fn buffer(&self) -> &Buffer {
+        self.terminal.backend().buffer()
+    }
+
     /// Plain-text contents of the terminal buffer, one string per row.  Useful
     /// for asserting on what a frame says without pinning how it looks.
     pub(crate) fn buffer_lines(&self) -> Vec<String> {
@@ -315,6 +321,17 @@ impl TestApp {
         self.svg_with(CellMetrics::default(), theme)
     }
 
+    /// Render the current frame to SVG in a palette of the caller's choosing.
+    ///
+    /// Which palette the client paints with is usually the one the terminal's
+    /// background calls for, and [`TestApp::svg`] takes it from there.  It is
+    /// not when the user has asked for no colour -- a frame worth snapshotting
+    /// against both backgrounds too, since the monochrome theme's whole claim
+    /// is that it reads on either.
+    pub(crate) fn svg_in_palette(&mut self, palette: ui::Theme, theme: TerminalTheme) -> String {
+        self.render_svg(palette, CellMetrics::default(), theme)
+    }
+
     /// Render the current frame to SVG with custom cell geometry, which the
     /// demo recorder uses to tighten the rows.
     ///
@@ -322,7 +339,18 @@ impl TestApp {
     /// what the terminal puts behind them, so the same state is a different
     /// buffer on a dark terminal than on a light one.
     pub(crate) fn svg_with(&mut self, metrics: CellMetrics, theme: TerminalTheme) -> String {
-        self.draw_in(theme.ui_theme());
+        self.render_svg(theme.ui_theme(), metrics, theme)
+    }
+
+    /// Draw the frame in `palette` and render the buffer as `theme`'s terminal
+    /// would show it.
+    fn render_svg(
+        &mut self,
+        palette: ui::Theme,
+        metrics: CellMetrics,
+        theme: TerminalTheme,
+    ) -> String {
+        self.draw_in(palette);
         let cursor = self.cursor();
         buffer_to_svg(self.terminal.backend().buffer(), cursor, metrics, theme)
     }

@@ -10,18 +10,20 @@
 <text x="740" y="55" fill="#204a87" textLength="80" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> Search </text>
 <rect x="820" y="40" width="150" height="20" fill="#d3d3d3"/>
 <text x="820" y="55" fill="#696969" textLength="150" lengthAdjust="spacingAndGlyphs" xml:space="preserve">──────────────┐</text>
-<rect x="730" y="60" width="20" height="20" fill="#d3d3d3"/>
-<text x="730" y="75" fill="#696969" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│ </text>
-<rect x="750" y="60" width="200" height="20" fill="#d3d3d3"/>
-<text x="750" y="75" fill="#2e3436" textLength="200" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Showing results for:</text>
-<rect x="950" y="60" width="20" height="20" fill="#d3d3d3"/>
-<text x="950" y="75" fill="#696969" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> │</text>
-<rect x="730" y="80" width="20" height="20" fill="#d3d3d3"/>
-<text x="730" y="95" fill="#696969" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│ </text>
+<rect x="730" y="60" width="10" height="20" fill="#d3d3d3"/>
+<text x="730" y="75" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="740" y="60" width="220" height="20" fill="#d3d3d3"/>
+<text x="740" y="75" fill="#2e3436" textLength="220" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Showing results for: </text>
+<rect x="960" y="60" width="10" height="20" fill="#d3d3d3"/>
+<text x="960" y="75" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="730" y="80" width="10" height="20" fill="#d3d3d3"/>
+<text x="730" y="95" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="740" y="80" width="10" height="20" fill="#d3d3d3"/>
 <rect x="750" y="80" width="70" height="20" fill="#d3d3d3"/>
 <text x="750" y="95" fill="#2e3436" textLength="70" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">invoice</text>
-<rect x="820" y="80" width="150" height="20" fill="#d3d3d3"/>
-<text x="820" y="95" fill="#696969" textLength="150" lengthAdjust="spacingAndGlyphs" xml:space="preserve">              │</text>
+<rect x="820" y="80" width="140" height="20" fill="#d3d3d3"/>
+<rect x="960" y="80" width="10" height="20" fill="#d3d3d3"/>
+<text x="960" y="95" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="730" y="100" width="10" height="20" fill="#d3d3d3"/>
 <text x="730" y="115" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└</text>
 <rect x="740" y="100" width="10" height="20" fill="#d3d3d3"/>

@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="640" viewBox="0 0 1000 640" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="16px">
+<rect width="100%" height="100%" fill="#eeeeec"/>
+<rect x="0" y="0" width="1000" height="20" fill="#2e3436"/>
+<text x="0" y="15" fill="#eeeeec" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">^Q:Quit g:GoToMailbox G:Accounts c:Compose Enter:Open s:Unstar -:NotImportant r:Reply y:Archive d:De</text>
+<text x="0" y="35" fill="#2e3436" textLength="480" lengthAdjust="spacingAndGlyphs" xml:space="preserve">     [Dec 24, 2025] hr@example.com         12K  </text>
+<rect x="480" y="20" width="90" height="20" fill="#2e3436"/>
+<text x="480" y="35" fill="#eeeeec" textLength="90" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[Archive]</text>
+<text x="580" y="35" fill="#2e3436" textLength="60" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">[Work]</text>
+<text x="640" y="35" fill="#2e3436" textLength="360" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Holiday schedule for next year     </text>
+<text x="0" y="55" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve" text-decoration="line-through" opacity="0.6">D    [Mar 07 13:37] tickets@support.exam  3.4K  Ticket #4711 has been closed                        </text>
+<text x="0" y="75" fill="#2e3436" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-style="italic" opacity="0.6">!    [Mar </text>
+<text x="100" y="75" fill="#2e3436" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">┌</text>
+<text x="110" y="75" fill="#2e3436" textLength="90" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold" opacity="0.6"> Compose </text>
+<text x="200" y="75" fill="#2e3436" textLength="700" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">─────────────────────────────────────────────────────────────────────┐</text>
+<text x="0" y="95" fill="#2e3436" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-style="italic">A    [Mar </text>
+<text x="100" y="95" fill="#2e3436" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│</text>
+<text x="110" y="95" fill="#2e3436" textLength="40" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold" opacity="0.6">To: </text>
+<text x="150" y="95" fill="#2e3436" textLength="750" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">&lt;empty&gt;                                                                   │</text>
+<text x="0" y="115" fill="#2e3436" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve">     [Mar </text>
+<text x="100" y="115" fill="#2e3436" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│</text>
+<text x="110" y="115" fill="#2e3436" textLength="40" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold" opacity="0.6">Cc: </text>
+<text x="150" y="115" fill="#2e3436" textLength="750" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">&lt;empty&gt;                                                                   │</text>
+<text x="0" y="135" fill="#2e3436" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> ○   [Mar </text>
+<text x="100" y="135" fill="#2e3436" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│</text>
+<text x="110" y="135" fill="#2e3436" textLength="50" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold" opacity="0.6">Bcc: </text>
+<text x="160" y="135" fill="#2e3436" textLength="740" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">&lt;empty&gt;                                                                  │</text>
+<text x="0" y="155" fill="#2e3436" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  →@ [Mar </text>
+<text x="100" y="155" fill="#2e3436" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│</text>
+<text x="110" y="155" fill="#2e3436" textLength="90" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold" opacity="0.6">Subject: </text>
+<text x="200" y="155" fill="#2e3436" textLength="700" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">&lt;empty&gt;                                                              │</text>
+<text x="0" y="175" fill="#2e3436" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> *   [Mar </text>
+<text x="100" y="175" fill="#2e3436" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│Press [Edit message] to compose.                                              │</text>
+<text x="0" y="195" fill="#2e3436" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  ↩  [Mar </text>
+<text x="100" y="195" fill="#2e3436" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│                                                                              │</text>
+<text x="900" y="195" fill="#2e3436" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve">eek       </text>
+<text x="0" y="215" fill="#2e3436" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">N    [Mar </text>
+<text x="100" y="215" fill="#2e3436" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│                                                                              │</text>
+<rect x="0" y="220" width="100" height="20" fill="#2e3436"/>
+<text x="0" y="235" fill="#eeeeec" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">N⊛ @ [Mar </text>
+<text x="100" y="235" fill="#2e3436" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│                                                                              │</text>
+<rect x="900" y="220" width="100" height="20" fill="#2e3436"/>
+<text x="900" y="235" fill="#eeeeec" textLength="100" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">bruary    </text>
+<text x="100" y="255" fill="#2e3436" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│                                                                              │</text>
+<text x="100" y="275" fill="#2e3436" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│ </text>
+<text x="120" y="275" fill="#2e3436" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┏</text>
+<text x="130" y="275" fill="#2e3436" textLength="130" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> Attach file </text>
+<text x="260" y="275" fill="#2e3436" textLength="620" lengthAdjust="spacingAndGlyphs" xml:space="preserve">━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓</text>
+<text x="880" y="275" fill="#2e3436" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6"> │</text>
+<text x="100" y="295" fill="#2e3436" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│ </text>
+<text x="120" y="295" fill="#2e3436" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┃</text>
+<text x="130" y="295" fill="#2e3436" textLength="60" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Path: </text>
+<text x="190" y="295" fill="#2e3436" textLength="690" lengthAdjust="spacingAndGlyphs" xml:space="preserve">                                                                    ┃</text>
+<text x="880" y="295" fill="#2e3436" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6"> │</text>
+<text x="100" y="315" fill="#2e3436" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│ </text>
+<text x="120" y="315" fill="#2e3436" textLength="760" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┃                                                                          ┃</text>
+<text x="880" y="315" fill="#2e3436" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6"> │</text>
+<text x="100" y="335" fill="#2e3436" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│ </text>
+<text x="120" y="335" fill="#2e3436" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┗</text>
+<text x="130" y="335" fill="#2e3436" textLength="50" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Enter</text>
+<text x="180" y="335" fill="#2e3436" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">:</text>
+<text x="190" y="335" fill="#2e3436" textLength="80" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Attach  </text>
+<text x="270" y="335" fill="#2e3436" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Esc</text>
+<text x="300" y="335" fill="#2e3436" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">:</text>
+<text x="310" y="335" fill="#2e3436" textLength="570" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Cancel━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛</text>
+<text x="880" y="335" fill="#2e3436" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6"> │</text>
+<text x="100" y="355" fill="#2e3436" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│                                                                              │</text>
+<text x="100" y="375" fill="#2e3436" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│                                                                              │</text>
+<text x="100" y="395" fill="#2e3436" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│                                                                              │</text>
+<text x="100" y="415" fill="#2e3436" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│                                                                              │</text>
+<text x="100" y="435" fill="#2e3436" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│                                                                              │</text>
+<text x="100" y="455" fill="#2e3436" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│                                                                              │</text>
+<text x="100" y="475" fill="#2e3436" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│                                                                              │</text>
+<text x="100" y="495" fill="#2e3436" textLength="90" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│        </text>
+<rect x="190" y="480" width="160" height="20" fill="#2e3436"/>
+<text x="190" y="495" fill="#eeeeec" textLength="160" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">[Attach file...]</text>
+<text x="350" y="495" fill="#2e3436" textLength="550" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">   [Cancel]   [Edit message]   [Draft]   [Send]       │</text>
+<text x="100" y="515" fill="#2e3436" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│                                                                              │</text>
+<text x="100" y="535" fill="#2e3436" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">│                   Drop a file on the terminal to attach it.                  │</text>
+<text x="100" y="555" fill="#2e3436" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">└──────────────────────────────────────────────────────────────────────────────┘</text>
+<rect x="0" y="620" width="1000" height="20" fill="#2e3436"/>
+<text x="0" y="635" fill="#eeeeec" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Personal • Inbox — message 11/11, 0 scheduled actions, got 0 events — Compose mode active.          </text>
+<rect x="190" y="280" width="10" height="20" fill="#2e3436" fill-opacity="0.4"/>
+</svg>
