@@ -13,7 +13,9 @@
 //! Two things would otherwise differ between two runs of the same test, and
 //! both are held still here: the clock (see [`crate::clock`]) and the mail,
 //! which comes from [`FixtureBackend`] rather than the mock backend's
-//! randomised inbox.
+//! randomised inbox.  A third is not held still but taken both ways: every
+//! frame is written once for a dark terminal and once for a light one (see
+//! [`TerminalTheme`]).
 //!
 //! Snapshots live in `src/snapshots/*.snap.svg`.  Review changes with
 //! `cargo insta review`, or set `INSTA_UPDATE=always` to rewrite them.
@@ -65,8 +67,59 @@ const NO_CURSOR: Position = Position {
 };
 
 const FONT_SIZE: usize = 16;
-const DEFAULT_FG: &str = "#d8d8d8";
-const DEFAULT_BG: &str = "#101010";
+
+/// The colours the *terminal* brings to a frame, as opposed to the ones Elma
+/// paints into it: Tango Dark and Tango Light, the pair GNOME Terminal has
+/// shipped since 2006 and most other emulators copied.
+///
+/// A cell the client leaves alone keeps `Color::Reset`, which the terminal
+/// fills with its own foreground and background -- and those two colours are
+/// the whole of what the Tango pair disagrees about.  Every view is therefore
+/// snapshotted in both, so a colour that only works against one of them is
+/// visible as such rather than only to the half of the users who have the
+/// other.
+///
+/// The 16 ANSI colours are the same in both, because that is how Tango is
+/// defined: one palette, two ways round.  That keeps each pair of frames a
+/// comparison of Elma's colours against the two backgrounds rather than of two
+/// palettes.  See [`ANSI16`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalTheme {
+    Dark,
+    Light,
+}
+
+impl TerminalTheme {
+    /// Both themes, in the order their snapshots are written.
+    pub(crate) const ALL: [Self; 2] = [Self::Dark, Self::Light];
+
+    /// What the theme's snapshot is named after.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+
+    /// The terminal's own text colour: Tango's Aluminium 2 on dark, Aluminium 6
+    /// on light.
+    fn fg(self) -> &'static str {
+        match self {
+            Self::Dark => "#d3d7cf",
+            Self::Light => "#2e3436",
+        }
+    }
+
+    /// The terminal's own background, the same two colours the other way
+    /// round -- give or take the lightest Aluminium, which is what Tango Light
+    /// uses rather than a flat white.
+    fn bg(self) -> &'static str {
+        match self {
+            Self::Dark => "#2e3436",
+            Self::Light => "#eeeeec",
+        }
+    }
+}
 
 /// Pixel geometry of one terminal cell in the rendered SVG.
 #[derive(Clone, Copy)]
@@ -241,13 +294,15 @@ impl TestApp {
             .collect()
     }
 
-    /// Render the current frame to SVG.
-    pub(crate) fn svg(&mut self) -> String {
+    /// Render the current frame to SVG, as a terminal with `theme`'s default
+    /// colours would show it.
+    pub(crate) fn svg(&mut self, theme: TerminalTheme) -> String {
         let cursor = self.cursor();
         buffer_to_svg(
             self.terminal.backend().buffer(),
             cursor,
             CellMetrics::default(),
+            theme,
         )
     }
 }
@@ -271,9 +326,9 @@ struct CellStyle {
     strike: bool,
 }
 
-fn cell_style(cell: &Cell) -> CellStyle {
-    let mut fg = css_color(cell.fg, DEFAULT_FG);
-    let mut bg = css_color(cell.bg, DEFAULT_BG);
+fn cell_style(cell: &Cell, theme: TerminalTheme) -> CellStyle {
+    let mut fg = css_color(cell.fg, theme.fg());
+    let mut bg = css_color(cell.bg, theme.bg());
     let modifier = cell.modifier;
     if modifier.contains(Modifier::REVERSED) {
         std::mem::swap(&mut fg, &mut bg);
@@ -289,10 +344,12 @@ fn cell_style(cell: &Cell) -> CellStyle {
     }
 }
 
-/// The 16 base ANSI colours (VS Code's terminal palette).
+/// The 16 base ANSI colours, from the Tango palette both
+/// [themes](TerminalTheme) are built on: the eight normal colours followed by
+/// the eight bright ones.
 const ANSI16: [&str; 16] = [
-    "#000000", "#cd3131", "#0dbc79", "#e5e510", "#2472c8", "#bc3fbc", "#11a8cd", "#e5e5e5",
-    "#666666", "#f14c4c", "#23d18b", "#f5f543", "#3b8eea", "#d670d6", "#29b8db", "#ffffff",
+    "#2e3436", "#cc0000", "#4e9a06", "#c4a000", "#3465a4", "#75507b", "#06989a", "#d3d7cf",
+    "#555753", "#ef2929", "#8ae234", "#fce94f", "#729fcf", "#ad7fa8", "#34e2e2", "#eeeeec",
 ];
 
 fn css_color(color: Color, default: &str) -> String {
@@ -344,7 +401,8 @@ fn xml_escape(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Render a ratatui cell buffer (plus optional cursor position) to SVG.
+/// Render a ratatui cell buffer (plus optional cursor position) to SVG, as a
+/// terminal with `theme`'s default colours would show it.
 ///
 /// Cells of one row are coalesced into runs of equal style; each run emits a
 /// background `<rect>` (when not the default background) and a `<text>` with an
@@ -354,6 +412,7 @@ pub(crate) fn buffer_to_svg(
     buffer: &Buffer,
     cursor: Option<Position>,
     metrics: CellMetrics,
+    theme: TerminalTheme,
 ) -> String {
     let CellMetrics {
         width: cell_w,
@@ -371,7 +430,8 @@ pub(crate) fn buffer_to_svg(
     );
     let _ = writeln!(
         svg,
-        r#"<rect width="100%" height="100%" fill="{DEFAULT_BG}"/>"#
+        r#"<rect width="100%" height="100%" fill="{}"/>"#,
+        theme.bg()
     );
 
     for y in 0..area.height {
@@ -379,7 +439,7 @@ pub(crate) fn buffer_to_svg(
         let mut runs: Vec<(usize, usize, String, CellStyle)> = Vec::new();
         for x in 0..area.width {
             let cell = buffer.cell(Position::new(x, y)).expect("cell in area");
-            let style = cell_style(cell);
+            let style = cell_style(cell, theme);
             match runs.last_mut() {
                 Some((_, cells, text, last_style)) if *last_style == style => {
                     *cells += 1;
@@ -391,7 +451,7 @@ pub(crate) fn buffer_to_svg(
 
         let row_px = y as usize * cell_h;
         for (start, cells, text, style) in &runs {
-            if style.bg != DEFAULT_BG {
+            if style.bg != theme.bg() {
                 let _ = writeln!(
                     svg,
                     r#"<rect x="{}" y="{row_px}" width="{}" height="{cell_h}" fill="{}"/>"#,
@@ -432,11 +492,14 @@ pub(crate) fn buffer_to_svg(
     }
 
     if let Some(position) = cursor {
+        // A translucent block in the terminal's own text colour, which is the
+        // one colour guaranteed to show up against its own background.
         let _ = writeln!(
             svg,
-            r##"<rect x="{}" y="{}" width="{cell_w}" height="{cell_h}" fill="#ffffff" fill-opacity="0.4"/>"##,
+            r#"<rect x="{}" y="{}" width="{cell_w}" height="{cell_h}" fill="{}" fill-opacity="0.4"/>"#,
             position.x as usize * cell_w,
             position.y as usize * cell_h,
+            theme.fg(),
         );
     }
 

@@ -266,6 +266,16 @@ key events and renders the resulting terminal to SVG. The tests live in
 and the frames themselves in `src/snapshots/*.snap.svg` — open one in a browser
 to see exactly what the client drew, colours and all.
 
+Each view is snapshotted twice, as `<view>-dark.snap.svg` and
+`<view>-light.snap.svg`, in the classic **Tango Dark** and **Tango Light** the
+Ubuntu-era GNOME Terminal shipped and most emulators copied. The pair differs
+only in the two colours the terminal supplies rather than Elma — Tango Light is
+`#2e3436` text on `#eeeeec`, Tango Dark the same two the other way round — and
+uses one and the same 16-colour Tango palette, which is how the scheme is
+defined. Anything Elma colours itself is therefore identical in both frames,
+and the pair shows at a glance which of those choices stop working when the
+terminal is not the one you happen to use.
+
 Nothing in a frame comes from the machine it was taken on: the mail comes from
 a fixture backend rather than the randomised mock one, and the clock the views
 read (`src/clock.rs`) is frozen for the duration of a test, so the dates in the

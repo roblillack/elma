@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="640" viewBox="0 0 1000 640" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="16px">
+<rect width="100%" height="100%" fill="#2e3436"/>
+<rect x="0" y="0" width="1000" height="20" fill="#d3d3d3"/>
+<text x="0" y="15" fill="#696969" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">^Q:Quit g:GoToMailbox G:Accounts c:Compose                                                          </text>
+<rect x="730" y="40" width="10" height="20" fill="#d3d3d3"/>
+<text x="730" y="55" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌</text>
+<rect x="740" y="40" width="80" height="20" fill="#d3d3d3"/>
+<text x="740" y="55" fill="#3465a4" textLength="80" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> Search </text>
+<rect x="820" y="40" width="150" height="20" fill="#d3d3d3"/>
+<text x="820" y="55" fill="#696969" textLength="150" lengthAdjust="spacingAndGlyphs" xml:space="preserve">──────────────┐</text>
+<rect x="730" y="60" width="20" height="20" fill="#d3d3d3"/>
+<text x="730" y="75" fill="#696969" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│ </text>
+<rect x="750" y="60" width="200" height="20" fill="#d3d3d3"/>
+<text x="750" y="75" fill="#2e3436" textLength="200" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Showing results for:</text>
+<rect x="950" y="60" width="20" height="20" fill="#d3d3d3"/>
+<text x="950" y="75" fill="#696969" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> │</text>
+<rect x="730" y="80" width="20" height="20" fill="#d3d3d3"/>
+<text x="730" y="95" fill="#696969" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│ </text>
+<rect x="750" y="80" width="200" height="20" fill="#d3d3d3"/>
+<text x="750" y="95" fill="#2e3436" textLength="200" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">nothing matches this</text>
+<rect x="950" y="80" width="20" height="20" fill="#d3d3d3"/>
+<text x="950" y="95" fill="#696969" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> │</text>
+<rect x="730" y="100" width="10" height="20" fill="#d3d3d3"/>
+<text x="730" y="115" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└</text>
+<rect x="740" y="100" width="10" height="20" fill="#d3d3d3"/>
+<text x="740" y="115" fill="#cc0000" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">/</text>
+<rect x="750" y="100" width="10" height="20" fill="#d3d3d3"/>
+<text x="750" y="115" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
+<rect x="760" y="100" width="60" height="20" fill="#d3d3d3"/>
+<text x="760" y="115" fill="#2e3436" textLength="60" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Change</text>
+<rect x="820" y="100" width="20" height="20" fill="#d3d3d3"/>
+<rect x="840" y="100" width="30" height="20" fill="#d3d3d3"/>
+<text x="840" y="115" fill="#cc0000" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Esc</text>
+<rect x="870" y="100" width="10" height="20" fill="#d3d3d3"/>
+<text x="870" y="115" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
+<rect x="880" y="100" width="50" height="20" fill="#d3d3d3"/>
+<text x="880" y="115" fill="#2e3436" textLength="50" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Clear</text>
+<rect x="930" y="100" width="40" height="20" fill="#d3d3d3"/>
+<text x="930" y="115" fill="#696969" textLength="40" lengthAdjust="spacingAndGlyphs" xml:space="preserve">───┘</text>
+<rect x="0" y="620" width="1000" height="20" fill="#d3d3d3"/>
+<text x="0" y="635" fill="#696969" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Personal • Inbox — 0 matches of 11 messages, message -/0, 0 scheduled — Loaded 11/11 messages in Inb</text>
+</svg>

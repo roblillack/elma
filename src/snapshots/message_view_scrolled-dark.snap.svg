@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="640" viewBox="0 0 1000 640" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="16px">
+<rect width="100%" height="100%" fill="#2e3436"/>
+<rect x="0" y="0" width="1000" height="20" fill="#d3d3d3"/>
+<text x="0" y="15" fill="#696969" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">q:Close s:Star S:SaveAttachment +/=:Important -:NotImportant r:Reply f:Forward y:Archive d:Delete Up</text>
+<text x="0" y="115" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">                               Invoice 2026-0342                                                    </text>
+<text x="0" y="195" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Dear customer,                                                                                      </text>
+<text x="0" y="235" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">your invoice for February 2026 is attached as a PDF. The total is 1,248.00 EUR,                     </text>
+<text x="0" y="255" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">payable within 14 days.                                                                             </text>
+<text x="0" y="295" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> • Hosting, February 2026 — 899.00 EUR                                                              </text>
+<text x="0" y="335" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> • Support plan — 349.00 EUR                                                                        </text>
+<text x="0" y="375" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Kind regards,                                                                                       </text>
+<text x="0" y="395" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Vendor Billing                                                                                      </text>
+<text x="0" y="455" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">---                                                                                                 </text>
+<text x="0" y="475" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Message parts:                                                                                      </text>
+<text x="0" y="495" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">- text/plain: 61 bytes                                                                              </text>
+<text x="0" y="515" fill="#d3d7cf" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">- text/html: 343 bytes                                                                              </text>
+<rect x="0" y="620" width="1000" height="20" fill="#d3d3d3"/>
+</svg>

@@ -2,7 +2,9 @@
 //!
 //! Each test drives the real [`App`](crate::app::App) through synthetic key
 //! events against the fixture mailbox and snapshots the rendered terminal as
-//! SVG (see [`crate::test_harness`]).  Review changed snapshots with
+//! SVG (see [`crate::test_harness`]) -- twice: once as a dark terminal draws
+//! it and once as a light one does, so a colour that only works against one of
+//! the two backgrounds shows up as such.  Review changed snapshots with
 //! `cargo insta review`; the `.snap.svg` files under `src/snapshots/` open
 //! directly in a browser.
 
@@ -10,7 +12,7 @@ use std::io::Write as _;
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use super::{FixtureBackend, TestApp, account};
+use super::{FixtureBackend, TerminalTheme, TestApp, account};
 use crate::app::LoadPhase;
 use crate::model::MailboxKind;
 
@@ -20,15 +22,26 @@ use crate::model::MailboxKind;
 const WIDTH: u16 = 100;
 const HEIGHT: u16 = 32;
 
-/// Emit one binary insta snapshot named `<name>.svg`.
+/// Snapshot the current frame once per terminal theme, as
+/// `<name>-dark.svg` and `<name>-light.svg`.
+///
+/// The two differ only in what the terminal paints where the client asked for
+/// no colour of its own, which is exactly the question a snapshot can answer
+/// and a running client cannot: whether the view still reads on a background
+/// the developer is not looking at.
 fn assert_svg(name: &str, app: &mut TestApp) {
-    let svg = app.svg();
-    let mut settings = insta::Settings::clone_current();
-    settings.set_prepend_module_to_snapshot(false);
-    settings.set_omit_expression(true);
-    settings.bind(|| {
-        insta::assert_binary_snapshot!(format!("{name}.svg").as_str(), svg.into_bytes());
-    });
+    for theme in TerminalTheme::ALL {
+        let svg = app.svg(theme);
+        let mut settings = insta::Settings::clone_current();
+        settings.set_prepend_module_to_snapshot(false);
+        settings.set_omit_expression(true);
+        settings.bind(|| {
+            insta::assert_binary_snapshot!(
+                format!("{name}-{}.svg", theme.name()).as_str(),
+                svg.into_bytes()
+            );
+        });
+    }
 }
 
 /// The standard app: one account on the fixture inbox, fully loaded.
