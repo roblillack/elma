@@ -8,7 +8,7 @@
 use crate::{
     backend::{
         ActionStatus, BackendEvent, LeafPart, MailBackend, MailboxSnapshot, OutgoingMessage,
-        PartRole, build_compose_body,
+        PartRole, build_compose_body, mailer_header,
     },
     model::{
         Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
@@ -1469,7 +1469,9 @@ impl JmapInner {
                 .with_context(|| format!("invalid identity email: {}", self.identity.email))?,
         );
 
-        let mut builder = LettreEmail::builder().from(from_addr);
+        let mut builder = LettreEmail::builder()
+            .from(from_addr)
+            .raw_header(mailer_header());
 
         for addr in to {
             let mailbox: LettreMailbox = addr
