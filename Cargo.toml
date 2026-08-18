@@ -85,3 +85,7 @@ time = { version = "0.3", features = ["macros"] }
 # gif encodes them into the README's animation.
 gif = "0.14"
 resvg = "0.47"
+# Lets the JMAP tests read the wire format back: what our request objects
+# serialise to, and what a canned server response deserialises into. Already in
+# the tree as a jmap-client dependency, so this costs no extra build.
+serde_json = "1"
