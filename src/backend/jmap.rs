@@ -17,8 +17,12 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow};
 use jmap_client::{
-    URI,
+    Method, Set as JmapSet, URI,
     client::{Client, Credentials},
+    core::{
+        response::{EmailSetResponse, EmailSubmissionSetResponse, TaggedMethodResponse},
+        set::SetObject,
+    },
     email::{self, Email as JmapEmail, EmailBodyPart, Property as EmailProperty},
     identity::Property as IdentityProperty,
     mailbox::{Mailbox as JmapMailbox, Property as MailboxProperty, Role as MailboxRole},
@@ -41,6 +45,10 @@ const BACKFILL_BATCH_SIZE: usize = 128;
 const MAX_BODY_VALUE_BYTES: usize = 512 * 1024;
 const EVENT_IDLE_POLL: Duration = Duration::from_secs(45);
 const EVENT_RETRY_DELAY: Duration = Duration::from_secs(10);
+/// What the copy in Sent carries once the message is on its way: read, and no
+/// longer a draft.  The compose path imports the message with `$draft` set, and
+/// delivery replaces the whole set with this one.
+const SENT_KEYWORDS: [&str; 1] = ["$seen"];
 
 /// Debug builds trace the JMAP conversation into `jmap-log-<stamp>-<pid>.log`,
 /// the counterpart of the IMAP trace the Gmail backend writes.
@@ -805,42 +813,81 @@ impl JmapInner {
                 .ok_or_else(|| anyhow!("email import did not return an identifier"))?
         };
 
+        // The submission carries the follow-up edit to the message itself:
+        // `onSuccessUpdateEmail` files the copy under Sent and drops the
+        // `$draft` keyword in the same request that hands the message over for
+        // delivery.  Doing that in two further round trips left a window in
+        // which a delivered message still looked like a draft -- and when the
+        // second one failed, it stayed that way for good.
+        //
+        // The update replaces `keywords` wholesale rather than patching
+        // `keywords/$draft` away.  RFC 8621 allows only `true` as a keyword
+        // value, so dropping one means patching it to `null` -- which
+        // jmap-client cannot express, its patch map being an
+        // `AHashMap<String, bool>` that can only ever send `false`.  FastMail
+        // rejects that with `invalidProperties`.  Replacing the set outright
+        // sidesteps the patch and is what marks the sent copy read.
+        let mut request = self.client.build();
+        let create_id = {
+            let submission = request.set_email_submission();
+            let create_id = submission
+                .create()
+                .email_id(draft_id.clone())
+                .identity_id(self.identity.id.clone())
+                .create_id()
+                .ok_or_else(|| anyhow!("email submission was built without a creation id"))?;
+
+            describe_sent_copy(
+                submission.arguments().on_success_update_email(&create_id),
+                sent_id.as_deref(),
+            );
+
+            create_id
+        };
+
         let trace = debug_logging::request(
             "EmailSubmission/set",
-            format_args!("create emailId={draft_id} identityId={}", self.identity.id),
+            format_args!(
+                "create emailId={draft_id} identityId={} onSuccessUpdateEmail mailboxIds=[{}] keywords=[{}]",
+                self.identity.id,
+                sent_id.as_deref().unwrap_or("unchanged"),
+                SENT_KEYWORDS.join(" "),
+            ),
         );
-        trace
-            .response(
-                self.client
-                    .email_submission_create(draft_id.clone(), self.identity.id.clone())
-                    .await,
-                |_| "submitted".to_owned(),
-            )
-            .context("creating JMAP email submission")?;
 
-        if let Some(sent_id) = sent_id {
-            let trace = debug_logging::request(
-                "Email/set",
-                format_args!("update id={draft_id} mailboxIds=[{sent_id}] (Sent)"),
-            );
-            let _ = trace
-                .response(
-                    self.client.email_set_mailboxes(&draft_id, [sent_id]).await,
-                    |_| "updated".to_owned(),
-                )
-                .context("moving submitted message to Sent mailbox")?;
+        // `onSuccessUpdateEmail` makes the server answer with a second,
+        // implicit `Email/set` response.  That rules out jmap-client's
+        // `send_single`, which pops the *last* method response: it would hand
+        // back the implicit update, and since one `SetResponse` deserialises
+        // happily from another's JSON that arrives as a submission which was
+        // simply never created -- a delivered message reported as a failure.
+        let responses = trace
+            .response(request.send().await, |response| {
+                format!("responses={}", response.method_responses().len())
+            })
+            .context("creating JMAP email submission")?
+            .unwrap_method_responses();
+
+        let (submission, update) = split_submission_responses(responses)?;
+
+        submission
+            .ok_or_else(|| anyhow!("server did not answer the email submission"))?
+            .created(&create_id)
+            .context("submitting message for delivery")?;
+
+        // Past this point the message is on its way, so a rejected update is
+        // worth recording but not worth failing the send over: it leaves the
+        // copy in Sent looking like a draft, and nothing more.
+        if let Some(mut update) = update {
+            match update.updated(&draft_id) {
+                Ok(_) => debug_logging::log_session(format_args!(
+                    "Email/set (implicit) id={draft_id} -> updated"
+                )),
+                Err(err) => debug_logging::log_session(format_args!(
+                    "Email/set (implicit) id={draft_id} -> ERROR: {err}"
+                )),
+            }
         }
-
-        let trace = debug_logging::request(
-            "Email/set",
-            format_args!("update id={draft_id} keywords/$draft=false"),
-        );
-        let _ = trace.response(
-            self.client
-                .email_set_keyword(&draft_id, "$draft", false)
-                .await,
-            |_| "updated".to_owned(),
-        );
 
         Ok(())
     }
@@ -980,21 +1027,77 @@ impl JmapInner {
         Ok(())
     }
 
+    /// Turn one keyword on or off for a message.
+    ///
+    /// Setting is a plain patch.  Clearing is not: RFC 8621 requires every
+    /// value in `keywords` to be `true`, so a keyword is dropped by patching it
+    /// to `null` -- and jmap-client models patches as `AHashMap<String, bool>`,
+    /// which can only ever send `false`.  FastMail rejects that with
+    /// `invalidProperties`, which is why un-starring, un-flagging and moving a
+    /// message back to the inbox unread all failed against it.
+    ///
+    /// Clearing therefore reads the current keywords back and writes the whole
+    /// set minus the one being dropped.  A keyword changed by someone else
+    /// between the read and the write is lost, which is the lesser evil against
+    /// the operation not working at all.
     async fn set_keyword(&self, message_id: MessageId, keyword: &str, value: bool) -> Result<()> {
         let jmap_id = self.lookup_message(message_id).await?;
+
+        if value {
+            let trace = debug_logging::request(
+                "Email/set",
+                format_args!("update id={jmap_id} keywords/{keyword}=true"),
+            );
+            trace
+                .response(
+                    self.client.email_set_keyword(&jmap_id, keyword, true).await,
+                    |_| "updated".to_owned(),
+                )
+                .with_context(|| format!("setting keyword {keyword}"))?;
+            return Ok(());
+        }
+
+        let remaining = self.keywords_without(&jmap_id, keyword).await?;
         let trace = debug_logging::request(
             "Email/set",
-            format_args!("update id={jmap_id} keywords/{keyword}={value}"),
+            format_args!("update id={jmap_id} keywords=[{}]", remaining.join(" ")),
         );
         trace
             .response(
                 self.client
-                    .email_set_keyword(&jmap_id, keyword, value)
+                    .email_set_keywords(&jmap_id, remaining.iter().map(String::as_str))
                     .await,
                 |_| "updated".to_owned(),
             )
-            .with_context(|| format!("updating keyword {keyword}"))?;
+            .with_context(|| format!("clearing keyword {keyword}"))?;
         Ok(())
+    }
+
+    /// The keywords the message currently carries, without `keyword`.
+    async fn keywords_without(&self, jmap_id: &str, keyword: &str) -> Result<Vec<String>> {
+        let trace = debug_logging::request(
+            "Email/get",
+            format_args!("id={jmap_id} properties=keywords"),
+        );
+        let email = trace
+            .response(
+                self.client
+                    .email_get(jmap_id, Some([EmailProperty::Keywords]))
+                    .await,
+                |email| match email {
+                    Some(email) => format!("keywords=[{}]", email.keywords().join(" ")),
+                    None => "not found".to_owned(),
+                },
+            )
+            .with_context(|| format!("reading keywords of {jmap_id}"))?
+            .ok_or_else(|| anyhow!("message {jmap_id} not found on server"))?;
+
+        Ok(email
+            .keywords()
+            .into_iter()
+            .filter(|existing| *existing != keyword)
+            .map(str::to_owned)
+            .collect())
     }
 
     async fn lookup_message(&self, message_id: MessageId) -> Result<String> {
@@ -1796,6 +1899,52 @@ fn flags_changed(before: &Message, after: &Message) -> bool {
         || before.labels != after.labels
 }
 
+/// Describe what the copy of a sent message should look like once delivery has
+/// been accepted: filed under Sent, read, and no longer a draft.
+///
+/// Both properties are written whole rather than patched.  A JMAP `PatchObject`
+/// removes a member by setting it to `null`, and jmap-client's patch map is an
+/// `AHashMap<String, bool>` that can only ever send `false` -- which RFC 8621
+/// forbids as a keyword value and FastMail rejects with `invalidProperties`.
+fn describe_sent_copy(update: &mut JmapEmail<JmapSet>, sent_id: Option<&str>) {
+    if let Some(sent_id) = sent_id {
+        update.mailbox_ids([sent_id]);
+    }
+    update.keywords(SENT_KEYWORDS);
+}
+
+/// Pick the `EmailSubmission/set` and the implicit `Email/set` out of what the
+/// server answered, by type rather than by position.
+///
+/// `onSuccessUpdateEmail` earns a second method response, which is what rules
+/// out jmap-client's `send_single`: it pops the *last* one, and a `SetResponse`
+/// for one type parses happily from another's JSON, so the implicit update
+/// arrives disguised as a submission that was never created.
+fn split_submission_responses(
+    responses: Vec<TaggedMethodResponse>,
+) -> Result<(Option<EmailSubmissionSetResponse>, Option<EmailSetResponse>)> {
+    let mut submission = None;
+    let mut update = None;
+
+    for response in responses {
+        if response.is_type(Method::SetEmailSubmission) {
+            submission = Some(
+                response
+                    .unwrap_set_email_submission()
+                    .context("reading the email submission response")?,
+            );
+        } else if response.is_type(Method::SetEmail) {
+            update = Some(
+                response
+                    .unwrap_set_email()
+                    .context("reading the response to the message update")?,
+            );
+        }
+    }
+
+    Ok((submission, update))
+}
+
 fn build_message_content(email: &JmapEmail) -> Result<MessageContent> {
     let mailer = email
         .header(&email::Header::as_text("X-Mailer", false))
@@ -2157,6 +2306,137 @@ mod tests {
         assert_eq!(
             labels_in(MailboxKind::Important, &data, &cache),
             vec!["Inbox".to_string(), "Starred".to_string()]
+        );
+    }
+    /// The shape FastMail rejected: jmap-client can only put `false` in a
+    /// patch, and RFC 8621 says a keyword is removed with `null` and never
+    /// carries any value but `true`.  Locked down here so the send path is never
+    /// "simplified" back onto `email_set_keyword(.., false)`.
+    #[test]
+    fn patching_a_keyword_off_produces_the_form_the_server_refuses() {
+        let mut email = <JmapEmail<JmapSet> as SetObject>::new(None);
+        email.keyword("$draft", false);
+
+        let json = serde_json::to_value(&email).expect("serialising the update");
+
+        assert_eq!(json["keywords/$draft"], serde_json::json!(false));
+    }
+
+    /// What the sent copy is described as instead: whole properties, every
+    /// value `true`, and not a patch pointer in sight.
+    #[test]
+    fn the_sent_copy_is_described_without_patching_anything() {
+        let mut email = <JmapEmail<JmapSet> as SetObject>::new(None);
+        describe_sent_copy(&mut email, Some("P6F"));
+
+        let json = serde_json::to_value(&email).expect("serialising the update");
+
+        assert_eq!(json["mailboxIds"], serde_json::json!({"P6F": true}));
+        assert_eq!(json["keywords"], serde_json::json!({"$seen": true}));
+        let patched: Vec<&String> = json
+            .as_object()
+            .expect("the update is an object")
+            .keys()
+            .filter(|key| key.contains('/'))
+            .collect();
+        assert!(
+            patched.is_empty(),
+            "left a patch pointer behind: {patched:?}"
+        );
+    }
+
+    /// Without a Sent mailbox there is nowhere to file the copy, but it still
+    /// has to stop being a draft.
+    #[test]
+    fn the_sent_copy_still_drops_the_draft_keyword_without_a_sent_mailbox() {
+        let mut email = <JmapEmail<JmapSet> as SetObject>::new(None);
+        describe_sent_copy(&mut email, None);
+
+        let json = serde_json::to_value(&email).expect("serialising the update");
+
+        assert!(json.get("mailboxIds").is_none());
+        assert_eq!(json["keywords"], serde_json::json!({"$seen": true}));
+    }
+
+    fn responses(body: serde_json::Value) -> Vec<TaggedMethodResponse> {
+        serde_json::from_value::<jmap_client::core::response::Response<TaggedMethodResponse>>(body)
+            .expect("parsing the server response")
+            .unwrap_method_responses()
+    }
+
+    /// `onSuccessUpdateEmail` earns a second method response, and the
+    /// submission is the *first* of the two.  Reading the last one -- which is
+    /// what jmap-client's `send_single` does -- found no creation and reported
+    /// a delivered message as a failed send.
+    #[test]
+    fn the_submission_is_found_behind_the_implicit_update() {
+        let parsed = responses(serde_json::json!({
+            "sessionState": "abc",
+            "methodResponses": [
+                ["EmailSubmission/set", {
+                    "accountId": "u1",
+                    "created": {"c0": {"id": "S1"}}
+                }, "s0"],
+                ["Email/set", {
+                    "accountId": "u1",
+                    "updated": {"StnBpNCKXfQ7": null}
+                }, "s0"]
+            ]
+        }));
+        assert_eq!(parsed.len(), 2);
+
+        let (submission, update) =
+            split_submission_responses(parsed).expect("both responses are readable");
+
+        submission
+            .expect("the submission response is there")
+            .created("c0")
+            .expect("the submission was created");
+        update.expect("the implicit update response is there");
+    }
+
+    /// A server that answers the submission alone is still understood; there is
+    /// simply no update to report on.
+    #[test]
+    fn a_lone_submission_response_is_read_on_its_own() {
+        let parsed = responses(serde_json::json!({
+            "sessionState": "abc",
+            "methodResponses": [
+                ["EmailSubmission/set", {
+                    "accountId": "u1",
+                    "created": {"c0": {"id": "S1"}}
+                }, "s0"]
+            ]
+        }));
+
+        let (submission, update) =
+            split_submission_responses(parsed).expect("the response is readable");
+
+        assert!(submission.is_some());
+        assert!(update.is_none());
+    }
+
+    /// A refused submission has to stay refused: this is the one case where
+    /// failing the send is the honest answer.
+    #[test]
+    fn a_refused_submission_is_reported_as_an_error() {
+        let parsed = responses(serde_json::json!({
+            "sessionState": "abc",
+            "methodResponses": [
+                ["EmailSubmission/set", {
+                    "accountId": "u1",
+                    "notCreated": {"c0": {"type": "forbiddenFrom"}}
+                }, "s0"]
+            ]
+        }));
+
+        let (submission, _) = split_submission_responses(parsed).expect("the response is readable");
+
+        assert!(
+            submission
+                .expect("the submission response is there")
+                .created("c0")
+                .is_err()
         );
     }
 }

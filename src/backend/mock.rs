@@ -26,6 +26,9 @@ use std::{
 use time::{Duration as TimeDuration, OffsetDateTime};
 
 const INITIAL_MESSAGE_COUNT: usize = 250;
+/// How long the worker sits on an action before applying it, mimicking the
+/// round trips a real backend incurs.  Tests build a backend without it.
+const ACTION_DELAY_MS: (u64, u64) = (50, 500);
 const MAILER_NAME: &str = "MockMailer/tdoc-demo";
 const DEFAULT_SENDER: &str = "user@mock.example";
 /// The one part that is a file without being an attachment.
@@ -104,8 +107,58 @@ impl MockBackend {
 
         backend.populate_initial_mailboxes(INITIAL_MESSAGE_COUNT);
         backend.spawn_incoming_mail_generator(mailboxes, contents, event_sender, id_counter);
-        backend.spawn_action_worker(work_queue);
+        backend.spawn_action_worker(work_queue, Some(ACTION_DELAY_MS));
         backend
+    }
+
+    #[cfg(test)]
+    /// A backend holding no mail and making no noise: no randomised inbox, no
+    /// generator thread injecting new messages, and no artificial delay before
+    /// an action is applied.
+    ///
+    /// Everything else is what demo mode runs -- the same work queue, the same
+    /// worker thread, the same action semantics -- so a test driving this is
+    /// driving the real thing, just deterministically and without the wait.
+    pub(crate) fn empty() -> Self {
+        let mailboxes = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut guard = mailboxes.lock().expect("mailboxes mutex poisoned");
+            for kind in MailboxKind::ALL {
+                guard.insert(kind, Vec::new());
+            }
+        }
+        let work_queue = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+
+        let backend = Self {
+            mailboxes,
+            contents: Arc::new(Mutex::new(HashMap::new())),
+            event_sender: Arc::new(Mutex::new(None)),
+            id_counter: Arc::new(AtomicU64::new(0)),
+            work_queue: Arc::clone(&work_queue),
+        };
+
+        backend.spawn_action_worker(work_queue, None);
+        backend
+    }
+
+    #[cfg(test)]
+    /// Put a message into a mailbox, for tests that need something to act on.
+    pub(crate) fn insert(&self, mailbox: MailboxKind, message: Message) {
+        let mut mailboxes = self.mailboxes.lock().expect("mailboxes mutex poisoned");
+        let list = mailboxes.entry(mailbox).or_default();
+        list.push(MockMessage { message });
+        list.sort_by_key(|mock| mock.message.sent);
+    }
+
+    #[cfg(test)]
+    /// The messages a mailbox holds, in the order the UI would list them.
+    pub(crate) fn messages_in(&self, mailbox: MailboxKind) -> Vec<Message> {
+        self.mailboxes
+            .lock()
+            .expect("mailboxes mutex poisoned")
+            .get(&mailbox)
+            .map(|list| list.iter().map(|mock| mock.message.clone()).collect())
+            .unwrap_or_default()
     }
 
     fn populate_initial_mailboxes(&self, inbox_count: usize) {
@@ -246,7 +299,11 @@ impl MockBackend {
         });
     }
 
-    fn spawn_action_worker(&self, work_queue: Arc<(Mutex<VecDeque<WorkItem>>, Condvar)>) {
+    fn spawn_action_worker(
+        &self,
+        work_queue: Arc<(Mutex<VecDeque<WorkItem>>, Condvar)>,
+        delay_ms: Option<(u64, u64)>,
+    ) {
         let mailboxes = Arc::clone(&self.mailboxes);
         let contents = Arc::clone(&self.contents);
 
@@ -262,8 +319,11 @@ impl MockBackend {
                     queue.pop_front().expect("queue was non-empty")
                 };
 
-                let delay_ms = delay_rng.gen_range_usize_inclusive(50, 500) as u64;
-                thread::sleep(Duration::from_millis(delay_ms));
+                if let Some((low, high)) = delay_ms {
+                    let delay =
+                        delay_rng.gen_range_usize_inclusive(low as usize, high as usize) as u64;
+                    thread::sleep(Duration::from_millis(delay));
+                }
 
                 let result = MockBackend::apply_action_now(&mailboxes, &contents, &item.action)
                     .map_err(|err| err.to_string());
@@ -1011,5 +1071,165 @@ mod tests {
         let clipped = mock_attachment_payload("report.pdf", "application/pdf", 12);
         assert_eq!(clipped.len(), 12);
         assert_eq!(&clipped, b"This is a pl");
+    }
+
+    /// Drive one action through the queue and the worker, the way the app
+    /// does, and wait for the worker to report back.
+    fn apply(backend: &MockBackend, action_type: ActionType, message_id: MessageId) {
+        let results = backend
+            .apply_actions(vec![Action::new(action_type, message_id)])
+            .expect("queueing the action");
+        let status = results
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the worker reports back");
+        status.result.expect("the action succeeds");
+    }
+
+    fn outgoing(subject: &str) -> OutgoingMessage {
+        OutgoingMessage {
+            to: vec!["someone@example.com".to_string()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: subject.to_string(),
+            text_body: "Body.".to_string(),
+            html_body: "<p>Body.</p>".to_string(),
+            attachments: Vec::new(),
+        }
+    }
+
+    fn message(id: MessageId) -> Message {
+        Message {
+            id,
+            sent: OffsetDateTime::now_utc(),
+            sender: "someone@example.com".to_string(),
+            recipients: vec![DEFAULT_SENDER.to_string()],
+            subject: "A message".to_string(),
+            size: 128,
+            starred: false,
+            important: false,
+            answered: false,
+            forwarded: false,
+            status: MessageStatus::Read,
+            labels: Vec::new(),
+            uid: id as u32,
+            seq: 0,
+            has_attachments: false,
+        }
+    }
+
+    fn has_label(message: &Message, label: &str) -> bool {
+        message
+            .labels
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(label))
+    }
+
+    /// The end state the JMAP backend spells out as `mailboxIds=[Sent]` and
+    /// `keywords=[$seen]`: filed under Sent, already read, and no longer
+    /// carrying the draft label it was composed under.
+    #[test]
+    fn sending_files_the_copy_under_sent_as_read_and_not_a_draft() {
+        let backend = MockBackend::empty();
+
+        backend
+            .send_message(outgoing("Two attachments"))
+            .expect("sending succeeds");
+
+        let sent = backend.messages_in(MailboxKind::Sent);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].subject, "Two attachments");
+        assert_eq!(sent[0].status, MessageStatus::Read);
+        assert!(has_label(&sent[0], "Sent"));
+        assert!(
+            !has_label(&sent[0], "Draft"),
+            "a sent message must not still look like a draft: {:?}",
+            sent[0].labels
+        );
+        assert!(backend.messages_in(MailboxKind::Drafts).is_empty());
+    }
+
+    #[test]
+    fn saving_a_draft_files_it_under_drafts_and_leaves_sent_alone() {
+        let backend = MockBackend::empty();
+
+        backend
+            .save_draft(outgoing("Still writing"))
+            .expect("saving succeeds");
+
+        let drafts = backend.messages_in(MailboxKind::Drafts);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].status, MessageStatus::New);
+        assert!(has_label(&drafts[0], "Draft"));
+        assert!(backend.messages_in(MailboxKind::Sent).is_empty());
+    }
+
+    /// Un-starring is the action that stayed broken against FastMail for as
+    /// long as the JMAP backend patched `keywords/$flagged` to `false`.
+    #[test]
+    fn unstarring_clears_the_star_and_drops_its_label() {
+        let backend = MockBackend::empty();
+        let mut starred = message(1);
+        starred.starred = true;
+        starred.labels = vec!["Starred".to_string()];
+        backend.insert(MailboxKind::Starred, starred);
+
+        apply(&backend, ActionType::MarkAsUnstarred, 1);
+
+        let messages = backend.messages_in(MailboxKind::Starred);
+        assert_eq!(messages.len(), 1);
+        assert!(!messages[0].starred);
+        assert!(
+            !has_label(&messages[0], "Starred"),
+            "the label outlived the star: {:?}",
+            messages[0].labels
+        );
+    }
+
+    #[test]
+    fn unmarking_important_clears_the_flag_and_drops_its_label() {
+        let backend = MockBackend::empty();
+        let mut important = message(2);
+        important.important = true;
+        important.labels = vec!["Important".to_string()];
+        backend.insert(MailboxKind::Important, important);
+
+        apply(&backend, ActionType::MarkAsUnimportant, 2);
+
+        let messages = backend.messages_in(MailboxKind::Important);
+        assert_eq!(messages.len(), 1);
+        assert!(!messages[0].important);
+        assert!(!has_label(&messages[0], "Important"));
+    }
+
+    /// The third caller of the keyword-clearing path: back to the inbox, and
+    /// unread again.
+    #[test]
+    fn moving_back_to_the_inbox_unread_restores_the_new_status() {
+        let backend = MockBackend::empty();
+        let mut archived = message(3);
+        archived.labels = vec!["Archive".to_string()];
+        backend.insert(MailboxKind::Archive, archived);
+
+        apply(&backend, ActionType::MoveToInboxUnread, 3);
+
+        assert!(backend.messages_in(MailboxKind::Archive).is_empty());
+        let inbox = backend.messages_in(MailboxKind::Inbox);
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].status, MessageStatus::New);
+        assert!(!has_label(&inbox[0], "Archive"));
+    }
+
+    #[test]
+    fn marking_as_read_leaves_the_message_where_it_is() {
+        let backend = MockBackend::empty();
+        let mut unread = message(4);
+        unread.status = MessageStatus::New;
+        backend.insert(MailboxKind::Inbox, unread);
+
+        apply(&backend, ActionType::MarkAsRead, 4);
+
+        let inbox = backend.messages_in(MailboxKind::Inbox);
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].status, MessageStatus::Read);
     }
 }
