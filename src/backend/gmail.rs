@@ -7,7 +7,7 @@
 use crate::{
     backend::{
         ActionStatus, BackendEvent, LeafPart, MailBackend, MailboxSnapshot, OutgoingMessage,
-        PartRole, build_compose_body,
+        PartRole, build_compose_body, mailer_header,
     },
     model::{
         Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
@@ -1589,7 +1589,9 @@ impl GmailInner {
             .parse()
             .with_context(|| format!("invalid Gmail address: {}", self.email))?;
 
-        let mut builder = LettreEmail::builder().from(from_mailbox);
+        let mut builder = LettreEmail::builder()
+            .from(from_mailbox)
+            .raw_header(mailer_header());
 
         for addr in to {
             let mailbox: LettreMailbox = addr

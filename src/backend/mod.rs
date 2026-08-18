@@ -9,7 +9,9 @@
 use crate::model::{Action, MailboxKind, Message, MessageContent, MessageId};
 use anyhow::Result;
 use lettre::message::{
-    Attachment as LettreAttachment, MultiPart, SinglePart, header::ContentType as LettreContentType,
+    Attachment as LettreAttachment, MultiPart, SinglePart,
+    header::ContentType as LettreContentType, header::HeaderName as LettreHeaderName,
+    header::HeaderValue as LettreHeaderValue,
 };
 use std::sync::mpsc::Receiver;
 
@@ -75,6 +77,24 @@ impl OutgoingAttachment {
     pub fn size(&self) -> usize {
         self.data.len()
     }
+}
+
+/// What outgoing messages name as their mailer.
+const MAILER: &str = concat!("Elma ", env!("CARGO_PKG_VERSION"));
+
+/// The `X-Mailer` every backend stamps on what it sends.
+///
+/// Leaving the header off does not mean the message goes out without one: a
+/// JMAP server is free to fill the gap with its own name, and FastMail files
+/// everything submitted through its API as `MessagingEngine.com Webmail
+/// Interface` -- so a message written in Elma arrived claiming to come from a
+/// webmail nobody had opened.  Naming ourselves keeps the two send paths
+/// saying the same thing, since SMTP added no header at all.
+pub(crate) fn mailer_header() -> LettreHeaderValue {
+    LettreHeaderValue::new(
+        LettreHeaderName::new_from_ascii_str("X-Mailer"),
+        MAILER.to_string(),
+    )
 }
 
 /// Assemble the MIME body of an outgoing message.
@@ -279,7 +299,27 @@ pub trait MailBackend: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{LeafPart, PartRole};
+    use super::{LeafPart, PartRole, mailer_header};
+
+    /// A message that names no mailer is one the server is free to name: it is
+    /// FastMail's stamp, not ours, that reached recipients before this header
+    /// existed.
+    #[test]
+    fn an_outgoing_message_names_elma_as_its_mailer() {
+        let message = lettre::Message::builder()
+            .from("her@example.com".parse().expect("the sender parses"))
+            .to("him@example.com".parse().expect("the recipient parses"))
+            .subject("Lunch?")
+            .raw_header(mailer_header())
+            .body(String::from("Half twelve?"))
+            .expect("the message builds");
+
+        let formatted = String::from_utf8(message.formatted()).expect("the message is text");
+        assert!(
+            formatted.contains(&format!("X-Mailer: Elma {}\r\n", env!("CARGO_PKG_VERSION"))),
+            "{formatted}"
+        );
+    }
 
     fn part(major_type: &str, has_filename: bool) -> LeafPart<'_> {
         LeafPart {
