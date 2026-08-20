@@ -6,8 +6,8 @@
 
 use crate::{
     backend::{
-        ActionStatus, BackendEvent, LeafPart, MailBackend, MailboxSnapshot, OutgoingMessage,
-        PartRole, build_compose_body, mailer_header,
+        ActionStatus, BackendEvent, FAILURES_BEFORE_REPORT, LeafPart, MailBackend, MailboxSnapshot,
+        OutgoingMessage, PartRole, build_compose_body, mailer_header, retry_backoff,
     },
     model::{
         Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
@@ -704,6 +704,14 @@ struct GmailInner {
     /// action, say -- has to leave it alone until the run is done.  Without
     /// this the next batch would find the session taken by a fresh IDLE task.
     backfill_active: AtomicBool,
+    /// Set once the UI has been told the connection is in trouble, cleared
+    /// once it has been told otherwise.
+    ///
+    /// Shared rather than kept on the IDLE task's stack, because that task does
+    /// not outlive the trouble: every action stops it and starts another, and a
+    /// replacement holding its own idea of what had been reported would connect
+    /// happily and leave the warning standing on screen for good.
+    sync_trouble_reported: AtomicBool,
     /// Serialises action processing so that only one [`process_action`] call
     /// runs at a time.  Without this, concurrent batches (e.g. an immediate
     /// flag-change batch and a regular move batch) can race: one task's
@@ -782,6 +790,7 @@ impl GmailBackend {
                 backfill_handle: AsyncMutex::new(None),
                 backfill_cancel: AsyncMutex::new(None),
                 backfill_active: AtomicBool::new(false),
+                sync_trouble_reported: AtomicBool::new(false),
                 action_lock: AsyncMutex::new(()),
             }),
         })
@@ -1032,7 +1041,10 @@ impl GmailInner {
     /// volunteer EXISTS during a FETCH.  See [`Self::poll_for_new_mail`].
     async fn backfill_loop(self: Arc<Self>, cancel: Arc<AtomicBool>) {
         if let Err(err) = self.pause_idle().await {
-            eprintln!("Gmail backfill could not pause IDLE: {err:?}");
+            log_backend_event(
+                "BACKEND",
+                &format!("backfill could not pause IDLE: {err:?}"),
+            );
         }
 
         self.run_backfill_batches(&cancel).await;
@@ -1040,7 +1052,7 @@ impl GmailInner {
         // Before restarting IDLE, or `start_idle_loop` will decline.
         self.backfill_active.store(false, Ordering::SeqCst);
         if let Err(err) = self.start_idle_loop().await {
-            eprintln!("Gmail idle restart error: {err:?}");
+            log_backend_event("BACKEND", &format!("idle could not be restarted: {err:?}"));
         }
     }
 
@@ -1087,7 +1099,7 @@ impl GmailInner {
                 last_poll = tokio_time::Instant::now();
                 if let Err(err) = self.poll_for_new_mail().await {
                     // Left for the next batch to trip over and reconnect on.
-                    eprintln!("Gmail backfill new-mail poll error: {err:?}");
+                    log_backend_event("BACKEND", &format!("new-mail poll failed: {err:?}"));
                 }
             }
 
@@ -1108,7 +1120,7 @@ impl GmailInner {
                 Err(err) => err,
             };
 
-            eprintln!("Gmail backfill error: {err:?}");
+            log_backend_event("BACKEND", &format!("backfill batch failed: {err:?}"));
 
             // Gmail hangs up on long backfills often enough that giving up on
             // the first one would leave most of the mailbox unread.  Dial
@@ -1119,11 +1131,12 @@ impl GmailInner {
             }
 
             failed_reconnects += 1;
-            eprintln!(
-                "Gmail backfill: reconnecting ({failed_reconnects}/{MAX_BACKFILL_RECONNECTS})"
+            log_backend_event(
+                "BACKEND",
+                &format!("backfill reconnecting ({failed_reconnects}/{MAX_BACKFILL_RECONNECTS})"),
             );
             if let Err(err) = self.ensure_connected().await {
-                eprintln!("Gmail backfill reconnect error: {err:?}");
+                log_backend_event("BACKEND", &format!("backfill could not reconnect: {err:?}"));
                 return;
             }
         }
@@ -1149,7 +1162,10 @@ impl GmailInner {
         // last line of defence for every path that still loses an EXISTS to
         // async-imap's unsolicited-response channel.
         if let Err(err) = self.drain_exists(session, None).await {
-            eprintln!("Gmail backfill EXISTS handling error: {err:?}");
+            log_backend_event(
+                "BACKEND",
+                &format!("backfill EXISTS handling failed: {err:?}"),
+            );
         }
 
         let (stored_messages, fetch_exists) = match self
@@ -1188,7 +1204,7 @@ impl GmailInner {
             match self.fetch_gmail_labels_command(session, &command).await {
                 Ok(exists) => label_exists = exists,
                 Err(err) => {
-                    eprintln!("Gmail backfill label fetch error: {err:?}");
+                    log_backend_event("BACKEND", &format!("backfill label fetch failed: {err:?}"));
                     // Labels are optional; a dead connection is not.  Carrying
                     // on here is what sent an IDLE into a closed socket.
                     if is_connection_lost(&err) {
@@ -1205,7 +1221,10 @@ impl GmailInner {
             .drain_exists(session, max_exists(fetch_exists, label_exists))
             .await
         {
-            eprintln!("Gmail backfill EXISTS handling error: {err:?}");
+            log_backend_event(
+                "BACKEND",
+                &format!("backfill EXISTS handling failed: {err:?}"),
+            );
             if is_connection_lost(&err) {
                 drop(session_guard);
                 self.discard_session().await;
@@ -1711,11 +1730,25 @@ impl GmailInner {
     }
 
     /// Long-lived task that keeps Gmail notifications flowing via the IDLE extension.
+    ///
+    /// Everything that can go wrong here is a connection that will not stay up,
+    /// which is ordinary: Gmail hangs up on long sessions, and the machine the
+    /// client runs on sleeps.  So a failure costs a backoff and nothing else,
+    /// and the user hears about it only once a run of them has gone by --
+    /// through the status line, never through stderr, which in a terminal the
+    /// renderer owns would land on top of the frame and stay there.  See
+    /// [`Self::idle_setback`].
     async fn idle_task(self: Arc<Self>, mut stop_rx: oneshot::Receiver<()>) {
+        let mut failures: u32 = 0;
+
         loop {
             if let Err(err) = self.ensure_connected().await {
-                eprintln!("Gmail idle reconnect error: {err:?}");
-                tokio_time::sleep(Duration::from_secs(5)).await;
+                if !self
+                    .idle_setback("idle reconnect", &err, &mut failures, &mut stop_rx)
+                    .await
+                {
+                    return;
+                }
                 continue;
             }
 
@@ -1731,9 +1764,31 @@ impl GmailInner {
 
             let mut idle_handle = session.idle();
             if let Err(err) = idle_handle.init().await {
-                eprintln!("Gmail idle init error: {err:?}");
-                tokio_time::sleep(Duration::from_secs(5)).await;
+                if !self
+                    .idle_setback(
+                        "idle init",
+                        &anyhow::Error::new(err),
+                        &mut failures,
+                        &mut stop_rx,
+                    )
+                    .await
+                {
+                    return;
+                }
                 continue;
+            }
+
+            // Listening again, which is as close to "the connection is fine" as
+            // this loop gets to know.
+            if failures > 0 {
+                log_backend_event(
+                    "BACKEND",
+                    &format!("idle recovered after {failures} failed attempt(s)"),
+                );
+                failures = 0;
+            }
+            if self.sync_trouble_reported.swap(false, Ordering::SeqCst) {
+                self.emit_event(BackendEvent::SyncRecovered);
             }
 
             let (wait_fut, stopper) = idle_handle.wait_with_timeout(Duration::from_secs(300));
@@ -1776,7 +1831,10 @@ impl GmailInner {
                         // `run_command_and_check_ok`, which parks untagged
                         // responses out of reach.  Pick them up.
                         if let Err(err) = self.drain_exists(&mut sess, None).await {
-                            eprintln!("Gmail idle EXISTS handling error: {err:?}");
+                            log_backend_event(
+                                "BACKEND",
+                                &format!("idle EXISTS handling failed: {err:?}"),
+                            );
                         }
                         self.reinsert_session(sess).await;
                     }
@@ -1790,7 +1848,7 @@ impl GmailInner {
                         .process_idle_response(resp.parsed(), &mut exists, &mut label_refresh)
                         .await
                     {
-                        eprintln!("Gmail idle processing error: {err:?}");
+                        log_backend_event("BACKEND", &format!("idle processing failed: {err:?}"));
                     }
 
                     self.collect_pending_idle(&mut idle_handle, &mut exists, &mut label_refresh)
@@ -1807,18 +1865,65 @@ impl GmailInner {
                             self.reinsert_session(sess).await;
                         }
                         Err(err) => {
-                            eprintln!("Gmail idle completion error: {err:?}");
+                            log_backend_event(
+                                "BACKEND",
+                                &format!("idle could not be completed: {err:?}"),
+                            );
                         }
                     }
                 }
                 Err(err) => {
-                    eprintln!("Gmail idle wait error: {err:?}");
                     if let Ok(sess) = idle_handle.done().await {
                         self.reinsert_session(sess).await;
                     }
-                    tokio_time::sleep(Duration::from_secs(5)).await;
+                    if !self
+                        .idle_setback(
+                            "idle wait",
+                            &anyhow::Error::new(err),
+                            &mut failures,
+                            &mut stop_rx,
+                        )
+                        .await
+                    {
+                        return;
+                    }
                 }
             }
+        }
+    }
+
+    /// Note that the IDLE session could not be kept up, and wait before trying
+    /// again.  Answers whether the loop should carry on.
+    ///
+    /// The wait is abandoned the moment the loop is asked to stop.  Every
+    /// action pauses IDLE and blocks until this task has noticed, so a wait
+    /// that ran to its end regardless would hold up the client for as long as
+    /// the backoff had grown to.
+    async fn idle_setback(
+        &self,
+        what: &str,
+        err: &anyhow::Error,
+        failures: &mut u32,
+        stop_rx: &mut oneshot::Receiver<()>,
+    ) -> bool {
+        *failures += 1;
+        log_backend_event(
+            "BACKEND",
+            &format!("{what} failed ({failures} in a row): {err:?}"),
+        );
+
+        if *failures >= FAILURES_BEFORE_REPORT
+            && !self.sync_trouble_reported.swap(true, Ordering::SeqCst)
+        {
+            self.emit_event(BackendEvent::SyncTrouble(format!(
+                "Not syncing: {}. Retrying...",
+                err.root_cause()
+            )));
+        }
+
+        tokio::select! {
+            _ = &mut *stop_rx => false,
+            _ = tokio_time::sleep(retry_backoff(*failures)) => true,
         }
     }
 
@@ -1841,12 +1946,12 @@ impl GmailInner {
                         .process_idle_response(resp.parsed(), exists, label_refresh)
                         .await
                     {
-                        eprintln!("Gmail idle processing error: {err:?}");
+                        log_backend_event("BACKEND", &format!("idle processing failed: {err:?}"));
                     }
                 }
                 Ok(IdleResponse::Timeout) | Ok(IdleResponse::ManualInterrupt) => break,
                 Err(err) => {
-                    eprintln!("Gmail idle additional wait error: {err:?}");
+                    log_backend_event("BACKEND", &format!("idle follow-up wait failed: {err:?}"));
                     break;
                 }
             }
@@ -1863,7 +1968,7 @@ impl GmailInner {
     ) {
         for count in exists {
             if let Err(err) = self.drain_exists(session, Some(count)).await {
-                eprintln!("Gmail idle EXISTS handling error: {err:?}");
+                log_backend_event("BACKEND", &format!("idle EXISTS handling failed: {err:?}"));
             }
         }
 
@@ -1882,10 +1987,12 @@ impl GmailInner {
         match self.fetch_gmail_labels_command(session, &command).await {
             Ok(label_exists) => {
                 if let Err(err) = self.drain_exists(session, label_exists).await {
-                    eprintln!("Gmail idle EXISTS handling error: {err:?}");
+                    log_backend_event("BACKEND", &format!("idle EXISTS handling failed: {err:?}"));
                 }
             }
-            Err(err) => eprintln!("Gmail label refresh error: {err:?}"),
+            Err(err) => {
+                log_backend_event("BACKEND", &format!("label refresh failed: {err:?}"));
+            }
         }
     }
 

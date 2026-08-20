@@ -566,6 +566,10 @@ struct MailboxState {
     event_count: usize,
     status_line: Option<String>,
     scroll_top: usize,
+    /// Whether the backend has told us it cannot reach the server.  Kept so
+    /// the recovery that follows only overwrites a status line this put there,
+    /// and not whatever the user has done since.
+    sync_trouble: bool,
 }
 
 /// Snapshot of the currently opened message.
@@ -1531,6 +1535,7 @@ impl App {
                         messages: Vec::new(),
                         selected: None,
                         events: placeholder_rx,
+                        sync_trouble: false,
                         event_count: 0,
                         status_line: None,
                         scroll_top: 0,
@@ -2108,6 +2113,18 @@ impl App {
                         let mailbox = self.mailbox_mut();
                         mailbox.event_count += 1;
                         refresh = true;
+                    }
+                }
+                Ok(BackendEvent::SyncTrouble(message)) => {
+                    let mailbox = self.mailbox_mut();
+                    mailbox.sync_trouble = true;
+                    mailbox.status_line = Some(message);
+                }
+                Ok(BackendEvent::SyncRecovered) => {
+                    let mailbox = self.mailbox_mut();
+                    if mailbox.sync_trouble {
+                        mailbox.sync_trouble = false;
+                        mailbox.status_line = Some("Syncing again.".to_string());
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -5891,6 +5908,7 @@ mod tests {
                 event_count: 0,
                 status_line: None,
                 scroll_top: 0,
+                sync_trouble: false,
             },
             message_view: None,
             commit_batches: VecDeque::new(),
@@ -5922,6 +5940,52 @@ mod tests {
 
     fn test_app(messages: Vec<Message>) -> App {
         test_app_with_backend(messages, Arc::new(NoopBackend))
+    }
+
+    /// Hand `app` an event channel of our own, so a test can play the part of
+    /// a backend.
+    fn subscribe(app: &mut App) -> mpsc::Sender<BackendEvent> {
+        let (tx, rx) = mpsc::channel();
+        app.mailbox.events = rx;
+        tx
+    }
+
+    #[test]
+    fn sync_trouble_reaches_the_status_line() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        let events = subscribe(&mut app);
+
+        events
+            .send(BackendEvent::SyncTrouble(
+                "Not syncing: operation timed out. Retrying...".to_string(),
+            ))
+            .unwrap();
+        app.poll_backend_events();
+        assert_eq!(
+            app.mailbox.status_line.as_deref(),
+            Some("Not syncing: operation timed out. Retrying...")
+        );
+
+        events.send(BackendEvent::SyncRecovered).unwrap();
+        app.poll_backend_events();
+        assert_eq!(app.mailbox.status_line.as_deref(), Some("Syncing again."));
+    }
+
+    /// A backend that recovers from trouble it never reported has nothing to
+    /// take back, and must not talk over whatever the user is being told.
+    #[test]
+    fn recovery_without_trouble_leaves_the_status_line_alone() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        let events = subscribe(&mut app);
+        app.mailbox.status_line = Some("Deleted 1 message.".to_string());
+
+        events.send(BackendEvent::SyncRecovered).unwrap();
+        app.poll_backend_events();
+
+        assert_eq!(
+            app.mailbox.status_line.as_deref(),
+            Some("Deleted 1 message.")
+        );
     }
 
     // -- schedule_action basics -----------------------------------------------
