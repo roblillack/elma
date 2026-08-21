@@ -1890,11 +1890,21 @@ impl FetchedEmail {
         let received_at = email.received_at();
         let sent_at = email.sent_at();
         let size = email.size();
-        let mailbox_ids = email
+        // `jmap-client` keeps `mailboxIds` in an `AHashMap`, and hands them
+        // over in that map's iteration order -- which is seeded afresh for
+        // every response, so the same email comes back with its mailboxes in a
+        // different order on every poll.  The order reaches the labels built
+        // from these ids, and `flags_changed` compares those as a sequence, so
+        // leaving it alone reports a flag change on every poll for any message
+        // filed in more than one other mailbox -- and reshuffles the labels
+        // under the reader while it is at it.  Sorting here is what makes both
+        // stable.
+        let mut mailbox_ids: Vec<String> = email
             .mailbox_ids()
             .into_iter()
             .map(|id| id.to_string())
             .collect();
+        mailbox_ids.sort();
         let keywords = email
             .keywords()
             .into_iter()
@@ -2469,6 +2479,74 @@ mod tests {
             labels_in(MailboxKind::Archive, &data, &cache),
             vec!["Inbox".to_string(), "Newsletters".to_string()]
         );
+    }
+
+    /// A canned `Email/get` payload, the way a poll receives one.  Parsed
+    /// afresh on every call, so each returns an independently-seeded
+    /// `AHashMap` for `mailboxIds` -- which is the whole point.
+    fn parse_email(mailbox_ids: &[&str]) -> FetchedEmail {
+        let ids: serde_json::Map<String, serde_json::Value> = mailbox_ids
+            .iter()
+            .map(|id| ((*id).to_string(), serde_json::json!(true)))
+            .collect();
+        let email: JmapEmail = serde_json::from_value(serde_json::json!({
+            "id": "M1",
+            "mailboxIds": ids,
+            "keywords": {"$seen": true},
+            "subject": "Hello",
+            "size": 42,
+            "receivedAt": "2026-08-20T06:00:00Z",
+            "hasAttachment": false,
+        }))
+        .expect("parsing the canned email");
+
+        FetchedEmail::from_email(email).expect("an email with an id builds")
+    }
+
+    /// `jmap-client` holds `mailboxIds` in an `AHashMap` and hands them over in
+    /// its iteration order, which is seeded per map -- so the same email arrives
+    /// with its mailboxes shuffled from one poll to the next.  Sorting them on
+    /// the way in is what stops that reaching the labels.
+    #[test]
+    fn mailbox_ids_arrive_in_a_stable_order() {
+        let wire = ["mb-news", "mb-inbox", "mb-work", "mb-archive"];
+        let sorted = vec![
+            "mb-archive".to_string(),
+            "mb-inbox".to_string(),
+            "mb-news".to_string(),
+            "mb-work".to_string(),
+        ];
+
+        // Four ids permute 24 ways, so an unsorted read is overwhelmingly
+        // unlikely to survive this many independently-seeded maps.
+        for poll in 0..64 {
+            assert_eq!(parse_email(&wire).mailbox_ids, sorted, "poll {poll}");
+        }
+    }
+
+    /// The leak this was found through: a message filed in more than one other
+    /// mailbox reported a flag change on every background poll, because
+    /// `flags_changed` compares labels as a sequence and the sequence came out
+    /// of a differently-seeded hash map each time.  Nothing about the message
+    /// changed, so nothing may be reported.
+    #[test]
+    fn an_unchanged_email_reports_no_flag_change_between_polls() {
+        let cache = standard_cache();
+        let wire = ["mb-inbox", "mb-news", "mb-archive", "mb-sent"];
+
+        let first = build_message(1, 1, 1, &parse_email(&wire), &cache, MailboxKind::Inbox)
+            .expect("message builds");
+
+        for poll in 0..64 {
+            let again = build_message(1, 1, 1, &parse_email(&wire), &cache, MailboxKind::Inbox)
+                .expect("message builds");
+            assert!(
+                !flags_changed(&first, &again),
+                "poll {poll} reported a change: {:?} -> {:?}",
+                first.labels,
+                again.labels
+            );
+        }
     }
 
     #[test]
