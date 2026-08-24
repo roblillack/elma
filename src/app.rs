@@ -566,6 +566,10 @@ struct MailboxState {
     event_count: usize,
     status_line: Option<String>,
     scroll_top: usize,
+    /// Whether the backend has told us it cannot reach the server.  Kept so
+    /// the recovery that follows only overwrites a status line this put there,
+    /// and not whatever the user has done since.
+    sync_trouble: bool,
 }
 
 /// Snapshot of the currently opened message.
@@ -1531,6 +1535,7 @@ impl App {
                         messages: Vec::new(),
                         selected: None,
                         events: placeholder_rx,
+                        sync_trouble: false,
                         event_count: 0,
                         status_line: None,
                         scroll_top: 0,
@@ -2052,6 +2057,25 @@ impl App {
         self.poll_save_attachment_operation();
         self.poll_outgoing_operation();
 
+        // Every account, not just the visible one -- for the same reason
+        // `poll_mailbox_loader` does it: a background account has to stay
+        // current so that switching to it lands on a ready mailbox.  The
+        // channel is the other half of that.  Its backend goes on watching the
+        // server whether or not anyone is looking, and an account nobody drains
+        // is an `mpsc` queue with nothing at the far end of it: every event it
+        // ever produced is still in there, and the process grows by the size of
+        // the mail it was told about until it is restarted.
+        for index in 0..self.accounts.len() {
+            self.with_account(index, |app| app.drain_backend_events());
+        }
+    }
+
+    /// Merge the events waiting for the account currently selected.
+    ///
+    /// Written against the active account throughout -- `mailbox_mut`,
+    /// `message_view`, the search filter -- so `with_account` is what aims it
+    /// at a background one.
+    fn drain_backend_events(&mut self) {
         let mut refresh = false;
         let current_id = self
             .current_account()
@@ -2108,6 +2132,18 @@ impl App {
                         let mailbox = self.mailbox_mut();
                         mailbox.event_count += 1;
                         refresh = true;
+                    }
+                }
+                Ok(BackendEvent::SyncTrouble(message)) => {
+                    let mailbox = self.mailbox_mut();
+                    mailbox.sync_trouble = true;
+                    mailbox.status_line = Some(message);
+                }
+                Ok(BackendEvent::SyncRecovered) => {
+                    let mailbox = self.mailbox_mut();
+                    if mailbox.sync_trouble {
+                        mailbox.sync_trouble = false;
+                        mailbox.status_line = Some("Syncing again.".to_string());
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -5891,6 +5927,7 @@ mod tests {
                 event_count: 0,
                 status_line: None,
                 scroll_top: 0,
+                sync_trouble: false,
             },
             message_view: None,
             commit_batches: VecDeque::new(),
@@ -5922,6 +5959,137 @@ mod tests {
 
     fn test_app(messages: Vec<Message>) -> App {
         test_app_with_backend(messages, Arc::new(NoopBackend))
+    }
+
+    /// Hand `app` an event channel of our own, so a test can play the part of
+    /// a backend.
+    fn subscribe(app: &mut App) -> mpsc::Sender<BackendEvent> {
+        subscribe_to(app, app.active_account)
+    }
+
+    /// [`subscribe`], but for whichever account the test names rather than the
+    /// one on screen.
+    fn subscribe_to(app: &mut App, index: usize) -> mpsc::Sender<BackendEvent> {
+        let (tx, rx) = mpsc::channel();
+        app.accounts[index].mailbox.events = rx;
+        tx
+    }
+
+    /// A two-account app, both mailboxes loaded, showing the first.
+    fn test_app_with_two_accounts(first: Vec<Message>, second: Vec<Message>) -> App {
+        let mut app = test_app(first);
+        let other = test_app(second);
+        app.accounts.extend(other.accounts);
+        app.accounts[1].name = "second".to_string();
+        app
+    }
+
+    /// The channel half of a background account: its backend goes on watching
+    /// the server while the user is looking at another account, and if nobody
+    /// receives from it the queue is unbounded -- which is how a long-running
+    /// client ends up holding every event it was ever sent.  So the events have
+    /// to be merged into the account they belong to, seen or not.
+    #[test]
+    fn a_background_accounts_events_are_drained_into_it() {
+        let mut app = test_app_with_two_accounts(
+            vec![make_message(1, MessageStatus::Read)],
+            vec![make_message(1, MessageStatus::Read)],
+        );
+        let background = subscribe_to(&mut app, 1);
+        assert_eq!(
+            app.active_account, 0,
+            "the first account is the visible one"
+        );
+
+        background
+            .send(BackendEvent::NewMessage(make_message(
+                2,
+                MessageStatus::New,
+            )))
+            .expect("the app still holds the receiver");
+        app.poll_backend_events();
+
+        // Merged into the account it was addressed to ...
+        assert_eq!(app.accounts[1].mailbox.messages.len(), 2);
+        assert_eq!(app.accounts[1].mailbox.messages[1].id, 2);
+        // ... and not into the one on screen.
+        assert_eq!(app.accounts[0].mailbox.messages.len(), 1);
+        // Nothing left behind in the queue to accumulate.
+        assert!(matches!(
+            app.accounts[1].mailbox.events.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+    }
+
+    /// Draining a background account must not move the selection or the status
+    /// line of the one being looked at.
+    #[test]
+    fn draining_a_background_account_leaves_the_visible_one_alone() {
+        let mut app = test_app_with_two_accounts(
+            vec![
+                make_message(1, MessageStatus::Read),
+                make_message(2, MessageStatus::Read),
+            ],
+            vec![make_message(1, MessageStatus::Read)],
+        );
+        let background = subscribe_to(&mut app, 1);
+        app.accounts[0].mailbox.selected = Some(1);
+        app.accounts[0].mailbox.status_line = Some("Deleted 1 message.".to_string());
+
+        background
+            .send(BackendEvent::SyncTrouble("Not syncing.".to_string()))
+            .expect("the app still holds the receiver");
+        app.poll_backend_events();
+
+        assert_eq!(app.accounts[0].mailbox.selected, Some(1));
+        assert_eq!(
+            app.accounts[0].mailbox.status_line.as_deref(),
+            Some("Deleted 1 message.")
+        );
+        // The trouble is recorded against the account that reported it.
+        assert_eq!(
+            app.accounts[1].mailbox.status_line.as_deref(),
+            Some("Not syncing.")
+        );
+        assert!(app.accounts[1].mailbox.sync_trouble);
+    }
+
+    #[test]
+    fn sync_trouble_reaches_the_status_line() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        let events = subscribe(&mut app);
+
+        events
+            .send(BackendEvent::SyncTrouble(
+                "Not syncing: operation timed out. Retrying...".to_string(),
+            ))
+            .unwrap();
+        app.poll_backend_events();
+        assert_eq!(
+            app.mailbox.status_line.as_deref(),
+            Some("Not syncing: operation timed out. Retrying...")
+        );
+
+        events.send(BackendEvent::SyncRecovered).unwrap();
+        app.poll_backend_events();
+        assert_eq!(app.mailbox.status_line.as_deref(), Some("Syncing again."));
+    }
+
+    /// A backend that recovers from trouble it never reported has nothing to
+    /// take back, and must not talk over whatever the user is being told.
+    #[test]
+    fn recovery_without_trouble_leaves_the_status_line_alone() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        let events = subscribe(&mut app);
+        app.mailbox.status_line = Some("Deleted 1 message.".to_string());
+
+        events.send(BackendEvent::SyncRecovered).unwrap();
+        app.poll_backend_events();
+
+        assert_eq!(
+            app.mailbox.status_line.as_deref(),
+            Some("Deleted 1 message.")
+        );
     }
 
     // -- schedule_action basics -----------------------------------------------

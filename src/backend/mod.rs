@@ -13,7 +13,7 @@ use lettre::message::{
     header::ContentType as LettreContentType, header::HeaderName as LettreHeaderName,
     header::HeaderValue as LettreHeaderValue,
 };
-use std::sync::mpsc::Receiver;
+use std::{sync::mpsc::Receiver, time::Duration};
 
 #[cfg(debug_assertions)]
 mod debug_log;
@@ -30,6 +30,47 @@ pub enum BackendEvent {
     NewMessage(Message),
     MessageFlagsChanged(Message),
     MessageDeleted(MessageId),
+    /// Background synchronisation has been failing long enough to be worth
+    /// saying so, with a line for the status bar.
+    ///
+    /// Sent once per spell of trouble rather than once per failure.  A poll
+    /// that fails because the machine is waking up or the network is changing
+    /// is ordinary, and the retry behind it usually settles the matter before
+    /// the user could have finished reading about it -- so backends absorb
+    /// [`FAILURES_BEFORE_REPORT`] of them before this goes out.
+    SyncTrouble(String),
+    /// Background synchronisation is working again, after a
+    /// [`BackendEvent::SyncTrouble`] said it was not.
+    SyncRecovered,
+}
+
+/// How many consecutive failures a backend absorbs before it reports the
+/// trouble through [`BackendEvent::SyncTrouble`].
+///
+/// With [`retry_backoff`] behind it the third failure lands some thirty
+/// seconds after the first, plus whatever the attempts themselves took: long
+/// enough that this is no longer a hiccup, short enough that the user has not
+/// yet started wondering why no mail is arriving.
+pub const FAILURES_BEFORE_REPORT: u32 = 3;
+
+/// How long to wait before retrying background work that has failed `failures`
+/// times in a row: ten seconds, then twenty, forty, and so on to a ceiling of
+/// five minutes.
+///
+/// A fixed delay has to choose between hammering a server that is down and
+/// taking its time over a hiccup that is already over.  Doubling serves both
+/// ends: the first retry is quick enough that a poll dropped across a sleeping
+/// network is picked straight back up, while an outage that lasts settles at
+/// one attempt every five minutes instead of one every ten seconds for as long
+/// as the client is running.
+pub fn retry_backoff(failures: u32) -> Duration {
+    const BASE: Duration = Duration::from_secs(10);
+    const CEILING: Duration = Duration::from_secs(5 * 60);
+
+    // Capped before the shift rather than after: `1 << 32` is undefined, and a
+    // backend that has been failing for a day would otherwise reach it.
+    let doublings = failures.saturating_sub(1).min(16);
+    BASE.saturating_mul(1 << doublings).min(CEILING)
 }
 
 /// Result information for a committed action.
@@ -299,7 +340,7 @@ pub trait MailBackend: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{LeafPart, PartRole, mailer_header};
+    use super::{Duration, LeafPart, PartRole, mailer_header, retry_backoff};
 
     /// A message that names no mailer is one the server is free to name: it is
     /// FastMail's stamp, not ours, that reached recipients before this header
@@ -407,5 +448,17 @@ mod tests {
             }
             .is_attachment()
         );
+    }
+
+    #[test]
+    fn retry_backoff_doubles_up_to_the_ceiling() {
+        assert_eq!(retry_backoff(1), Duration::from_secs(10));
+        assert_eq!(retry_backoff(2), Duration::from_secs(20));
+        assert_eq!(retry_backoff(3), Duration::from_secs(40));
+        assert_eq!(retry_backoff(6), Duration::from_secs(300));
+
+        // However long the trouble has lasted, the wait stops at the ceiling
+        // rather than overflowing the shift behind it.
+        assert_eq!(retry_backoff(u32::MAX), Duration::from_secs(300));
     }
 }

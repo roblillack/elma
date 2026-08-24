@@ -7,8 +7,8 @@
 
 use crate::{
     backend::{
-        ActionStatus, BackendEvent, LeafPart, MailBackend, MailboxSnapshot, OutgoingMessage,
-        PartRole, build_compose_body, mailer_header,
+        ActionStatus, BackendEvent, FAILURES_BEFORE_REPORT, LeafPart, MailBackend, MailboxSnapshot,
+        OutgoingMessage, PartRole, build_compose_body, mailer_header, retry_backoff,
     },
     model::{
         Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
@@ -38,13 +38,22 @@ use std::{
     time::Duration,
 };
 use time::OffsetDateTime;
-use tokio::{runtime::Runtime, sync::Mutex as AsyncMutex, task::JoinHandle, time::interval};
+use tokio::{runtime::Runtime, sync::Mutex as AsyncMutex, task::JoinHandle};
 
 const INITIAL_FETCH_LIMIT: usize = 128;
 const BACKFILL_BATCH_SIZE: usize = 128;
 const MAX_BODY_VALUE_BYTES: usize = 512 * 1024;
 const EVENT_IDLE_POLL: Duration = Duration::from_secs(45);
-const EVENT_RETRY_DELAY: Duration = Duration::from_secs(10);
+/// How long one JMAP request may take.
+///
+/// `jmap-client` builds a fresh HTTP client per call and applies a single
+/// timeout to all of them, defaulting to ten seconds.  That is generous for a
+/// method call and much too tight for a `Blob/download`: the same limit covers
+/// reading the body, so a large attachment on a slow link never finished.  A
+/// minute is long enough for the attachment and short enough that a request
+/// which will never answer cannot hold the background poll for a stretch the
+/// user would notice.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// What the copy in Sent carries once the message is on its way: read, and no
 /// longer a draft.  The compose path imports the message with `$draft` set, and
 /// delivery replaces the whole set with this one.
@@ -63,6 +72,7 @@ const SENT_KEYWORDS: [&str; 1] = ["$seen"];
 /// payload that contains it comes out redacted whatever produced it.
 #[cfg(debug_assertions)]
 mod debug_logging {
+    use super::JmapError;
     use crate::backend::debug_log::{DebugLog, LogKind, REDACTED};
     use std::{fmt::Display, sync::Arc};
 
@@ -114,16 +124,21 @@ mod debug_logging {
 
     impl JmapRequest {
         /// Record what the server made of the request, handing `result` back
-        /// untouched so call sites keep their usual error handling.
-        pub fn response<T, E: Display>(
+        /// for the call site's usual error handling -- with the error wrapped
+        /// on the way past, so the cause `jmap-client` drops on the floor
+        /// survives the trip.  See [`JmapError`].
+        pub fn response<T>(
             &self,
-            result: Result<T, E>,
+            result: Result<T, jmap_client::Error>,
             summary: impl FnOnce(&T) -> String,
-        ) -> Result<T, E> {
+        ) -> Result<T, JmapError> {
+            let result = result.map_err(JmapError::from);
             if let Some(logger) = &self.logger {
                 let payload = match &result {
                     Ok(value) => format!("{} -> {}", self.method, summary(value)),
-                    Err(err) => format!("{} -> ERROR: {err}", self.method),
+                    // Flattened: the log writes a line at a time, and the cause
+                    // is the half that says what actually went wrong.
+                    Err(err) => format!("{} -> ERROR: {}", self.method, err.one_line()),
                 };
                 logger.log_event(&self.scope, "S->C", &payload);
             }
@@ -182,6 +197,7 @@ mod debug_logging {
 
 #[cfg(not(debug_assertions))]
 mod debug_logging {
+    use super::JmapError;
     use std::fmt::Display;
 
     pub struct JmapRequest;
@@ -195,12 +211,12 @@ mod debug_logging {
     }
 
     impl JmapRequest {
-        pub fn response<T, E: Display>(
+        pub fn response<T>(
             &self,
-            result: Result<T, E>,
+            result: Result<T, jmap_client::Error>,
             _summary: impl FnOnce(&T) -> String,
-        ) -> Result<T, E> {
-            result
+        ) -> Result<T, JmapError> {
+            result.map_err(JmapError::from)
         }
     }
 
@@ -273,13 +289,65 @@ impl std::fmt::Display for JmapAuth {
     }
 }
 
+/// A `jmap-client` error that keeps hold of the cause it hides.
+///
+/// `jmap_client::Error` implements `std::error::Error` with an empty body, so
+/// its `source()` is always `None` and the reqwest error behind
+/// `Error::Transport` gets no further than the one line reqwest prints for
+/// itself: "error sending request for url (...)".  That line reads exactly the
+/// same whether the request timed out, was refused, never resolved or lost its
+/// TLS handshake, which left every transport failure looking identical in the
+/// log and in front of the user.  Restating the source puts the rest of the
+/// chain back, so `{err:?}` says which of them it was.
+#[derive(Debug)]
+pub struct JmapError(jmap_client::Error);
+
+impl JmapError {
+    /// The message and everything behind it on one line, for the debug log --
+    /// which writes a line at a time and has no room for anyhow's layout.
+    fn one_line(&self) -> String {
+        let mut text = self.to_string();
+        let mut cause = std::error::Error::source(self);
+        while let Some(err) = cause {
+            text.push_str(&format!(": {err}"));
+            cause = std::error::Error::source(err);
+        }
+        text
+    }
+}
+
+impl std::fmt::Display for JmapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for JmapError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.0 {
+            // One link further down than one might expect: `jmap_client::Error`
+            // quotes reqwest's message inside its own, so handing back the
+            // reqwest error itself would only say the same thing twice.  What
+            // it has to add starts at its cause.
+            jmap_client::Error::Transport(err) => std::error::Error::source(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<jmap_client::Error> for JmapError {
+    fn from(err: jmap_client::Error) -> Self {
+        Self(err)
+    }
+}
+
 /// Say why the session could not be built, in one line.
 ///
 /// A credential the server turns down arrives as a bare `401 Unauthorized` that
 /// names neither the account nor what was sent, and the mailbox loader shows an
 /// error's message rather than walking its causes -- so which credential went
 /// out, and which one to reach for instead, are folded into the message itself.
-fn connect_error(err: jmap_client::Error, auth: &JmapAuth, base_url: &str) -> anyhow::Error {
+fn connect_error(err: JmapError, auth: &JmapAuth, base_url: &str) -> anyhow::Error {
     let url = debug_logging::redact_url(base_url);
     match http_status(&err) {
         Some(status @ (401 | 403)) => anyhow!(
@@ -287,13 +355,16 @@ fn connect_error(err: jmap_client::Error, auth: &JmapAuth, base_url: &str) -> an
             credential = auth.credential_description(),
             hint = auth.rejection_hint(),
         ),
-        _ => anyhow!("connecting to JMAP server at {url}: {err}"),
+        // Flattened rather than left for anyhow to lay out: the mailbox loader
+        // shows an error's message and not its causes, so a reason that stayed
+        // one link down would never be seen.
+        _ => anyhow!("connecting to JMAP server at {url}: {}", err.one_line()),
     }
 }
 
 /// The HTTP status behind a `jmap-client` error, for the errors that carry one.
-fn http_status(err: &jmap_client::Error) -> Option<u16> {
-    match err {
+fn http_status(err: &JmapError) -> Option<u16> {
+    match &err.0 {
         jmap_client::Error::Transport(err) => err.status().map(|status| status.as_u16()),
         jmap_client::Error::Problem(problem) => {
             problem.status().and_then(|status| status.try_into().ok())
@@ -307,6 +378,28 @@ fn http_status(err: &jmap_client::Error) -> Option<u16> {
             .and_then(|code| code.parse().ok()),
         _ => None,
     }
+}
+
+/// Wait for `delay`, giving up early if the loop has been cancelled.  Answers
+/// whether the caller should carry on.
+///
+/// Sliced rather than slept in one go so a cancellation is picked up within the
+/// second: the backoff climbs into the minutes, and a task that only looked at
+/// its flag on waking would keep the folder it was polling pinned for that long
+/// after the user had left it.
+async fn sleep_unless_cancelled(cancel: &AtomicBool, delay: Duration) -> bool {
+    const SLICE: Duration = Duration::from_secs(1);
+
+    let mut remaining = delay;
+    while !remaining.is_zero() {
+        if cancel.load(AtomicOrdering::SeqCst) {
+            return false;
+        }
+        let slice = remaining.min(SLICE);
+        tokio::time::sleep(slice).await;
+        remaining -= slice;
+    }
+    !cancel.load(AtomicOrdering::SeqCst)
 }
 
 /// Configuration required to bootstrap the JMAP backend.
@@ -441,9 +534,11 @@ impl MailBackend for JmapBackend {
                 }
             }
 
+            // Logged and no more: every action reported its own outcome
+            // through `ActionStatus` already, and the poll behind this one
+            // picks up whatever the refresh missed.
             if refresh_needed && let Err(err) = inner.refresh_current_mailbox().await {
                 debug_logging::log_session(format_args!("refresh after actions failed: {err:?}"));
-                eprintln!("JMAP refresh error after actions: {err:?}");
             }
         });
 
@@ -506,7 +601,9 @@ impl JmapInner {
         // can scrub the account's secret out of everything that follows.
         debug_logging::register_secret(auth.secret());
 
-        let mut builder = Client::new().credentials(auth.credentials());
+        let mut builder = Client::new()
+            .credentials(auth.credentials())
+            .timeout(REQUEST_TIMEOUT);
         if !trusted_hosts.is_empty() {
             builder = builder.follow_redirects(trusted_hosts);
         }
@@ -946,29 +1043,62 @@ impl JmapInner {
         Ok(())
     }
 
+    /// Poll the current mailbox for changes until the loop is cancelled.
+    ///
+    /// A poll that fails is not news on its own.  The machine wakes from sleep,
+    /// the network changes, a request times out -- and the attempt behind it
+    /// succeeds.  So a failure costs a backoff (see [`retry_backoff`]) and
+    /// nothing else, and only once [`FAILURES_BEFORE_REPORT`] of them have gone
+    /// by in a row does the UI hear about it, once for the whole spell rather
+    /// than once per attempt.
+    ///
+    /// None of it is printed.  The terminal belongs to the renderer, which
+    /// draws by diffing against what it last put on screen: a line written
+    /// behind its back lands on top of the frame, in raw mode so every newline
+    /// staircases across the width, and stays there until a resize forces a
+    /// repaint.  What there is to say goes to the debug log and to the status
+    /// line.
     async fn event_loop(self: Arc<Self>, cancel: Arc<AtomicBool>) {
+        let mut failures: u32 = 0;
+        let mut reported = false;
+
         loop {
-            if cancel.load(AtomicOrdering::SeqCst) {
-                break;
+            let delay = if failures == 0 {
+                EVENT_IDLE_POLL
+            } else {
+                retry_backoff(failures)
+            };
+            if !sleep_unless_cancelled(&cancel, delay).await {
+                return;
             }
 
-            let mut poll_interval = interval(EVENT_IDLE_POLL);
-            loop {
-                if cancel.load(AtomicOrdering::SeqCst) {
-                    return;
+            match self.refresh_current_mailbox().await {
+                Ok(()) => {
+                    if failures > 0 {
+                        debug_logging::log_session(format_args!(
+                            "background refresh recovered after {failures} failed attempt(s)"
+                        ));
+                    }
+                    if reported {
+                        self.emit_status(BackendEvent::SyncRecovered);
+                    }
+                    failures = 0;
+                    reported = false;
                 }
-                let _ = poll_interval.tick().await;
-                if let Err(err) = self.refresh_current_mailbox().await {
-                    debug_logging::log_session(format_args!("background refresh failed: {err:?}"));
-                    eprintln!("JMAP background refresh error: {err:?}");
-                    break;
+                Err(err) => {
+                    failures += 1;
+                    debug_logging::log_session(format_args!(
+                        "background refresh failed ({failures} in a row): {err:?}"
+                    ));
+                    if failures >= FAILURES_BEFORE_REPORT && !reported {
+                        reported = true;
+                        self.emit_status(BackendEvent::SyncTrouble(format!(
+                            "Not syncing: {}. Retrying...",
+                            err.root_cause()
+                        )));
+                    }
                 }
             }
-
-            if cancel.load(AtomicOrdering::SeqCst) {
-                break;
-            }
-            tokio::time::sleep(EVENT_RETRY_DELAY).await;
         }
     }
 
@@ -997,6 +1127,19 @@ impl JmapInner {
         if self.current_mailbox() != mailbox {
             return;
         }
+        if let Some(sender) = self.events.lock().unwrap().as_ref() {
+            let _ = sender.send(event);
+        }
+    }
+
+    /// Hand `event` to the UI whichever mailbox is on screen.
+    ///
+    /// The check [`Self::emit_event`] makes is there to keep one folder's
+    /// messages out of another's list.  How the connection is faring belongs to
+    /// no folder in particular, so it goes out unfiltered -- and it has to,
+    /// since a report that the account cannot be reached is worth just as much
+    /// after the user has moved to another folder.
+    fn emit_status(&self, event: BackendEvent) {
         if let Some(sender) = self.events.lock().unwrap().as_ref() {
             let _ = sender.send(event);
         }
@@ -1182,7 +1325,9 @@ impl JmapInner {
             {
                 Ok(page) => page,
                 Err(err) => {
-                    eprintln!("JMAP backfill fetch error: {err:?}");
+                    // Backfill is best-effort: the run stops here, and the next
+                    // refresh starts a new one from where this got to.
+                    debug_logging::log_session(format_args!("backfill fetch failed: {err:?}"));
                     break;
                 }
             };
@@ -1234,7 +1379,9 @@ impl JmapInner {
                             },
                         )),
                         Err(err) => {
-                            eprintln!("JMAP backfill build error: {err:?}");
+                            debug_logging::log_session(format_args!(
+                                "backfill could not build a message: {err:?}"
+                            ));
                         }
                     }
                 }
@@ -1743,11 +1890,21 @@ impl FetchedEmail {
         let received_at = email.received_at();
         let sent_at = email.sent_at();
         let size = email.size();
-        let mailbox_ids = email
+        // `jmap-client` keeps `mailboxIds` in an `AHashMap`, and hands them
+        // over in that map's iteration order -- which is seeded afresh for
+        // every response, so the same email comes back with its mailboxes in a
+        // different order on every poll.  The order reaches the labels built
+        // from these ids, and `flags_changed` compares those as a sequence, so
+        // leaving it alone reports a flag change on every poll for any message
+        // filed in more than one other mailbox -- and reshuffles the labels
+        // under the reader while it is at it.  Sorting here is what makes both
+        // stable.
+        let mut mailbox_ids: Vec<String> = email
             .mailbox_ids()
             .into_iter()
             .map(|id| id.to_string())
             .collect();
+        mailbox_ids.sort();
         let keywords = email
             .keywords()
             .into_iter()
@@ -2140,20 +2297,53 @@ mod tests {
 
     #[test]
     fn status_is_read_off_a_bare_status_line() {
-        let err = jmap_client::Error::Server("401 Unauthorized".to_string());
+        let err = JmapError::from(jmap_client::Error::Server("401 Unauthorized".to_string()));
         assert_eq!(http_status(&err), Some(401));
+    }
+
+    /// The reason a transport failure carries is the half worth having, and it
+    /// sits one link below the line `jmap-client` prints for itself.
+    #[test]
+    fn a_transport_failure_keeps_the_reason_behind_it() {
+        // A port nothing is listening on: bound only to be told a free one,
+        // then dropped, so the connection is refused rather than left hanging.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            listener.local_addr().expect("local address").port()
+        };
+
+        let runtime = Runtime::new().expect("runtime");
+        let err = JmapError::from(runtime.block_on(async move {
+            Client::new()
+                .credentials(Credentials::bearer("token"))
+                .connect(&format!("http://127.0.0.1:{port}"))
+                .await
+                .err()
+                .expect("nothing is listening on that port")
+        }));
+
+        // On its own the error names the URL and nothing one could act on ...
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Transport error: error sending request for url (http://127.0.0.1:{port}/.well-known/jmap)"
+            )
+        );
+        // ... while the chain behind it says what actually happened.
+        let detail = err.one_line().to_lowercase();
+        assert!(detail.contains("refused"), "{detail}");
     }
 
     #[test]
     fn a_server_message_without_a_status_reads_as_none() {
-        let err = jmap_client::Error::Server("connection reset".to_string());
+        let err = JmapError::from(jmap_client::Error::Server("connection reset".to_string()));
         assert_eq!(http_status(&err), None);
     }
 
     #[test]
     fn a_rejected_password_names_the_account_and_offers_the_token() {
         let message = connect_error(
-            jmap_client::Error::Server("401 Unauthorized".to_string()),
+            JmapError::from(jmap_client::Error::Server("401 Unauthorized".to_string())),
             &basic_auth(),
             "https://mail.example.com/.well-known/jmap",
         )
@@ -2171,7 +2361,7 @@ mod tests {
     #[test]
     fn a_rejected_token_offers_the_password() {
         let message = connect_error(
-            jmap_client::Error::Server("403 Forbidden".to_string()),
+            JmapError::from(jmap_client::Error::Server("403 Forbidden".to_string())),
             &bearer_auth(),
             "https://api.fastmail.com/jmap/session",
         )
@@ -2186,7 +2376,9 @@ mod tests {
     #[test]
     fn other_failures_are_reported_as_they_come() {
         let message = connect_error(
-            jmap_client::Error::Server("503 Service Unavailable".to_string()),
+            JmapError::from(jmap_client::Error::Server(
+                "503 Service Unavailable".to_string(),
+            )),
             &basic_auth(),
             "https://mail.example.com",
         )
@@ -2201,7 +2393,7 @@ mod tests {
     #[test]
     fn a_url_with_userinfo_is_redacted_in_errors() {
         let message = connect_error(
-            jmap_client::Error::Server("401 Unauthorized".to_string()),
+            JmapError::from(jmap_client::Error::Server("401 Unauthorized".to_string())),
             &basic_auth(),
             "https://rob:s3cret@mail.example.com/.well-known/jmap",
         )
@@ -2287,6 +2479,74 @@ mod tests {
             labels_in(MailboxKind::Archive, &data, &cache),
             vec!["Inbox".to_string(), "Newsletters".to_string()]
         );
+    }
+
+    /// A canned `Email/get` payload, the way a poll receives one.  Parsed
+    /// afresh on every call, so each returns an independently-seeded
+    /// `AHashMap` for `mailboxIds` -- which is the whole point.
+    fn parse_email(mailbox_ids: &[&str]) -> FetchedEmail {
+        let ids: serde_json::Map<String, serde_json::Value> = mailbox_ids
+            .iter()
+            .map(|id| ((*id).to_string(), serde_json::json!(true)))
+            .collect();
+        let email: JmapEmail = serde_json::from_value(serde_json::json!({
+            "id": "M1",
+            "mailboxIds": ids,
+            "keywords": {"$seen": true},
+            "subject": "Hello",
+            "size": 42,
+            "receivedAt": "2026-08-20T06:00:00Z",
+            "hasAttachment": false,
+        }))
+        .expect("parsing the canned email");
+
+        FetchedEmail::from_email(email).expect("an email with an id builds")
+    }
+
+    /// `jmap-client` holds `mailboxIds` in an `AHashMap` and hands them over in
+    /// its iteration order, which is seeded per map -- so the same email arrives
+    /// with its mailboxes shuffled from one poll to the next.  Sorting them on
+    /// the way in is what stops that reaching the labels.
+    #[test]
+    fn mailbox_ids_arrive_in_a_stable_order() {
+        let wire = ["mb-news", "mb-inbox", "mb-work", "mb-archive"];
+        let sorted = vec![
+            "mb-archive".to_string(),
+            "mb-inbox".to_string(),
+            "mb-news".to_string(),
+            "mb-work".to_string(),
+        ];
+
+        // Four ids permute 24 ways, so an unsorted read is overwhelmingly
+        // unlikely to survive this many independently-seeded maps.
+        for poll in 0..64 {
+            assert_eq!(parse_email(&wire).mailbox_ids, sorted, "poll {poll}");
+        }
+    }
+
+    /// The leak this was found through: a message filed in more than one other
+    /// mailbox reported a flag change on every background poll, because
+    /// `flags_changed` compares labels as a sequence and the sequence came out
+    /// of a differently-seeded hash map each time.  Nothing about the message
+    /// changed, so nothing may be reported.
+    #[test]
+    fn an_unchanged_email_reports_no_flag_change_between_polls() {
+        let cache = standard_cache();
+        let wire = ["mb-inbox", "mb-news", "mb-archive", "mb-sent"];
+
+        let first = build_message(1, 1, 1, &parse_email(&wire), &cache, MailboxKind::Inbox)
+            .expect("message builds");
+
+        for poll in 0..64 {
+            let again = build_message(1, 1, 1, &parse_email(&wire), &cache, MailboxKind::Inbox)
+                .expect("message builds");
+            assert!(
+                !flags_changed(&first, &again),
+                "poll {poll} reported a change: {:?} -> {:?}",
+                first.labels,
+                again.labels
+            );
+        }
     }
 
     #[test]
