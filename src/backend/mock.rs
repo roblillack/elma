@@ -5,7 +5,9 @@
 //! the UI logic without relying on an external mail provider.
 
 use crate::{
-    backend::{ActionStatus, BackendEvent, MailBackend, MailboxSnapshot, OutgoingMessage},
+    backend::{
+        ActionStatus, BackendEvent, MailBackend, MailboxSnapshot, OutgoingMessage, compose_address,
+    },
     model::{
         Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
         MessageContentPart, MessageId, MessageStatus,
@@ -524,9 +526,9 @@ impl MockBackend {
         } = outgoing;
 
         let mut recipients = Vec::new();
-        recipients.extend(to);
-        recipients.extend(cc);
-        recipients.extend(bcc);
+        recipients.extend(to.iter().cloned());
+        recipients.extend(cc.iter().cloned());
+        recipients.extend(bcc.iter().cloned());
 
         let attachments_total: usize = attachments.iter().map(|att| att.size()).sum();
         let size = text_body.len() + html_body.len() + subject.len() + attachments_total;
@@ -556,6 +558,9 @@ impl MockBackend {
 
         let mut content_state = MessageContent {
             mailer: format!("{MAILER_NAME} compose"),
+            to,
+            cc,
+            bcc,
             ..Default::default()
         };
         content_state.parts.push(MessageContentPart {
@@ -785,7 +790,13 @@ fn new_random_message(
     let html = format!("<html><body><h1>{subject}</h1>{body}</body></html>");
     let plain = html2text::from_read(html.as_bytes(), 80);
 
-    let mut content = MessageContent::default();
+    let mut content = MessageContent {
+        to: recipients
+            .iter()
+            .map(|name| compose_address(Some(name), &mock_address(name)))
+            .collect(),
+        ..Default::default()
+    };
     content.parts.push(MessageContentPart {
         content_type: "text/html".to_string(),
         content: html.as_bytes().to_vec(),
@@ -879,6 +890,17 @@ fn generate_recipients(rng: &mut SimpleRng) -> Vec<String> {
         recipients.push(generate_sender(rng));
     }
     recipients
+}
+
+/// The made-up address behind a generated name: `Sam D. Chen` is
+/// `sam.d.chen@mock.example`.
+fn mock_address(name: &str) -> String {
+    let local: Vec<String> = name
+        .split_whitespace()
+        .map(|part| part.trim_matches('.').to_ascii_lowercase())
+        .filter(|part| !part.is_empty())
+        .collect();
+    format!("{}@mock.example", local.join("."))
 }
 
 fn generate_subject(rng: &mut SimpleRng) -> String {
@@ -1161,6 +1183,23 @@ mod tests {
         assert_eq!(drafts[0].status, MessageStatus::New);
         assert!(has_label(&drafts[0], "Draft"));
         assert!(backend.messages_in(MailboxKind::Sent).is_empty());
+    }
+
+    #[test]
+    fn a_saved_draft_loads_with_every_recipient_where_it_was() {
+        let backend = MockBackend::empty();
+        let draft = OutgoingMessage {
+            cc: vec!["\"Doe, Jane\" <jane@example.com>".to_string()],
+            bcc: vec!["boss@example.com".to_string()],
+            ..outgoing("Still writing")
+        };
+        backend.save_draft(draft).expect("saving succeeds");
+
+        let id = backend.messages_in(MailboxKind::Drafts)[0].id;
+        let content = backend.load_message(id).expect("the draft loads");
+        assert_eq!(content.to, ["someone@example.com"]);
+        assert_eq!(content.cc, ["\"Doe, Jane\" <jane@example.com>"]);
+        assert_eq!(content.bcc, ["boss@example.com"]);
     }
 
     /// Un-starring is the action that stayed broken against FastMail for as

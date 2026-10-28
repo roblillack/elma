@@ -8,10 +8,13 @@
 
 use crate::model::{Action, MailboxKind, Message, MessageContent, MessageId};
 use anyhow::Result;
-use lettre::message::{
-    Attachment as LettreAttachment, MultiPart, SinglePart,
-    header::ContentType as LettreContentType, header::HeaderName as LettreHeaderName,
-    header::HeaderValue as LettreHeaderValue,
+use lettre::{
+    Address as LettreAddress,
+    message::{
+        Attachment as LettreAttachment, Mailbox as LettreMailbox, MultiPart, SinglePart,
+        header::ContentType as LettreContentType, header::HeaderName as LettreHeaderName,
+        header::HeaderValue as LettreHeaderValue,
+    },
 };
 use std::{sync::mpsc::Receiver, time::Duration};
 
@@ -136,6 +139,25 @@ pub(crate) fn mailer_header() -> LettreHeaderValue {
         LettreHeaderName::new_from_ascii_str("X-Mailer"),
         MAILER.to_string(),
     )
+}
+
+/// Write a recipient the way the compose fields read it back: as one mailbox
+/// lettre can parse, for [`MessageContent::to`] and its siblings.
+///
+/// A display name holding anything an atom may not -- a comma, above all --
+/// comes out quoted, so `Doe, John` stays one recipient rather than two.  An
+/// address lettre cannot parse is passed on bare, as received: a recipient the
+/// user can see and correct beats one that silently disappears.
+pub(crate) fn compose_address(name: Option<&str>, email: &str) -> String {
+    let Ok(address) = email.trim().parse::<LettreAddress>() else {
+        return email.trim().to_string();
+    };
+    // A line break cannot be quoted, and lettre fails to format one rather than
+    // write it out -- folded header text has no business in a name anyway.
+    let name = name
+        .map(|name| name.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|name| !name.is_empty());
+    LettreMailbox::new(name, address).to_string()
 }
 
 /// Assemble the MIME body of an outgoing message.
@@ -340,7 +362,43 @@ pub trait MailBackend: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{Duration, LeafPart, PartRole, mailer_header, retry_backoff};
+    use super::{
+        Duration, LeafPart, LettreMailbox, PartRole, compose_address, mailer_header, retry_backoff,
+    };
+
+    /// What a reopened draft puts in its compose fields has to be what goes out
+    /// again when it is sent: the same name, the same address, one recipient.
+    #[test]
+    fn a_compose_address_parses_back_as_the_mailbox_it_came_from() {
+        for name in [
+            "Doe, John",
+            "Jane \"JJ\" Doe",
+            "Jörg Müller",
+            "Ann; Bob",
+            "Plain",
+        ] {
+            let written = compose_address(Some(name), "someone@example.com");
+            let parsed: LettreMailbox = written
+                .parse()
+                .unwrap_or_else(|err| panic!("{written:?} does not parse: {err}"));
+            assert_eq!(parsed.name.as_deref(), Some(name), "{written:?}");
+            assert_eq!(parsed.email.to_string(), "someone@example.com");
+        }
+
+        assert_eq!(
+            compose_address(Some("Doe, John"), "john@example.com"),
+            "\"Doe, John\" <john@example.com>"
+        );
+        assert_eq!(compose_address(None, "a@example.com"), "a@example.com");
+        assert_eq!(compose_address(Some(" "), "a@example.com"), "a@example.com");
+        // A name that arrived folded must not make formatting fail.
+        assert_eq!(
+            compose_address(Some("Ann\r\n Smith"), "a@example.com"),
+            "Ann Smith <a@example.com>"
+        );
+        // Nothing lettre can parse: kept as it came, not dropped.
+        assert_eq!(compose_address(Some("X"), "undisclosed"), "undisclosed");
+    }
 
     /// A message that names no mailer is one the server is free to name: it is
     /// FastMail's stamp, not ours, that reached recipients before this header

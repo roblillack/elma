@@ -1028,6 +1028,7 @@ fn fixture_contents() -> HashMap<MessageId, MessageContent> {
                     inline: true,
                 },
             ],
+            ..Default::default()
         },
     );
 
@@ -1054,6 +1055,7 @@ fn fixture_contents() -> HashMap<MessageId, MessageContent> {
                 },
             ],
             attachments: Vec::new(),
+            ..Default::default()
         },
     );
 
@@ -1074,6 +1076,8 @@ twelve?</p></body></html>"#
                 },
             ],
             attachments: Vec::new(),
+            to: vec!["anna@example.com".to_string()],
+            ..Default::default()
         },
     );
 
@@ -1087,6 +1091,7 @@ twelve?</p></body></html>"#
                     .to_vec(),
             }],
             attachments: Vec::new(),
+            ..Default::default()
         },
     );
 
