@@ -2337,17 +2337,19 @@ impl GmailInner {
             .ok_or_else(|| anyhow!("IMAP session is not available"))?;
 
         let result = async {
-            session
-                .select(&folder_name)
+            bounded(session.select(&folder_name))
                 .await
                 .with_context(|| format!("selecting mailbox {folder_name}"))?;
             for command in commands {
                 match command {
-                    ActionCommand::Move(target) => session.uid_mv(uid.to_string(), target).await,
+                    ActionCommand::Move(target) => {
+                        bounded(session.uid_mv(uid.to_string(), target)).await
+                    }
                     ActionCommand::Flags(query) | ActionCommand::Labels(query) => {
-                        session
-                            .run_command_and_check_ok(format!("UID STORE {uid} {query}"))
-                            .await
+                        bounded(
+                            session.run_command_and_check_ok(format!("UID STORE {uid} {query}")),
+                        )
+                        .await
                     }
                 }
                 .with_context(|| format!("applying the action in {folder_name}"))?;
@@ -2356,14 +2358,25 @@ impl GmailInner {
         }
         .await;
 
+        // On a connection that has stopped answering, selecting the open
+        // folder again would only sit out another timeout.  Without a session
+        // the next IDLE dials afresh and opens the right folder anyway.
+        if result.as_ref().is_err_and(is_connection_lost) {
+            *guard = None;
+            return result;
+        }
+
         // Whatever that folder announced in the meantime is about that folder.
         while session.unsolicited_responses.try_recv().is_ok() {}
 
-        match session.select(&open_name).await {
+        match bounded(session.select(&open_name)).await {
             // Mail may have arrived while the other folder was open.
             Ok(mailbox) => {
                 if let Err(err) = self.drain_exists(session, Some(mailbox.exists)).await {
                     log_backend_event("BACKEND", &format!("EXISTS handling failed: {err:?}"));
+                    if is_connection_lost(&err) {
+                        *guard = None;
+                    }
                 }
             }
             // Kept, the session would carry on in the wrong folder.  Without
