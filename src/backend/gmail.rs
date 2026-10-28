@@ -3859,14 +3859,29 @@ mod tests {
         assert!(!is_connection_lost(&err), "a refusal is not a dead line");
     }
 
+    /// Written against [`MIN_TRANSFER_RATE`] rather than a figure, so tuning
+    /// the rate does not mean rewriting the test.
     #[test]
     fn a_large_transfer_gets_time_in_proportion() {
+        // Less than a second's worth at the slowest rate adds nothing.
         assert_eq!(transfer_timeout(0), COMMAND_TIMEOUT);
-        assert_eq!(transfer_timeout(1024), COMMAND_TIMEOUT);
+        assert_eq!(transfer_timeout(MIN_TRANSFER_RATE - 1), COMMAND_TIMEOUT);
         assert_eq!(
-            transfer_timeout(25 * 1024 * 1024),
-            COMMAND_TIMEOUT + Duration::from_secs(800)
+            transfer_timeout(MIN_TRANSFER_RATE),
+            COMMAND_TIMEOUT + Duration::from_secs(1)
         );
+
+        // A second per MIN_TRANSFER_RATE bytes on top of the command limit...
+        assert_eq!(
+            transfer_timeout(100 * MIN_TRANSFER_RATE),
+            COMMAND_TIMEOUT + Duration::from_secs(100)
+        );
+
+        // ...so a 25 MiB attachment crawling along at exactly the minimum
+        // rate still makes it.
+        let attachment = 25 * 1024 * 1024;
+        let at_minimum_rate = Duration::from_secs_f64(attachment as f64 / MIN_TRANSFER_RATE as f64);
+        assert!(transfer_timeout(attachment) >= at_minimum_rate);
     }
 
     #[test]
