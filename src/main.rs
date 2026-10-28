@@ -382,12 +382,13 @@ fn jmap_setup_from_config(config: &mut AccountConfig, index: usize) -> Result<Jm
     }
 
     Ok(JmapSetup {
-        username,
         config: JmapConfig {
             base_url,
             auth,
             trusted_hosts,
+            username: username.clone(),
         },
+        username,
     })
 }
 

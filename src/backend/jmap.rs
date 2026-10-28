@@ -509,6 +509,9 @@ pub struct JmapConfig {
     pub base_url: String,
     pub auth: JmapAuth,
     pub trusted_hosts: Vec<String>,
+    /// The address the account is configured with, which decides the
+    /// identity mail goes out as.  See [`choose_identity`].
+    pub username: String,
 }
 
 /// Production backend that communicates with FastMail (or any other JMAP
@@ -745,7 +748,7 @@ impl JmapInner {
         let client = Arc::new(Self::connect(&config, &secret).await?);
 
         let mailboxes = Self::load_mailboxes(&client).await?;
-        let identity = Self::load_identity(&client).await?;
+        let identity = Self::load_identity(&client, &config.username).await?;
 
         Ok(Arc::new(Self {
             runtime,
@@ -771,6 +774,7 @@ impl JmapInner {
             base_url,
             auth,
             trusted_hosts,
+            ..
         } = config;
 
         let mut builder = Client::new()
@@ -1884,7 +1888,7 @@ impl JmapInner {
         Ok(MailboxCache::from_mailboxes(mailboxes))
     }
 
-    async fn load_identity(client: &Client) -> Result<IdentityInfo> {
+    async fn load_identity(client: &Client, username: &str) -> Result<IdentityInfo> {
         let mut request = client.build();
         request.add_capability(URI::Submission);
         let get = request.get_identity();
@@ -1900,25 +1904,37 @@ impl JmapInner {
                 format!("identities={}", response.list().len())
             })
             .context("fetching account identity")?;
-        if let Some(identity) = response.take_list().into_iter().next() {
-            let id = identity
-                .id()
-                .map(|id| id.to_string())
-                .ok_or_else(|| anyhow!("identity has no id"))?;
-            let email = identity
-                .email()
-                .map(|addr| addr.to_string())
-                .ok_or_else(|| anyhow!("identity has no email address"))?;
-            let name = identity.name().map(|name| name.to_string());
-            Ok(IdentityInfo { id, email, name })
-        } else {
-            let session = client.session();
-            let email = session.username().to_string();
-            Ok(IdentityInfo {
-                id: email.clone(),
-                email,
-                name: None,
+        // One that came back without the properties asked for cannot be sent
+        // as, and is no reason to turn the account away when others can.
+        let identities = response
+            .take_list()
+            .into_iter()
+            .filter_map(|identity| {
+                Some(IdentityInfo {
+                    id: identity.id()?.to_string(),
+                    email: identity.email()?.to_string(),
+                    name: identity.name().map(|name| name.to_string()),
+                })
             })
+            .collect();
+
+        let session = client.session();
+        match choose_identity(identities, username, session.username()) {
+            Some(identity) => {
+                debug_logging::log_session(format_args!(
+                    "sending as {} (identity {})",
+                    identity.email, identity.id
+                ));
+                Ok(identity)
+            }
+            None => {
+                let email = session.username().to_string();
+                Ok(IdentityInfo {
+                    id: email.clone(),
+                    email,
+                    name: None,
+                })
+            }
         }
     }
 
@@ -1995,6 +2011,30 @@ struct IdentityInfo {
     id: String,
     email: String,
     name: Option<String>,
+}
+
+/// The identity mail goes out as: the one for the account's own address.
+///
+/// FastMail lists every address an account may send as -- aliases, other
+/// domains -- in no promised order, so the first is not necessarily the
+/// account's own.  The configured `username` is the address the user named;
+/// the session's username is the server's idea of the same, for an account
+/// configured with something other than an address.  Failing both, the first
+/// identity is as good a guess as any.
+fn choose_identity(
+    mut identities: Vec<IdentityInfo>,
+    username: &str,
+    session_username: &str,
+) -> Option<IdentityInfo> {
+    let matching = [username, session_username].into_iter().find_map(|wanted| {
+        identities
+            .iter()
+            .position(|identity| identity.email.eq_ignore_ascii_case(wanted))
+    });
+    match matching {
+        Some(position) => Some(identities.swap_remove(position)),
+        None => identities.into_iter().next(),
+    }
 }
 
 #[derive(Clone)]
@@ -2715,6 +2755,7 @@ mod tests {
             base_url: format!("http://127.0.0.1:{port}"),
             auth: basic_auth(),
             trusted_hosts: Vec::new(),
+            username: "rob@example.com".to_string(),
         })
         .expect("the backend to be constructed");
         let error = backend
@@ -2814,6 +2855,55 @@ mod tests {
         })
         .expect("the session object to parse");
         assert_eq!(mail_account(&without_mail), None);
+    }
+
+    fn identity(id: &str, email: &str) -> IdentityInfo {
+        IdentityInfo {
+            id: id.to_string(),
+            email: email.to_string(),
+            name: None,
+        }
+    }
+
+    /// FastMail lists aliases and other domains next to the account's own
+    /// address, and the own address need not come first.
+    #[test]
+    fn mail_goes_out_as_the_configured_address() {
+        let identities = vec![
+            identity("i1", "postmaster@lillack.net"),
+            identity("i2", "Rob@Lillack.net"),
+            identity("i3", "rob@example.com"),
+        ];
+        let chosen = choose_identity(identities, "rob@lillack.net", "rob@lillack.net")
+            .expect("an identity to be chosen");
+        assert_eq!(
+            chosen.id, "i2",
+            "the address the account is configured with, in any case"
+        );
+    }
+
+    #[test]
+    fn the_session_username_stands_in_for_a_username_that_is_no_address() {
+        let identities = vec![
+            identity("i1", "postmaster@lillack.net"),
+            identity("i2", "rob@lillack.net"),
+        ];
+        let chosen = choose_identity(identities, "rob", "rob@lillack.net")
+            .expect("an identity to be chosen");
+        assert_eq!(chosen.id, "i2");
+    }
+
+    #[test]
+    fn without_a_matching_identity_the_first_is_used() {
+        let identities = vec![
+            identity("i1", "postmaster@lillack.net"),
+            identity("i2", "info@lillack.net"),
+        ];
+        let chosen = choose_identity(identities, "rob@lillack.net", "rob@lillack.net")
+            .expect("an identity to be chosen");
+        assert_eq!(chosen.id, "i1");
+
+        assert!(choose_identity(Vec::new(), "rob@lillack.net", "rob@lillack.net").is_none());
     }
 
     /// One request as [`fake_jmap_server`] saw it.
@@ -2971,6 +3061,7 @@ mod tests {
             base_url: format!("http://127.0.0.1:{port}"),
             auth: bearer_auth(),
             trusted_hosts: Vec::new(),
+            username: "rob@example.com".to_string(),
         })
         .expect("the backend to be constructed");
 
@@ -3052,6 +3143,7 @@ mod tests {
                 "Work",
             ))),
             trusted_hosts: Vec::new(),
+            username: "rob@example.com".to_string(),
         })
         .expect("the backend to be constructed")
     }
