@@ -35,7 +35,10 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Mutex, PoisonError},
+    sync::{
+        Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use url::Url;
@@ -289,6 +292,11 @@ pub struct OAuthCredential {
     /// The account's name, for the message that asks the user to sign in.
     account: String,
     state: Mutex<Option<StoredCredential>>,
+    /// Set while the credential in `state` has not made it into the file: a
+    /// renewal whose save failed.  The renewal may already have retired the
+    /// refresh token on disk, so what is held here is the only copy that still
+    /// works -- it is kept, and saved again before any token is handed out.
+    unsaved: AtomicBool,
 }
 
 impl OAuthCredential {
@@ -299,6 +307,7 @@ impl OAuthCredential {
             username: username.to_string(),
             account: account.to_string(),
             state: Mutex::new(None),
+            unsaved: AtomicBool::new(false),
         }
     }
 
@@ -323,6 +332,9 @@ impl OAuthCredential {
 
     async fn token(&self, refused: bool) -> Result<String> {
         let credential = self.current()?;
+        if self.unsaved.load(Ordering::SeqCst) {
+            self.persist(&credential)?;
+        }
         if credential.is_fresh() && !refused {
             return Ok(credential.access_token);
         }
@@ -363,10 +375,27 @@ impl OAuthCredential {
                 .map(|seconds| Utc::now().timestamp() + seconds),
             ..credential
         };
-        self.store.save(&updated)?;
-        let token = updated.access_token.clone();
-        *self.state.lock().unwrap() = Some(updated);
-        Ok(token)
+        // Held before it is saved, so a save that fails cannot lose it: with a
+        // rotating refresh token, the one just spent may no longer work.
+        *self.state.lock().unwrap() = Some(updated.clone());
+        self.unsaved.store(true, Ordering::SeqCst);
+        // Saved before the access token is used, as the profile asks: a token
+        // in use whose refresh token never reached the disk would leave the
+        // next start with only the retired one.
+        self.persist(&updated)?;
+        Ok(updated.access_token)
+    }
+
+    /// Write `credential` to the file, clearing `unsaved` once it is there.
+    fn persist(&self, credential: &StoredCredential) -> Result<()> {
+        self.store.save(credential).with_context(|| {
+            format!(
+                "keeping the renewed sign-in for {}; it is held in memory until it can be saved",
+                self.username
+            )
+        })?;
+        self.unsaved.store(false, Ordering::SeqCst);
+        Ok(())
     }
 
     /// The stored sign-in, read from the file on first use.
@@ -1480,6 +1509,74 @@ mod tests {
                 .block_on(live.access_token())
                 .expect("the fresh token should be reused"),
             "a-newer-token"
+        );
+    }
+
+    /// A renewal whose save fails keeps the rotated refresh token in memory --
+    /// the one on disk may already be spent -- and hands out no access token
+    /// until the save has gone through.
+    #[test]
+    fn a_renewal_that_cannot_be_saved_is_kept_until_it_can() {
+        let (port, server) = one_refresh_server();
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let store = TokenStore::new(directory.path().join("oauth.toml"));
+        store
+            .save(&StoredCredential {
+                token_endpoint: format!("http://127.0.0.1:{port}/oauth/refresh"),
+                expires_at: Some(Utc::now().timestamp() - 1),
+                ..credential()
+            })
+            .expect("the sign-in should save");
+
+        // A directory where the save puts its temporary file: reading still
+        // works, writing does not.
+        let blocker = directory.path().join("oauth.toml.new");
+        fs::create_dir(&blocker).expect("the blocking directory");
+
+        let live = OAuthCredential::new(
+            store.clone(),
+            "https://api.example.com/jmap/session",
+            "rob@example.com",
+            "Work",
+        );
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+
+        let error = runtime
+            .block_on(live.access_token())
+            .expect_err("a renewal that is not saved is not used");
+        assert!(format!("{error:#}").contains("held in memory"), "{error:#}");
+        server.join().expect("the renewal to have happened");
+        assert_eq!(
+            store
+                .find("https://api.example.com/jmap/session", "rob@example.com")
+                .expect("readable")
+                .expect("found")
+                .refresh_token
+                .as_deref(),
+            Some("a-refresh-token"),
+            "nothing reached the file"
+        );
+
+        // With the disk writable again, the held renewal is saved and used --
+        // without a second trip to the token endpoint, which is gone.
+        fs::remove_dir(&blocker).expect("the blocker to go");
+        assert_eq!(
+            runtime
+                .block_on(live.access_token())
+                .expect("the held renewal to be saved and used"),
+            "a-newer-token"
+        );
+        assert_eq!(
+            store
+                .find("https://api.example.com/jmap/session", "rob@example.com")
+                .expect("readable")
+                .expect("found")
+                .refresh_token
+                .as_deref(),
+            Some("a-rotated-token")
         );
     }
 
