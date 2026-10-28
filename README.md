@@ -71,8 +71,8 @@ A JMAP account signs in one of three ways, and reads its session object from
 name = "Fastmail"
 backend = "jmap"
 username = "user@fastmail.com"
-# No credential here: `elma --login Fastmail` signs in through the browser and
-# keeps the token in ~/.elma/oauth.toml.
+# No credential here: Elma signs in through the browser the first time it
+# starts, and keeps the token in ~/.elma/oauth.toml.
 
 [[accounts]]
 name = "Work"
@@ -104,11 +104,15 @@ trusted already.
 
 #### Signing in through the browser
 
+An account that signs in through the browser and has never done so is signed in
+when Elma starts, before the interface comes up. To sign in again -- after the
+sign-in was revoked, say -- run:
+
 ```console
 $ elma --login Fastmail
 ```
 
-This runs the whole OAuth flow on your machine — there is no server of Elma's in
+Either way, this runs the whole OAuth flow on your machine — there is no server of Elma's in
 the middle, and the token never passes through one:
 
 - The endpoint is asked who authorizes access to it: an unauthenticated request

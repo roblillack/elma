@@ -70,6 +70,12 @@ fn main() -> Result<()> {
         terminal::no_colour_in_env(),
     )
     .with_context(|| format!("invalid theme in {}", config_path_display()))?;
+
+    // Like `--login`, before the alternate screen is entered.
+    if !demo_mode && let Some(config) = &config {
+        sign_in_where_missing(config);
+    }
+
     let accounts = load_accounts(demo_mode, config)?;
 
     let mut app = App::new(accounts).context("failed to initialize application state")?;
@@ -406,7 +412,7 @@ fn sign_in_to_account(config: Option<Config>, requested: Option<&str>) -> Result
         ));
     }
 
-    let (index, mut config) = match requested {
+    let (index, config) = match requested {
         Some(requested) => {
             let position = candidates
                 .iter()
@@ -436,9 +442,70 @@ fn sign_in_to_account(config: Option<Config>, requested: Option<&str>) -> Result
         );
     }
 
+    sign_in_with(config, index, &oauth::TokenStore::at_default_path()?)
+}
+
+/// Sign in, before the application starts, to every account that signs in
+/// through the browser and has never done so.
+///
+/// Without this, such an account would start up only to report that it has no
+/// sign-in, and send the user back to the shell for `elma --login`.  It runs
+/// with the terminal still to itself, which the flow needs: a URL to show and a
+/// browser to wait for.  A sign-in that fails is reported, and the application
+/// starts without it -- the account says what is missing when it is opened,
+/// and the others are usable meanwhile.
+fn sign_in_where_missing(config: &Config) {
+    let Ok(store) = oauth::TokenStore::at_default_path() else {
+        return;
+    };
+    for (index, entry) in accounts_without_sign_in(config, &store) {
+        let label = account_label(&entry, index);
+        println!("{label} has not been signed in yet.");
+        if let Err(err) = sign_in_with(entry, index, &store) {
+            eprintln!();
+            eprintln!("Signing in to {label} failed: {err:#}");
+            eprintln!("Press Enter to start without it, or Ctrl-C to quit.");
+            let _ = std::io::stdin().read_line(&mut String::new());
+        }
+        println!();
+    }
+}
+
+/// The accounts in `config` that sign in through the browser and have no
+/// sign-in in `store`.
+///
+/// An entry that cannot be made sense of is left out: building the account
+/// says what is wrong with it, and better than a failed sign-in would.  So is
+/// one whose sign-in cannot be looked up, for the same reason.
+fn accounts_without_sign_in(
+    config: &Config,
+    store: &oauth::TokenStore,
+) -> Vec<(usize, AccountConfig)> {
+    config
+        .accounts
+        .iter()
+        .flatten()
+        .enumerate()
+        .filter(|(index, entry)| {
+            if !entry.backend.eq_ignore_ascii_case("jmap")
+                || !matches!(auth_kind(entry, *index), Ok(AuthKind::OAuth))
+            {
+                return false;
+            }
+            // Looked up under the same endpoint the backend will use.
+            let Ok((endpoint, username)) = jmap_endpoint(&mut (*entry).clone(), *index) else {
+                return false;
+            };
+            matches!(store.find(&endpoint, &username), Ok(None))
+        })
+        .map(|(index, entry)| (index, entry.clone()))
+        .collect()
+}
+
+/// Run the browser sign-in for one account and keep the result in `store`.
+fn sign_in_with(mut config: AccountConfig, index: usize, store: &oauth::TokenStore) -> Result<()> {
     let scopes = config.scopes.clone();
     let (endpoint, username) = jmap_endpoint(&mut config, index)?;
-    let store = oauth::TokenStore::at_default_path()?;
 
     println!("Signing in to {endpoint} as {username}.");
     let signed_in = oauth::sign_in_blocking(&endpoint, &username, scopes.as_deref())?;
@@ -479,16 +546,20 @@ fn account_matches(config: &AccountConfig, name: &str) -> bool {
 fn account_names(candidates: &[(usize, AccountConfig)]) -> String {
     candidates
         .iter()
-        .map(|(index, entry)| {
-            entry
-                .name
-                .clone()
-                .or_else(|| entry.username.clone())
-                .or_else(|| entry.email.clone())
-                .unwrap_or_else(|| format!("accounts[{index}]"))
-        })
+        .map(|(index, entry)| account_label(entry, *index))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// How to refer to an account in a message: its name, or failing that its
+/// address, or failing both its place in the file.
+fn account_label(entry: &AccountConfig, index: usize) -> String {
+    entry
+        .name
+        .clone()
+        .or_else(|| entry.username.clone())
+        .or_else(|| entry.email.clone())
+        .unwrap_or_else(|| format!("accounts[{index}]"))
 }
 
 /// `.elmarc` in the home directory: `$HOME` on Unix, the user profile
@@ -513,7 +584,7 @@ struct Config {
     accounts: Option<Vec<AccountConfig>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct AccountConfig {
     name: Option<String>,
     /// Which backend serves the account.  `type` is accepted as well: both
@@ -802,6 +873,72 @@ mod tests {
         );
         assert!(account_matches(&entry, "rob@example.com"));
         assert!(!account_matches(&entry, "Private"));
+    }
+
+    /// Startup signs in to the accounts that sign in through the browser and
+    /// never have -- and to nothing else.
+    #[test]
+    fn only_browser_accounts_without_a_sign_in_are_signed_in_at_startup() {
+        let config: Config = toml::from_str(
+            r#"
+            [[accounts]]
+            name = "Fastmail"
+            backend = "jmap"
+            username = "rob@fastmail.com"
+
+            [[accounts]]
+            name = "Signed in"
+            backend = "jmap"
+            username = "rob@example.com"
+            url = "https://mail.example.com/jmap/session"
+
+            [[accounts]]
+            name = "Password"
+            backend = "jmap"
+            username = "rob@example.com"
+            password = "s3cret"
+            url = "https://other.example.com/jmap/session"
+
+            [[accounts]]
+            name = "Private"
+            backend = "gmail"
+            email = "rob@gmail.com"
+            password = "app-password"
+
+            [[accounts]]
+            name = "Broken"
+            backend = "jmap"
+            "#,
+        )
+        .expect("configuration should parse");
+
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let store = oauth::TokenStore::new(directory.path().join("oauth.toml"));
+        store
+            .save(&oauth::StoredCredential {
+                endpoint: "https://mail.example.com/jmap/session".to_string(),
+                username: "rob@example.com".to_string(),
+                issuer: "https://mail.example.com".to_string(),
+                client_id: "a-client".to_string(),
+                token_endpoint: "https://mail.example.com/oauth/token".to_string(),
+                resource: None,
+                access_token: "a-token".to_string(),
+                refresh_token: None,
+                expires_at: None,
+                scopes: Vec::new(),
+            })
+            .expect("the sign-in to be stored");
+
+        let names: Vec<_> = accounts_without_sign_in(&config, &store)
+            .iter()
+            .map(|(index, entry)| account_label(entry, *index))
+            .collect();
+        assert_eq!(
+            names,
+            ["Fastmail"],
+            "signed in already, a password, another backend, or no username: none of \
+             those is for the browser"
+        );
     }
 
     /// FastMail's JMAP API only accepts bearer tokens, so an account configured
