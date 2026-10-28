@@ -677,25 +677,25 @@ impl JmapInner {
             state.highest_received_index = 0;
             state.current_mailbox = Some(mailbox);
         }
-        let previous_highest = state.highest_received_index;
-        let mut remaining_ids = state.current_sequence.clone();
         let mailbox_cache = self.mailboxes.lock().await.clone();
         let mut added_ids = Vec::new();
         let mut updated_ids = Vec::new();
 
-        let mut new_stored = HashMap::new();
-
-        let page_len = emails.len();
-        let capacity = remaining_ids.len().max(page_len);
-        let mut new_sequence = Vec::with_capacity(capacity);
-        let mut page_ids = Vec::with_capacity(page_len);
+        // New to this listing, not merely new to the session: a message seen
+        // in another folder earlier still has to be announced when it turns up
+        // here, or it never reaches the list the user is looking at.
+        let listed: HashSet<MessageId> = state.current_sequence.iter().copied().collect();
+        let coverage = PageCoverage::of(&emails, start_position, has_more);
+        let page_end = start_position + emails.len();
+        let mut page = Vec::with_capacity(emails.len());
+        let mut page_ids = Vec::with_capacity(emails.len());
 
         for (index, data) in emails.into_iter().enumerate() {
-            let (message_id, uid, is_new) = state.ensure_ids(&data.jmap_id);
+            let (message_id, uid) = state.ensure_ids(&data.jmap_id);
             let seq = total.saturating_sub(start_position + index).max(1) as u32;
             let message = build_message(message_id, uid, seq, &data, &mailbox_cache, mailbox)?;
 
-            if is_new {
+            if !listed.contains(&message_id) {
                 added_ids.push(message_id);
             } else if let Some(previous) = state.messages.get(&message_id)
                 && flags_changed(&previous.message, &message)
@@ -703,26 +703,18 @@ impl JmapInner {
                 updated_ids.push(message_id);
             }
 
-            if let Some(pos) = remaining_ids.iter().position(|id| *id == message_id) {
-                remaining_ids.remove(pos);
-            }
-
-            new_sequence.push(message_id);
             page_ids.push(message_id);
-            new_stored.insert(
+            page.push((
                 message_id,
                 StoredMessage {
                     message,
                     jmap_id: data.jmap_id,
+                    received_at: data.received_at,
                 },
-            );
+            ));
         }
 
-        new_sequence.extend(remaining_ids);
-
-        let removed = state.update_current(mailbox, new_sequence, new_stored);
-        let new_highest = start_position + page_len;
-        state.highest_received_index = previous_highest.max(new_highest);
+        let removed = state.apply_page(page, &coverage, page_end);
         let more_available = has_more && state.highest_received_index < total;
         state.set_more_available(more_available);
 
@@ -1117,15 +1109,21 @@ impl JmapInner {
         }
     }
 
+    /// Tell the UI what a refresh found.
+    ///
+    /// Removals go first.  A new message carries the sequence number it has
+    /// once they are gone, and the UI files it under that number: announced
+    /// while a message that has left is still listed, it would land one row
+    /// off and overwrite the message it found there.
     fn emit_diff(&self, mailbox: MailboxKind, sync: MailboxSync) {
+        for id in sync.removed {
+            self.emit_event(mailbox, BackendEvent::MessageDeleted(id));
+        }
         for message in sync.added {
             self.emit_event(mailbox, BackendEvent::NewMessage(message));
         }
         for message in sync.updated {
             self.emit_event(mailbox, BackendEvent::MessageFlagsChanged(message));
-        }
-        for id in sync.removed {
-            self.emit_event(mailbox, BackendEvent::MessageDeleted(id));
         }
     }
 
@@ -1479,7 +1477,7 @@ impl JmapInner {
                 let mut state = self.state.lock().await;
                 let mut entries = Vec::new();
                 for (offset, data) in emails.into_iter().enumerate() {
-                    let (message_id, uid, _) = state.ensure_ids(&data.jmap_id);
+                    let (message_id, uid) = state.ensure_ids(&data.jmap_id);
                     if state.current_sequence.contains(&message_id) {
                         continue;
                     }
@@ -1490,6 +1488,7 @@ impl JmapInner {
                             StoredMessage {
                                 message,
                                 jmap_id: data.jmap_id,
+                                received_at: data.received_at,
                             },
                         )),
                         Err(err) => {
@@ -1885,7 +1884,7 @@ struct JmapState {
 }
 
 impl JmapState {
-    fn ensure_ids(&mut self, jmap_id: &str) -> (MessageId, u32, bool) {
+    fn ensure_ids(&mut self, jmap_id: &str) -> (MessageId, u32) {
         if let Some(id) = self.jmap_to_id.get(jmap_id).copied() {
             let uid = self
                 .messages
@@ -1895,46 +1894,62 @@ impl JmapState {
                     self.next_uid += 1;
                     self.next_uid - 1
                 });
-            (id, uid, false)
+            (id, uid)
         } else {
             self.next_message_id = self.next_message_id.saturating_add(1).max(1);
             let id = self.next_message_id;
             self.next_uid = self.next_uid.saturating_add(1).max(1);
             let uid = self.next_uid;
             self.jmap_to_id.insert(jmap_id.to_string(), id);
-            (id, uid, true)
+            (id, uid)
         }
     }
 
-    fn update_current(
+    /// Fold a fresh look at the top of the open mailbox into its listing, and
+    /// return the messages that look shows to have left.
+    ///
+    /// The page becomes the head of the listing.  A message listed before and
+    /// missing from the page has only gone if the page would have had to show
+    /// it (see [`PageCoverage`]); one further down may simply have slid past
+    /// the end of the page, and stays.  Those that went leave the listing but
+    /// not `messages`, so an action already queued against one still finds the
+    /// email it was meant for.
+    ///
+    /// `page_end` is where the page stops in the mailbox.  The backfill cursor
+    /// moves back a place for every message that left: each sat before it, so
+    /// everything the backfill has yet to read is now that many places nearer
+    /// the top, and a cursor left where it was would step over as many
+    /// messages as had gone.
+    fn apply_page(
         &mut self,
-        mailbox: MailboxKind,
-        new_sequence: Vec<MessageId>,
-        new_messages: HashMap<MessageId, StoredMessage>,
+        page: Vec<(MessageId, StoredMessage)>,
+        coverage: &PageCoverage,
+        page_end: usize,
     ) -> Vec<MessageId> {
+        let on_page: HashSet<MessageId> = page.iter().map(|(id, _)| *id).collect();
+        let mut sequence: Vec<MessageId> = page.iter().map(|(id, _)| *id).collect();
         let mut removed = Vec::new();
-        let new_set: HashSet<_> = new_sequence.iter().copied().collect();
-        for id in &self.current_sequence {
-            if !new_set.contains(id) {
-                removed.push(*id);
+
+        for id in std::mem::take(&mut self.current_sequence) {
+            if on_page.contains(&id) {
+                continue;
+            }
+            let received_at = self.messages.get(&id).and_then(|stored| stored.received_at);
+            if coverage.covers(received_at) {
+                removed.push(id);
+            } else {
+                sequence.push(id);
             }
         }
 
-        for id in &removed {
-            if let Some(stored) = self.messages.get_mut(id) {
-                stored.message.status = match mailbox {
-                    MailboxKind::Trash => MessageStatus::Deleted,
-                    MailboxKind::Spam => MessageStatus::Spam,
-                    _ => stored.message.status,
-                };
-            }
-        }
-
-        for (id, stored) in new_messages {
+        for (id, stored) in page {
             self.messages.insert(id, stored);
         }
-
-        self.current_sequence = new_sequence;
+        self.current_sequence = sequence;
+        self.highest_received_index = self
+            .highest_received_index
+            .saturating_sub(removed.len())
+            .max(page_end);
 
         removed
     }
@@ -1975,6 +1990,54 @@ impl JmapState {
 struct StoredMessage {
     message: Message,
     jmap_id: String,
+    /// The `receivedAt` the mailbox query sorts by, for telling whether a
+    /// later page would have had to show this message.
+    received_at: Option<i64>,
+}
+
+/// How much of the open mailbox one page of `Email/query` results vouches for.
+///
+/// The query sorts newest first by `receivedAt`, so a page that starts at the
+/// top holds every message that arrived after the oldest one on it.  A message
+/// listed earlier and missing from such a page has left the mailbox if it
+/// arrived after that oldest one -- or at any time at all, when the page runs
+/// to the end of the mailbox.  One that arrived at the very moment the oldest
+/// did may have been sorted just past the end of the page, so it gets the
+/// benefit of the doubt, as does one whose arrival time is not known.
+struct PageCoverage {
+    /// The page holds the whole mailbox.
+    complete: bool,
+    /// When the oldest message on the page arrived, for a page that starts at
+    /// the top of the mailbox.
+    oldest_received_at: Option<i64>,
+}
+
+impl PageCoverage {
+    fn of(emails: &[FetchedEmail], start_position: usize, has_more: bool) -> Self {
+        // A page from further down says nothing about what lies above it.
+        if start_position > 0 {
+            return Self {
+                complete: false,
+                oldest_received_at: None,
+            };
+        }
+        Self {
+            complete: !has_more,
+            oldest_received_at: emails.iter().filter_map(|email| email.received_at).min(),
+        }
+    }
+
+    /// Whether a message that arrived at `received_at` would be on the page if
+    /// it were still in the mailbox.
+    fn covers(&self, received_at: Option<i64>) -> bool {
+        if self.complete {
+            return true;
+        }
+        matches!(
+            (self.oldest_received_at, received_at),
+            (Some(oldest), Some(received)) if received > oldest
+        )
+    }
 }
 
 struct MailboxSync {
@@ -2985,5 +3048,164 @@ mod tests {
         assert!(!is_state_mismatch(&JmapError::from(
             jmap_client::Error::Server("503 Service Unavailable".to_string())
         )));
+    }
+
+    /// Message `id` as the mailbox query returns it, arriving at `received_at`.
+    fn fetched_at(id: MessageId, received_at: i64) -> FetchedEmail {
+        let mut data = email(&["mb-inbox"], &[]);
+        data.jmap_id = format!("M{id}");
+        data.received_at = Some(received_at);
+        data
+    }
+
+    /// Message `id`, arriving an hour before message `id - 1`: the lower the
+    /// id, the nearer the top of the mailbox.
+    fn fetched(id: MessageId) -> FetchedEmail {
+        fetched_at(id, 1_000_000 - id as i64 * 3600)
+    }
+
+    fn stored(id: MessageId, data: FetchedEmail) -> StoredMessage {
+        let message = build_message(
+            id,
+            id as u32,
+            1,
+            &data,
+            &standard_cache(),
+            MailboxKind::Inbox,
+        )
+        .expect("message builds");
+        StoredMessage {
+            message,
+            jmap_id: data.jmap_id,
+            received_at: data.received_at,
+        }
+    }
+
+    /// The Inbox listing `ids`, with the backfill having read `read` places.
+    fn listing(ids: &[MessageId], read: usize) -> JmapState {
+        let mut state = JmapState {
+            current_mailbox: Some(MailboxKind::Inbox),
+            highest_received_index: read,
+            ..JmapState::default()
+        };
+        for &id in ids {
+            state.messages.insert(id, stored(id, fetched(id)));
+            state.current_sequence.push(id);
+        }
+        state
+    }
+
+    /// The top of the mailbox as a refresh fetches it.
+    fn first_page(
+        emails: Vec<(MessageId, FetchedEmail)>,
+        has_more: bool,
+    ) -> (Vec<(MessageId, StoredMessage)>, PageCoverage) {
+        let (ids, emails): (Vec<MessageId>, Vec<FetchedEmail>) = emails.into_iter().unzip();
+        let coverage = PageCoverage::of(&emails, 0, has_more);
+        let page = ids
+            .into_iter()
+            .zip(emails)
+            .map(|(id, data)| (id, stored(id, data)))
+            .collect();
+        (page, coverage)
+    }
+
+    fn page_of(
+        ids: &[MessageId],
+        has_more: bool,
+    ) -> (Vec<(MessageId, StoredMessage)>, PageCoverage) {
+        first_page(ids.iter().map(|&id| (id, fetched(id))).collect(), has_more)
+    }
+
+    /// Before this, a refresh kept every message it had ever listed, so a
+    /// message moved or deleted elsewhere stayed on screen for good.
+    #[test]
+    fn a_message_missing_from_the_top_of_the_mailbox_has_left() {
+        let mut state = listing(&[1, 2, 3, 4, 5, 6], 6);
+        let (page, coverage) = page_of(&[1, 3, 4], true);
+
+        let removed = state.apply_page(page, &coverage, 3);
+
+        assert_eq!(removed, vec![2]);
+        assert_eq!(state.current_sequence, vec![1, 3, 4, 5, 6]);
+        // Gone from the listing, but an action queued against it before the
+        // refresh still has an email to aim at.
+        assert_eq!(
+            state.messages.get(&2).map(|stored| stored.jmap_id.as_str()),
+            Some("M2")
+        );
+    }
+
+    /// A message that is simply further down than the page reaches has not
+    /// gone anywhere -- including one a new arrival has just pushed off it.
+    #[test]
+    fn a_message_past_the_end_of_the_page_stays() {
+        let mut state = listing(&[1, 2, 3, 4, 5, 6], 6);
+        let newest = fetched_at(7, 2_000_000);
+        let (page, coverage) =
+            first_page(vec![(7, newest), (1, fetched(1)), (2, fetched(2))], true);
+
+        let removed = state.apply_page(page, &coverage, 3);
+
+        assert!(removed.is_empty(), "{removed:?}");
+        assert_eq!(state.current_sequence, vec![7, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(state.highest_received_index, 6);
+    }
+
+    /// A page that runs to the end of the mailbox leaves nowhere else for a
+    /// missing message to be, however long ago it arrived.
+    #[test]
+    fn a_page_that_reaches_the_end_vouches_for_the_whole_mailbox() {
+        let mut state = listing(&[1, 2, 3], 3);
+        let (page, coverage) = page_of(&[1, 2], false);
+
+        let removed = state.apply_page(page, &coverage, 2);
+
+        assert_eq!(removed, vec![3]);
+        assert_eq!(state.current_sequence, vec![1, 2]);
+    }
+
+    /// Messages that arrived in the same second sort in whatever order the
+    /// server picks, so one missing from the page may sit just past its end.
+    #[test]
+    fn a_message_tied_with_the_oldest_on_the_page_stays() {
+        let mut state = listing(&[1, 2, 3], 3);
+        let tied = fetched(2).received_at;
+        if let Some(stored) = state.messages.get_mut(&3) {
+            stored.received_at = tied;
+        }
+        let (page, coverage) = page_of(&[1, 2], true);
+
+        let removed = state.apply_page(page, &coverage, 2);
+
+        assert!(removed.is_empty(), "{removed:?}");
+        assert_eq!(state.current_sequence, vec![1, 2, 3]);
+    }
+
+    /// The backfill reads the mailbox by position.  Every message that leaves
+    /// from above its cursor moves the rest up a place, and a cursor that
+    /// stayed put would skip one message for each -- leaving it on screen as a
+    /// row that never finishes loading.
+    #[test]
+    fn the_backfill_resumes_where_the_unread_messages_now_start() {
+        // Ten messages; the first page and one backfill batch have read six.
+        let mut state = listing(&[1, 2, 3, 4, 5, 6], 6);
+        // Message 2 is archived, so 7 is now the sixth message in the mailbox.
+        let mailbox: Vec<MessageId> = (1..=10).filter(|id| *id != 2).collect();
+        let (page, coverage) = page_of(&[1, 3, 4], true);
+
+        state.apply_page(page, &coverage, 3);
+
+        assert_eq!(mailbox[state.next_cursor_index()], 7);
+    }
+
+    /// Only a page from the top of the mailbox says anything about what is
+    /// missing from it.
+    #[test]
+    fn a_page_from_further_down_vouches_for_nothing() {
+        let coverage = PageCoverage::of(&[fetched(5), fetched(6)], 4, false);
+
+        assert!(!coverage.covers(fetched(1).received_at));
+        assert!(!coverage.covers(fetched(9).received_at));
     }
 }
