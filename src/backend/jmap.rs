@@ -23,6 +23,7 @@ use jmap_client::{
     core::{
         error::MethodErrorType,
         response::{EmailSetResponse, EmailSubmissionSetResponse, TaggedMethodResponse},
+        session::Session,
         set::SetObject,
     },
     email::{self, Email as JmapEmail, EmailBodyPart, Property as EmailProperty},
@@ -401,6 +402,38 @@ fn connect_error(err: JmapError, auth: &JmapAuth, base_url: &str) -> anyhow::Err
     }
 }
 
+/// The account the session names as primary for mail.
+///
+/// A session names a primary account per capability, and they need not all be
+/// the same: FastMail's lists a second account next to the mail one, and the
+/// mail methods turn its ID down with `accountNotSupportedByMethod`.
+fn mail_account(session: &Session) -> Option<&str> {
+    session
+        .primary_accounts()
+        .find(|(capability, _)| capability.as_str() == URI::Mail.as_ref())
+        .map(|(_, account)| account.as_str())
+}
+
+/// Point the client's requests at the mail account.
+///
+/// Left to itself, `jmap-client` uses whichever primary account its hash map
+/// yields first -- and the map is seeded afresh in every process, so with more
+/// than one account on offer, where the mail methods went changed from one
+/// start to the next.  A session without a mail account keeps that default,
+/// for want of anything better.
+fn use_mail_account(client: &mut Client) {
+    let session = client.session();
+    match mail_account(&session) {
+        Some(account) => {
+            client.set_default_account_id(account);
+        }
+        None => debug_logging::log_session(format_args!(
+            "the session names no primary account for mail; using {}",
+            client.default_account_id()
+        )),
+    }
+}
+
 /// A session fetch the server refused, already worded for the user by
 /// [`connect_error`].
 ///
@@ -751,8 +784,12 @@ impl JmapInner {
             "Session/get",
             format_args!("url={} auth={auth}", debug_logging::redact_url(base_url)),
         );
+        let connected = builder.connect(base_url).await.map(|mut client| {
+            use_mail_account(&mut client);
+            client
+        });
         trace
-            .response(builder.connect(base_url).await, |client| {
+            .response(connected, |client| {
                 format!(
                     "account={} api={}",
                     client.default_account_id(),
@@ -2707,6 +2744,78 @@ mod tests {
         );
     }
 
+    /// The session object of a server at `base` whose mail lives in account
+    /// `u1` -- and which, like FastMail, names other primary accounts besides,
+    /// for capabilities that are not about mail.
+    fn fake_session(base: &str) -> serde_json::Value {
+        serde_json::json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:core": {
+                    "maxSizeUpload": 50_000_000,
+                    "maxConcurrentUpload": 4,
+                    "maxSizeRequest": 10_000_000,
+                    "maxConcurrentRequests": 4,
+                    "maxCallsInRequest": 16,
+                    "maxObjectsInGet": 500,
+                    "maxObjectsInSet": 500,
+                    "collationAlgorithms": []
+                },
+                "urn:ietf:params:jmap:mail": {},
+                "urn:ietf:params:jmap:submission": {},
+                "urn:ietf:params:jmap:contacts": {},
+                "urn:ietf:params:jmap:calendars": {},
+                "urn:ietf:params:jmap:principals": {}
+            },
+            "accounts": {
+                "u1": {
+                    "name": "rob@example.com",
+                    "isPersonal": true,
+                    "isReadOnly": false,
+                    "accountCapabilities": {}
+                },
+                "c1": {
+                    "name": "rob@example.com",
+                    "isPersonal": true,
+                    "isReadOnly": false,
+                    "accountCapabilities": {}
+                }
+            },
+            "primaryAccounts": {
+                "urn:ietf:params:jmap:contacts": "c1",
+                "urn:ietf:params:jmap:calendars": "c1",
+                "urn:ietf:params:jmap:principals": "c1",
+                "urn:ietf:params:jmap:mail": "u1",
+                "urn:ietf:params:jmap:submission": "u1"
+            },
+            "username": "rob@example.com",
+            "apiUrl": format!("{base}/api"),
+            "downloadUrl": format!("{base}/download/{{accountId}}/{{blobId}}/{{name}}?type={{type}}"),
+            "uploadUrl": format!("{base}/upload/{{accountId}}/"),
+            "eventSourceUrl": format!("{base}/events?types={{types}}&closeafter={{closeafter}}&ping={{ping}}"),
+            "state": "session-1"
+        })
+    }
+
+    /// Requests go to the mail account, not to whichever primary account the
+    /// session happens to list first.
+    #[test]
+    fn the_mail_account_is_the_one_requests_go_to() {
+        let session: Session = serde_json::from_value(fake_session("http://127.0.0.1"))
+            .expect("the session object to parse");
+        assert_eq!(mail_account(&session), Some("u1"));
+
+        let without_mail: Session = serde_json::from_value({
+            let mut session = fake_session("http://127.0.0.1");
+            session["primaryAccounts"]
+                .as_object_mut()
+                .expect("primary accounts")
+                .remove("urn:ietf:params:jmap:mail");
+            session
+        })
+        .expect("the session object to parse");
+        assert_eq!(mail_account(&without_mail), None);
+    }
+
     /// One request as [`fake_jmap_server`] saw it.
     #[derive(Debug)]
     struct SeenRequest {
@@ -2795,36 +2904,7 @@ mod tests {
                     sessions_refused += 1;
                     serde_json::Value::Null
                 } else if line.starts_with("GET /.well-known/jmap ") {
-                    serde_json::json!({
-                        "capabilities": {
-                            "urn:ietf:params:jmap:core": {
-                                "maxSizeUpload": 50_000_000,
-                                "maxConcurrentUpload": 4,
-                                "maxSizeRequest": 10_000_000,
-                                "maxConcurrentRequests": 4,
-                                "maxCallsInRequest": 16,
-                                "maxObjectsInGet": 500,
-                                "maxObjectsInSet": 500,
-                                "collationAlgorithms": []
-                            },
-                            "urn:ietf:params:jmap:mail": {}
-                        },
-                        "accounts": {
-                            "u1": {
-                                "name": "rob@example.com",
-                                "isPersonal": true,
-                                "isReadOnly": false,
-                                "accountCapabilities": {}
-                            }
-                        },
-                        "primaryAccounts": { "urn:ietf:params:jmap:mail": "u1" },
-                        "username": "rob@example.com",
-                        "apiUrl": format!("{base}/api"),
-                        "downloadUrl": format!("{base}/download/{{accountId}}/{{blobId}}/{{name}}?type={{type}}"),
-                        "uploadUrl": format!("{base}/upload/{{accountId}}/"),
-                        "eventSourceUrl": format!("{base}/events?types={{types}}&closeafter={{closeafter}}&ping={{ping}}"),
-                        "state": "session-1"
-                    })
+                    fake_session(&base)
                 } else if line.starts_with("POST /token ") {
                     tokens_issued += 1;
                     serde_json::json!({
@@ -2837,14 +2917,20 @@ mod tests {
                         .into_iter()
                         .find(|method| body.contains(method))
                         .unwrap_or_else(|| panic!("an unexpected request: {line} {body}"));
-                    serde_json::json!({
-                        "sessionState": "session-1",
-                        "methodResponses": [[method, {
+                    // Only the mail account holds mail, as on FastMail.
+                    let answer = if body.contains("\"accountId\":\"u1\"") {
+                        serde_json::json!([method, {
                             "accountId": "u1",
                             "state": "1",
                             "list": [],
                             "notFound": []
-                        }, "s0"]]
+                        }, "s0"])
+                    } else {
+                        serde_json::json!(["error", { "type": "accountNotSupportedByMethod" }, "s0"])
+                    };
+                    serde_json::json!({
+                        "sessionState": "session-1",
+                        "methodResponses": [answer]
                     })
                 }
                 .to_string();
