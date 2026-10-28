@@ -286,6 +286,7 @@ folder.</p>
                 },
             ],
             attachments: Vec::new(),
+            ..Default::default()
         },
     );
 
@@ -325,6 +326,7 @@ billed against is the one your auditors will ask for.</p>
                 blob_id: None,
                 inline: false,
             }],
+            ..Default::default()
         },
     );
 

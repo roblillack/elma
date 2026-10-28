@@ -138,6 +138,14 @@ pub struct MessageContent {
     pub mailer: String,
     pub parts: Vec<MessageContentPart>,
     pub attachments: Vec<MessageAttachment>,
+    /// Recipients as addresses, each written so it parses back as a single
+    /// mailbox: reopening a draft puts them straight into the compose fields.
+    ///
+    /// [`Message::recipients`] is for display and may hold nothing but a name;
+    /// these are what the message is actually addressed to.
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
 }
 
 impl MessageContent {

@@ -1322,9 +1322,30 @@ fn build_forward_document(original: &Document, message: &Message) -> Document {
     document
 }
 
+/// Split a recipient field at `,` and `;` -- but not inside a quoted name,
+/// where a comma is part of the name: `"Doe, John" <john@example.com>` is one
+/// recipient, and it is how a reopened draft writes him back.
 fn split_addresses(input: &str) -> Vec<String> {
-    input
-        .split([',', ';'])
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (idx, c) in input.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ',' | ';' if !quoted => {
+                parts.push(&input[start..idx]);
+                start = idx + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&input[start..]);
+
+    parts
+        .into_iter()
         .map(|part| part.trim())
         .filter(|part| !part.is_empty())
         .map(|part| part.to_string())
@@ -4603,11 +4624,21 @@ impl App {
     }
 
     fn show_draft_compose(&mut self, message: &Message, body: Document, loaded: LoadedMessage) {
+        // The recipients come from the draft itself, not from the list: the
+        // list has no Cc or Bcc, and may name people rather than addresses.
+        // Re-saving replaces the old draft, so whatever is left out here is
+        // gone for good.
+        let content = &loaded.content;
+        let to = if content.to.is_empty() {
+            &message.recipients
+        } else {
+            &content.to
+        };
         let mut compose = ComposeState::from_draft(
             message.id,
-            message.recipients.join(", "),
-            String::new(),
-            String::new(),
+            to.join(", "),
+            content.cc.join(", "),
+            content.bcc.join(", "),
             message.subject.clone(),
             body,
         );
@@ -7122,6 +7153,91 @@ mod tests {
         assert!(draft_status_line("Editing draft.", 3).contains("3 attachments"));
     }
 
+    /// A reopened draft is addressed from the draft itself: the list knows
+    /// nothing of Cc and Bcc, and re-saving deletes the old copy, so whatever
+    /// is not restored here is gone for good.
+    #[test]
+    fn reopening_a_draft_restores_to_cc_and_bcc() {
+        let mut message = make_message(1, MessageStatus::Read);
+        // What a Gmail envelope gives the list: a name, which will not send.
+        message.recipients = vec!["Doe, John".to_string()];
+        let mut app = test_app(vec![message.clone()]);
+
+        app.deliver_loaded_message(
+            message,
+            MessageLoadPurpose::Draft,
+            None,
+            LoadedMessage {
+                content: MessageContent {
+                    to: vec!["\"Doe, John\" <john@example.com>".to_string()],
+                    cc: vec!["ann@example.com".to_string(), "bob@example.com".to_string()],
+                    bcc: vec!["boss@example.com".to_string()],
+                    ..Default::default()
+                },
+                attachments: Vec::new(),
+                unavailable: 0,
+            },
+        );
+
+        let compose = app.compose.as_ref().expect("the draft opens in compose");
+        assert_eq!(
+            compose.field_data(ComposeField::To).0,
+            "\"Doe, John\" <john@example.com>"
+        );
+        assert_eq!(
+            compose.field_data(ComposeField::Cc).0,
+            "ann@example.com, bob@example.com"
+        );
+        assert_eq!(compose.field_data(ComposeField::Bcc).0, "boss@example.com");
+
+        // And saving it again writes back what was there.
+        let outgoing = compose.to_outgoing().expect("the draft serialises");
+        assert_eq!(outgoing.to, ["\"Doe, John\" <john@example.com>"]);
+        assert_eq!(outgoing.cc, ["ann@example.com", "bob@example.com"]);
+        assert_eq!(outgoing.bcc, ["boss@example.com"]);
+    }
+
+    #[test]
+    fn a_draft_that_names_no_recipients_falls_back_to_the_list() {
+        let mut message = make_message(1, MessageStatus::Read);
+        message.recipients = vec!["anna@example.com".to_string()];
+        let mut app = test_app(vec![message.clone()]);
+
+        app.deliver_loaded_message(
+            message,
+            MessageLoadPurpose::Draft,
+            None,
+            LoadedMessage {
+                content: MessageContent::default(),
+                attachments: Vec::new(),
+                unavailable: 0,
+            },
+        );
+
+        let compose = app.compose.as_ref().expect("the draft opens in compose");
+        assert_eq!(compose.field_data(ComposeField::To).0, "anna@example.com");
+        assert_eq!(compose.field_data(ComposeField::Cc).0, "");
+        assert_eq!(compose.field_data(ComposeField::Bcc).0, "");
+    }
+
+    #[test]
+    fn a_comma_in_a_quoted_name_does_not_split_the_recipient() {
+        assert_eq!(
+            split_addresses(
+                r#""Doe, John" <john@example.com>, ann@example.com; "A \"B; C\"" <bc@example.com>"#
+            ),
+            [
+                r#""Doe, John" <john@example.com>"#,
+                "ann@example.com",
+                r#""A \"B; C\"" <bc@example.com>"#,
+            ]
+        );
+        assert_eq!(
+            split_addresses(" a@example.com ;b@example.com,, "),
+            ["a@example.com", "b@example.com"]
+        );
+    }
+
     // -- Paste routing --------------------------------------------------------
 
     #[test]
@@ -7545,6 +7661,7 @@ mod tests {
                 Some(b"%PDF-1.7"),
                 None,
             )],
+            ..Default::default()
         };
 
         let (restored, unavailable) = restore_compose_attachments(app.backend.as_ref(), &content);
@@ -7566,6 +7683,7 @@ mod tests {
                 // No filename: the name has to come from the content type.
                 attachment(None, "image/png", None, Some("b2")),
             ],
+            ..Default::default()
         };
 
         let (restored, unavailable) = restore_compose_attachments(app.backend.as_ref(), &content);
@@ -7589,6 +7707,7 @@ mod tests {
                 // Neither bytes nor a blob to fetch.
                 attachment(Some("gone.txt"), "text/plain", None, None),
             ],
+            ..Default::default()
         };
 
         let (restored, unavailable) = restore_compose_attachments(app.backend.as_ref(), &content);
@@ -7613,6 +7732,7 @@ mod tests {
                 inline_attachment("signature-logo.png", b"PNG"),
                 attachment(Some("report.pdf"), "application/pdf", Some(b"%PDF"), None),
             ],
+            ..Default::default()
         };
 
         let (restored, unavailable) = restore_compose_attachments(app.backend.as_ref(), &content);
@@ -7633,6 +7753,7 @@ mod tests {
                 mailer: String::new(),
                 parts: vec![],
                 attachments: vec![inline_attachment("signature-logo.png", b"PNG")],
+                ..Default::default()
             },
         );
 
@@ -7662,6 +7783,7 @@ mod tests {
                     mailer: String::new(),
                     parts: vec![],
                     attachments: vec![inline_attachment("signature-logo.png", b"PNG")],
+                    ..Default::default()
                 },
                 attachments: Vec::new(),
                 unavailable: 0,
@@ -7695,6 +7817,7 @@ mod tests {
                     Some(b"%PDF-1.7"),
                     None,
                 )],
+                ..Default::default()
             },
             document: None,
             raw_html: None,
@@ -7797,6 +7920,7 @@ mod tests {
                     content: b"loaded body".to_vec(),
                 }],
                 attachments: vec![],
+                ..Default::default()
             })
         }
 

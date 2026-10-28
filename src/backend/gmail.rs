@@ -7,7 +7,8 @@
 use crate::{
     backend::{
         ActionStatus, BackendEvent, FAILURES_BEFORE_REPORT, LeafPart, MailBackend, MailboxSnapshot,
-        OutgoingMessage, PartRole, build_compose_body, mailer_header, retry_backoff,
+        OutgoingMessage, PartRole, build_compose_body, compose_address, mailer_header,
+        retry_backoff,
     },
     model::{
         Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
@@ -29,7 +30,7 @@ use lettre::{
     Message as LettreEmail, SmtpTransport, Transport, message::Mailbox as LettreMailbox,
     transport::smtp::authentication::Credentials,
 };
-use mailparse::{self, DispositionType, MailHeaderMap, ParsedMail};
+use mailparse::{self, DispositionType, MailAddr, MailHeaderMap, ParsedMail};
 use rustls_platform_verifier::ConfigVerifierExt;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -1550,7 +1551,7 @@ impl GmailInner {
 
     async fn send_via_smtp(self: Arc<Self>, outgoing: OutgoingMessage) -> Result<()> {
         let email = self
-            .build_compose_email(outgoing)
+            .build_compose_email(outgoing, false)
             .context("building SMTP message")?;
         let account = self.email.clone();
         let password = self.password.clone();
@@ -1574,7 +1575,7 @@ impl GmailInner {
 
     async fn save_draft(self: Arc<Self>, outgoing: OutgoingMessage) -> Result<()> {
         let email = self
-            .build_compose_email(outgoing)
+            .build_compose_email(outgoing, true)
             .context("building draft message")?;
         let raw = email.formatted();
 
@@ -1588,7 +1589,16 @@ impl GmailInner {
         Ok(())
     }
 
-    fn build_compose_email(&self, outgoing: OutgoingMessage) -> Result<LettreEmail> {
+    /// Build the message to send or, with `keep_bcc`, the draft to store.
+    ///
+    /// lettre leaves the `Bcc` header out by default, which is right for a
+    /// message on its way out and wrong for a draft: the stored draft is the
+    /// only record of who it was going to be blind-copied to.
+    fn build_compose_email(
+        &self,
+        outgoing: OutgoingMessage,
+        keep_bcc: bool,
+    ) -> Result<LettreEmail> {
         let OutgoingMessage {
             to,
             cc,
@@ -1631,6 +1641,10 @@ impl GmailInner {
                 .parse()
                 .with_context(|| format!("invalid Bcc address: {addr}"))?;
             builder = builder.bcc(mailbox);
+        }
+
+        if keep_bcc {
+            builder = builder.keep_bcc();
         }
 
         builder = builder.subject(subject);
@@ -2645,7 +2659,42 @@ fn build_message_content(mail: &ParsedMail<'_>) -> Result<MessageContent> {
         mailer,
         parts,
         attachments,
+        to: header_addresses(mail, "To"),
+        cc: header_addresses(mail, "Cc"),
+        bcc: header_addresses(mail, "Bcc"),
     })
+}
+
+/// The addresses in a message's `field` headers, written for the compose
+/// fields.
+///
+/// The envelope the message list is built from names people rather than
+/// addresses, so a reopened draft cannot be addressed from it.  Groups are
+/// opened up into their members; a header that will not parse is kept as
+/// written, for the user to correct rather than to lose.
+fn header_addresses(mail: &ParsedMail<'_>, field: &str) -> Vec<String> {
+    let mut addresses = Vec::new();
+    for header in mail.headers.get_all_headers(field) {
+        let Ok(list) = mailparse::addrparse_header(header) else {
+            let raw = header.get_value();
+            if !raw.trim().is_empty() {
+                addresses.push(raw.trim().to_string());
+            }
+            continue;
+        };
+        for addr in list.iter() {
+            let members = match addr {
+                MailAddr::Single(single) => std::slice::from_ref(single),
+                MailAddr::Group(group) => &group.addrs[..],
+            };
+            addresses.extend(
+                members
+                    .iter()
+                    .map(|member| compose_address(member.display_name.as_deref(), &member.addr)),
+            );
+        }
+    }
+    addresses
 }
 
 fn collect_parts(
@@ -3232,6 +3281,70 @@ mod tests {
             content.attachments[0].filename.as_deref(),
             Some("report.csv")
         );
+    }
+
+    /// The envelope the list is built from names people, not addresses; a
+    /// reopened draft has to be addressed from the headers themselves.
+    #[test]
+    fn a_message_reads_its_recipients_from_the_headers() {
+        let raw = concat!(
+            "To: =?UTF-8?Q?J=C3=B6rg?= <joerg@example.com>, \"Doe, John\" <john@example.com>\r\n",
+            "Cc: team: ann@example.com, Bob <bob@example.com>;\r\n",
+            "Bcc: boss@example.com\r\n",
+            "Content-Type: text/plain\r\n",
+            "\r\n",
+            "hello\r\n",
+        );
+        let parsed = mailparse::parse_mail(raw.as_bytes()).expect("parsing the fixture");
+        let content = build_message_content(&parsed).expect("building content");
+
+        assert_eq!(
+            content.to,
+            [
+                "Jörg <joerg@example.com>",
+                "\"Doe, John\" <john@example.com>"
+            ]
+        );
+        assert_eq!(content.cc, ["ann@example.com", "Bob <bob@example.com>"]);
+        assert_eq!(content.bcc, ["boss@example.com"]);
+    }
+
+    fn outgoing_with_bcc() -> OutgoingMessage {
+        OutgoingMessage {
+            to: vec!["\"Doe, John\" <john@example.com>".to_string()],
+            cc: vec!["ann@example.com".to_string()],
+            bcc: vec!["boss@example.com".to_string()],
+            subject: "Lunch".to_string(),
+            text_body: "Thursday?".to_string(),
+            html_body: "<p>Thursday?</p>".to_string(),
+            attachments: Vec::new(),
+        }
+    }
+
+    /// A saved draft has to come back with every recipient it went in with,
+    /// Bcc included -- while what is sent must still not show its Bcc.
+    #[test]
+    fn a_saved_draft_keeps_its_bcc_and_a_sent_message_does_not() {
+        let backend = GmailBackend::new("rob@example.com", "unused").expect("backend builds");
+
+        let draft = backend
+            .inner
+            .build_compose_email(outgoing_with_bcc(), true)
+            .expect("the draft builds")
+            .formatted();
+        let parsed = mailparse::parse_mail(&draft).expect("parsing the draft");
+        let content = build_message_content(&parsed).expect("building content");
+        assert_eq!(content.to, ["\"Doe, John\" <john@example.com>"]);
+        assert_eq!(content.cc, ["ann@example.com"]);
+        assert_eq!(content.bcc, ["boss@example.com"]);
+
+        let sent = backend
+            .inner
+            .build_compose_email(outgoing_with_bcc(), false)
+            .expect("the message builds")
+            .formatted();
+        let parsed = mailparse::parse_mail(&sent).expect("parsing the message");
+        assert!(parsed.headers.get_first_header("Bcc").is_none());
     }
 
     fn populate_state(count: u32) -> SharedState {

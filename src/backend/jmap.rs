@@ -8,7 +8,8 @@
 use crate::{
     backend::{
         ActionStatus, BackendEvent, FAILURES_BEFORE_REPORT, LeafPart, MailBackend, MailboxSnapshot,
-        OutgoingMessage, PartRole, build_compose_body, mailer_header, retry_backoff,
+        OutgoingMessage, PartRole, build_compose_body, compose_address, mailer_header,
+        retry_backoff,
     },
     model::{
         Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
@@ -791,6 +792,9 @@ impl JmapInner {
             EmailProperty::HtmlBody,
             EmailProperty::Attachments,
             EmailProperty::HasAttachment,
+            EmailProperty::To,
+            EmailProperty::Cc,
+            EmailProperty::Bcc,
             EmailProperty::Header(email::Header::as_text("X-Mailer", false)),
         ]);
         {
@@ -862,7 +866,7 @@ impl JmapInner {
 
     async fn send_message(self: Arc<Self>, outgoing: OutgoingMessage) -> Result<()> {
         let email = self
-            .build_compose_email(outgoing)
+            .build_compose_email(outgoing, false)
             .context("building outgoing message")?;
         let raw = email.formatted();
 
@@ -1009,7 +1013,7 @@ impl JmapInner {
             .ok_or_else(|| anyhow!("Drafts mailbox not available on account"))?;
 
         let email = self
-            .build_compose_email(outgoing)
+            .build_compose_email(outgoing, true)
             .context("building draft message")?;
         let raw = email.formatted();
 
@@ -1702,7 +1706,15 @@ impl JmapInner {
         }
     }
 
-    fn build_compose_email(&self, outgoing: OutgoingMessage) -> Result<LettreEmail> {
+    /// Build the message to submit or, with `keep_bcc`, the draft to store.
+    ///
+    /// lettre leaves the `Bcc` header out by default; a draft has to keep it,
+    /// being the only record of who it was going to be blind-copied to.
+    fn build_compose_email(
+        &self,
+        outgoing: OutgoingMessage,
+        keep_bcc: bool,
+    ) -> Result<LettreEmail> {
         let OutgoingMessage {
             to,
             cc,
@@ -1748,6 +1760,10 @@ impl JmapInner {
                 .parse()
                 .with_context(|| format!("invalid Bcc address: {addr}"))?;
             builder = builder.bcc(mailbox);
+        }
+
+        if keep_bcc {
+            builder = builder.keep_bcc();
         }
 
         builder = builder.subject(subject);
@@ -2295,7 +2311,20 @@ fn build_message_content(email: &JmapEmail) -> Result<MessageContent> {
         mailer,
         parts,
         attachments,
+        to: compose_addresses(email.to()),
+        cc: compose_addresses(email.cc()),
+        bcc: compose_addresses(email.bcc()),
     })
+}
+
+/// Recipients as the compose fields take them, quoted where the name needs it
+/// -- unlike [`format_address`], which writes them for display.
+fn compose_addresses(addresses: Option<&[email::EmailAddress]>) -> Vec<String> {
+    addresses
+        .unwrap_or_default()
+        .iter()
+        .map(|addr| compose_address(addr.name(), addr.email()))
+        .collect()
 }
 
 /// What a JMAP body part is, by the rule every backend shares.
@@ -2687,6 +2716,30 @@ mod tests {
                 again.labels
             );
         }
+    }
+
+    /// A reopened draft is addressed from these, so a name with a comma in it
+    /// has to come out quoted: unquoted, it would split into two recipients.
+    #[test]
+    fn a_loaded_message_carries_its_recipients_as_addresses() {
+        let email: JmapEmail = serde_json::from_value(serde_json::json!({
+            "id": "M1",
+            "to": [
+                {"name": "Doe, John", "email": "john@example.com"},
+                {"name": null, "email": "ann@example.com"},
+            ],
+            "cc": [{"name": "Bob", "email": "bob@example.com"}],
+            "bcc": [{"name": "", "email": "boss@example.com"}],
+        }))
+        .expect("parsing the canned email");
+
+        let content = build_message_content(&email).expect("content builds");
+        assert_eq!(
+            content.to,
+            ["\"Doe, John\" <john@example.com>", "ann@example.com"]
+        );
+        assert_eq!(content.cc, ["Bob <bob@example.com>"]);
+        assert_eq!(content.bcc, ["boss@example.com"]);
     }
 
     #[test]
