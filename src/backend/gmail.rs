@@ -2291,26 +2291,29 @@ impl GmailInner {
 
     async fn apply_action_internal(&self, action: &Action) -> Result<()> {
         let id = action.message_id;
-        let command = {
-            let labels = self.labels.lock().await;
-            ActionCommand::for_action(action.action_type, &labels)
-        };
-
         let (folder, uid) =
             message_location(id).ok_or_else(|| anyhow!("message {id} names no folder"))?;
+        let commands = {
+            let labels = self.labels.lock().await;
+            ActionCommand::for_action(action.action_type, folder, &labels)
+        };
+
         let open = *self.current_mailbox.lock().await;
         if folder != open {
-            return self.apply_in_folder(folder, open, uid, &command).await;
+            return self.apply_in_folder(folder, open, uid, &commands).await;
         }
 
-        match command {
-            ActionCommand::Move(target) => self.move_message(id, &target).await,
-            ActionCommand::Flags(query) => self.update_flags(id, query).await,
-            ActionCommand::Labels(query) => self.update_gmail_labels(id, query).await,
+        for command in commands {
+            match command {
+                ActionCommand::Move(target) => self.move_message(id, &target).await?,
+                ActionCommand::Flags(query) => self.update_flags(id, query).await?,
+                ActionCommand::Labels(query) => self.update_gmail_labels(id, query).await?,
+            }
         }
+        Ok(())
     }
 
-    /// Run `command` on `uid` in `folder`, which is not the folder the session
+    /// Run `commands` on `uid` in `folder`, which is not the folder the session
     /// has open.
     ///
     /// The UI goes on committing a batch after the user has moved to another
@@ -2324,7 +2327,7 @@ impl GmailInner {
         folder: MailboxKind,
         open: MailboxKind,
         uid: u32,
-        command: &ActionCommand,
+        commands: &[ActionCommand],
     ) -> Result<()> {
         let folder_name = self.mailbox_name(folder).await?;
         let open_name = self.mailbox_name(open).await?;
@@ -2338,15 +2341,18 @@ impl GmailInner {
                 .select(&folder_name)
                 .await
                 .with_context(|| format!("selecting mailbox {folder_name}"))?;
-            match command {
-                ActionCommand::Move(target) => session.uid_mv(uid.to_string(), target).await,
-                ActionCommand::Flags(query) | ActionCommand::Labels(query) => {
-                    session
-                        .run_command_and_check_ok(format!("UID STORE {uid} {query}"))
-                        .await
+            for command in commands {
+                match command {
+                    ActionCommand::Move(target) => session.uid_mv(uid.to_string(), target).await,
+                    ActionCommand::Flags(query) | ActionCommand::Labels(query) => {
+                        session
+                            .run_command_and_check_ok(format!("UID STORE {uid} {query}"))
+                            .await
+                    }
                 }
+                .with_context(|| format!("applying the action in {folder_name}"))?;
             }
-            .with_context(|| format!("applying the action in {folder_name}"))
+            Ok(())
         }
         .await;
 
@@ -2676,20 +2682,42 @@ enum ActionCommand {
 }
 
 impl ActionCommand {
-    fn for_action(action_type: ActionType, labels: &SpecialMailboxes) -> Self {
+    /// The commands behind an action on a message listed in `folder`, in the
+    /// order they have to run.
+    fn for_action(
+        action_type: ActionType,
+        folder: MailboxKind,
+        labels: &SpecialMailboxes,
+    ) -> Vec<Self> {
         match action_type {
-            ActionType::Archive => Self::Move(labels.archive.clone()),
-            ActionType::Delete => Self::Move(labels.trash.clone()),
-            ActionType::MoveToSpam => Self::Move(labels.spam.clone()),
-            ActionType::MoveToInboxUnread => Self::Flags("-FLAGS.SILENT (\\Seen)"),
-            ActionType::MoveToInboxRead | ActionType::MarkAsRead => {
-                Self::Flags("+FLAGS.SILENT (\\Seen)")
-            }
-            ActionType::MarkAsStarred => Self::Flags("+FLAGS.SILENT (\\Flagged)"),
-            ActionType::MarkAsUnstarred => Self::Flags("-FLAGS.SILENT (\\Flagged)"),
-            ActionType::MarkAsImportant => Self::Labels("+X-GM-LABELS (\\Important)"),
-            ActionType::MarkAsUnimportant => Self::Labels("-X-GM-LABELS (\\Important)"),
+            ActionType::Archive => vec![Self::Move(labels.archive.clone())],
+            ActionType::Delete => vec![Self::Move(labels.trash.clone())],
+            ActionType::MoveToSpam => vec![Self::Move(labels.spam.clone())],
+            ActionType::MoveToInboxUnread => Self::restore("-FLAGS.SILENT (\\Seen)", folder),
+            ActionType::MoveToInboxRead => Self::restore("+FLAGS.SILENT (\\Seen)", folder),
+            ActionType::MarkAsRead => vec![Self::Flags("+FLAGS.SILENT (\\Seen)")],
+            ActionType::MarkAsUnread => vec![Self::Flags("-FLAGS.SILENT (\\Seen)")],
+            ActionType::MarkAsStarred => vec![Self::Flags("+FLAGS.SILENT (\\Flagged)")],
+            ActionType::MarkAsUnstarred => vec![Self::Flags("-FLAGS.SILENT (\\Flagged)")],
+            ActionType::MarkAsImportant => vec![Self::Labels("+X-GM-LABELS (\\Important)")],
+            ActionType::MarkAsUnimportant => vec![Self::Labels("-X-GM-LABELS (\\Important)")],
         }
+    }
+
+    /// Bring a message listed in `folder` back to the Inbox, setting `\Seen`
+    /// as `seen` says.
+    ///
+    /// Out of Trash and Spam the message has to move.  Everywhere else it is
+    /// still in All Mail, and the Inbox is just a label to add back: moving it
+    /// would expunge it from the folder, and expunging from All Mail is how
+    /// Gmail sends a message to the Trash.  The flag goes first, since once
+    /// the message has moved its UID in `folder` no longer names it.
+    fn restore(seen: &'static str, folder: MailboxKind) -> Vec<Self> {
+        let back = match folder {
+            MailboxKind::Trash | MailboxKind::Spam => Self::Move("INBOX".to_string()),
+            _ => Self::Labels("+X-GM-LABELS (\\Inbox)"),
+        };
+        vec![Self::Flags(seen), back]
     }
 }
 
@@ -4047,6 +4075,48 @@ mod tests {
             .unwrap();
         assert!(highest < u64::MAX - u64::from(u32::MAX));
         assert_eq!(message_location(u64::MAX - 1), None);
+    }
+
+    /// Restoring is decided by the folder the message was listed in, which
+    /// the id carries -- not by whichever folder is open when the action runs.
+    #[test]
+    fn a_restore_moves_out_of_trash_and_spam_and_relabels_elsewhere() {
+        let labels = SpecialMailboxes::default();
+
+        for folder in [MailboxKind::Trash, MailboxKind::Spam] {
+            let steps = ActionCommand::for_action(ActionType::MoveToInboxUnread, folder, &labels);
+            assert!(
+                matches!(
+                    steps.as_slice(),
+                    [
+                        ActionCommand::Flags("-FLAGS.SILENT (\\Seen)"),
+                        ActionCommand::Move(target),
+                    ] if target == "INBOX"
+                ),
+                "out of {folder}: flag first, then move"
+            );
+        }
+
+        for folder in [MailboxKind::Archive, MailboxKind::Starred] {
+            let steps = ActionCommand::for_action(ActionType::MoveToInboxRead, folder, &labels);
+            assert!(
+                matches!(
+                    steps.as_slice(),
+                    [
+                        ActionCommand::Flags("+FLAGS.SILENT (\\Seen)"),
+                        ActionCommand::Labels("+X-GM-LABELS (\\Inbox)"),
+                    ]
+                ),
+                "from {folder}: the Inbox label goes back on, nothing is expunged"
+            );
+        }
+
+        // Marking unread is a flag and nothing more, wherever the message is.
+        let steps = ActionCommand::for_action(ActionType::MarkAsUnread, MailboxKind::Sent, &labels);
+        assert!(matches!(
+            steps.as_slice(),
+            [ActionCommand::Flags("-FLAGS.SILENT (\\Seen)")]
+        ));
     }
 
     #[test]

@@ -193,6 +193,7 @@ pub enum ActionType {
     MarkAsUnstarred,
     MarkAsImportant,
     MarkAsRead,
+    MarkAsUnread,
     MarkAsUnimportant,
     MoveToSpam,
 }

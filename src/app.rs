@@ -2493,11 +2493,8 @@ impl App {
                                 ActionType::MarkAsRead => {
                                     msg.status = MessageStatus::New;
                                 }
-                                ActionType::MoveToInboxUnread => {
+                                ActionType::MarkAsUnread => {
                                     msg.status = MessageStatus::Read;
-                                }
-                                ActionType::MoveToInboxRead => {
-                                    msg.status = MessageStatus::New;
                                 }
                                 _ => {}
                             }
@@ -4968,10 +4965,11 @@ impl App {
                     MessageStatus::New
                 };
                 msg.status = new_status;
+                // Only the flag: the message stays in whatever folder it is in.
                 let action_type = if new_status == MessageStatus::New {
-                    ActionType::MoveToInboxUnread
+                    ActionType::MarkAsUnread
                 } else {
-                    ActionType::MoveToInboxRead
+                    ActionType::MarkAsRead
                 };
                 let message_id = msg.id;
                 let action = Action::new(action_type, message_id);
@@ -6496,6 +6494,65 @@ mod tests {
             let outcome = app.schedule_action(ActionType::Delete, 1, MessageStatus::Deleted);
             assert_eq!(outcome, ScheduleOutcome::AlreadyScheduled);
             assert_eq!(app.scheduled_actions.len(), 1);
+        }
+    }
+
+    // -- Read/unread toggle ---------------------------------------------------
+
+    /// The actions `backend` has been handed so far, oldest first.
+    fn submitted(backend: &DeferredBackend) -> Vec<ActionType> {
+        backend
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(actions, _)| actions.iter().map(|action| action.action_type))
+            .collect()
+    }
+
+    /// `u` flips the flag and nothing else.  It used to send the restore
+    /// actions, which on a backend that honours them pulled the message into
+    /// the Inbox from whatever folder it was read in.
+    #[test]
+    fn toggling_unread_only_changes_the_flag() {
+        let backend = Arc::new(DeferredBackend::new());
+        let mut app = test_app_with_backend(
+            vec![make_message(1, MessageStatus::Read)],
+            Arc::clone(&backend) as Arc<dyn MailBackend>,
+        );
+
+        app.toggle_unread();
+        assert_eq!(app.mailbox.messages[0].status, MessageStatus::New);
+        app.toggle_unread();
+        assert_eq!(app.mailbox.messages[0].status, MessageStatus::Read);
+
+        assert_eq!(
+            submitted(&backend),
+            vec![ActionType::MarkAsUnread, ActionType::MarkAsRead]
+        );
+        assert!(app.scheduled_actions.is_empty());
+    }
+
+    #[test]
+    fn a_failed_unread_toggle_puts_the_flag_back() {
+        for (before, after) in [
+            (MessageStatus::Read, MessageStatus::New),
+            (MessageStatus::New, MessageStatus::Read),
+        ] {
+            let backend = Arc::new(DeferredBackend::new());
+            let mut app = test_app_with_backend(
+                vec![make_message(1, before)],
+                Arc::clone(&backend) as Arc<dyn MailBackend>,
+            );
+
+            app.toggle_unread();
+            assert_eq!(app.mailbox.messages[0].status, after);
+
+            backend.complete_with_failures(&[1].into_iter().collect());
+            app.poll_commit_updates();
+
+            assert_eq!(app.mailbox.messages.len(), 1, "the message stays listed");
+            assert_eq!(app.mailbox.messages[0].status, before);
         }
     }
 
