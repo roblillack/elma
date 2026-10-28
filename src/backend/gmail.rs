@@ -656,8 +656,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// behind the session, for good.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 /// The slowest a message body may download, or a draft upload, before it
-/// counts as stalled: 256 kbit/s.  See [`transfer_timeout`].
-const MIN_TRANSFER_RATE: usize = 32 * 1024;
+/// counts as stalled: 8 kbit/s.  See [`transfer_timeout`].
+const MIN_TRANSFER_RATE: usize = 1 * 1024;
 /// How long [`GmailInner::pause_idle`] waits for the IDLE task to hand the
 /// session back before giving up on it.
 const IDLE_STOP_TIMEOUT: Duration = Duration::from_secs(30);
