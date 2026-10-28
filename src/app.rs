@@ -119,6 +119,27 @@ fn last_loaded_index(messages: &[Message]) -> Option<usize> {
         .find_map(|(idx, msg)| (!msg.is_placeholder()).then_some(idx))
 }
 
+/// Take the backend's latest word on a message the list already shows.
+///
+/// Two things stay as the list has them: a status the user scheduled locally
+/// (Deleted, Archived, …), which the backend does not know about yet, and the
+/// row's position, which is the list's to number.
+fn merge_backend_update(existing: &mut Message, update: Message) {
+    let local_status = existing.status;
+    let local_seq = existing.seq;
+    *existing = update;
+    existing.seq = local_seq;
+    match local_status {
+        MessageStatus::Deleted
+        | MessageStatus::Archived
+        | MessageStatus::PendingInbox
+        | MessageStatus::Spam => {
+            existing.status = local_status;
+        }
+        _ => {}
+    }
+}
+
 fn resequence_messages(messages: &mut [Message]) {
     for (index, message) in messages.iter_mut().enumerate() {
         let new_seq = index as u32 + 1;
@@ -2165,8 +2186,27 @@ impl App {
                     } else {
                         message.seq.saturating_sub(1) as usize
                     };
-                    ensure_placeholder_capacity(&mut mailbox.messages, index + 1);
-                    mailbox.messages[index] = message;
+                    if let Some(existing) =
+                        mailbox.messages.iter_mut().find(|msg| msg.id == message.id)
+                    {
+                        // Announced again: one row per message.
+                        merge_backend_update(existing, message);
+                    } else if mailbox
+                        .messages
+                        .get(index)
+                        .is_some_and(|msg| !msg.is_placeholder())
+                    {
+                        // The backend's numbering no longer matches the list --
+                        // a commit renumbered it locally, or the backend missed
+                        // a removal.  Writing into the slot would make the
+                        // message shown there vanish, so the newcomer goes to
+                        // the end, where new mail belongs.
+                        mailbox.messages.push(message);
+                        resequence_messages(&mut mailbox.messages);
+                    } else {
+                        ensure_placeholder_capacity(&mut mailbox.messages, index + 1);
+                        mailbox.messages[index] = message;
+                    }
                     if mailbox.selected.is_none() {
                         mailbox.selected = last_loaded_index(&mailbox.messages);
                     }
@@ -2177,19 +2217,7 @@ impl App {
                     if let Some(existing) =
                         mailbox.messages.iter_mut().find(|msg| msg.id == message.id)
                     {
-                        // Preserve locally-scheduled status (e.g. Deleted, Archived)
-                        // that the backend doesn't know about.
-                        let local_status = existing.status;
-                        *existing = message;
-                        match local_status {
-                            MessageStatus::Deleted
-                            | MessageStatus::Archived
-                            | MessageStatus::PendingInbox
-                            | MessageStatus::Spam => {
-                                existing.status = local_status;
-                            }
-                            _ => {}
-                        }
+                        merge_backend_update(existing, message);
                         mailbox.event_count += 1;
                         refresh = true;
                     }
@@ -6287,6 +6315,70 @@ mod tests {
             app.mailbox.status_line.as_deref(),
             Some("Deleted 1 message.")
         );
+    }
+
+    // -- New mail never replaces a message on screen ---------------------------
+
+    fn listed_ids(app: &App) -> Vec<MessageId> {
+        app.mailbox.messages.iter().map(|msg| msg.id).collect()
+    }
+
+    /// A commit renumbers the list locally, and a backend that missed a
+    /// removal counts differently, so the position a new message claims can
+    /// belong to a message the user is looking at.
+    #[test]
+    fn new_mail_claiming_an_occupied_row_is_added_rather_than_written_over_it() {
+        let mut app = test_app(vec![
+            make_message(1, MessageStatus::Read),
+            make_message(2, MessageStatus::Read),
+            make_message(3, MessageStatus::Read),
+        ]);
+        let events = subscribe(&mut app);
+
+        let mut arriving = make_message(9, MessageStatus::New);
+        arriving.seq = 2;
+        events.send(BackendEvent::NewMessage(arriving)).unwrap();
+        app.poll_backend_events();
+
+        assert_eq!(listed_ids(&app), vec![1, 2, 3, 9]);
+        let seqs: Vec<u32> = app.mailbox.messages.iter().map(|msg| msg.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_message_announced_twice_keeps_a_single_row() {
+        let mut app = test_app(vec![
+            make_message(1, MessageStatus::Read),
+            make_message(2, MessageStatus::Read),
+            make_message(3, MessageStatus::Read),
+        ]);
+        let events = subscribe(&mut app);
+
+        let mut again = make_message(2, MessageStatus::Read);
+        again.seq = 3;
+        again.starred = true;
+        events.send(BackendEvent::NewMessage(again)).unwrap();
+        app.poll_backend_events();
+
+        assert_eq!(listed_ids(&app), vec![1, 2, 3]);
+        assert!(app.mailbox.messages[1].starred, "the update still lands");
+        assert_eq!(app.mailbox.messages[1].seq, 2);
+    }
+
+    #[test]
+    fn backfill_still_fills_in_placeholders() {
+        let mut app = test_app(vec![
+            placeholder_message(1),
+            make_message(2, MessageStatus::Read),
+        ]);
+        let events = subscribe(&mut app);
+
+        let mut older = make_message(7, MessageStatus::Read);
+        older.seq = 1;
+        events.send(BackendEvent::NewMessage(older)).unwrap();
+        app.poll_backend_events();
+
+        assert_eq!(listed_ids(&app), vec![7, 2]);
     }
 
     // -- schedule_action basics -----------------------------------------------
