@@ -2107,7 +2107,7 @@ impl App {
         let message_id = view.message_id;
         view.message.status = MessageStatus::Read;
 
-        if let Some(slot) = self.selected_loaded_message_mut() {
+        if let Some(slot) = self.target_message_mut() {
             slot.status = MessageStatus::Read;
         }
 
@@ -2668,6 +2668,30 @@ impl App {
             .messages
             .get_mut(idx)
             .filter(|msg| !msg.is_placeholder())
+    }
+
+    /// The message a key acts on: the one in the viewer while it is open,
+    /// otherwise the one selected in the list.
+    ///
+    /// The two are not always the same.  Opening a message only moves the
+    /// viewer once its body has arrived, and the selection is free to move in
+    /// the meantime -- `j`/`k` move it before the next body is even fetched.
+    fn target_message(&self) -> Option<&Message> {
+        match self.message_view.as_ref() {
+            Some(view) => self
+                .mailbox
+                .messages
+                .iter()
+                .find(|msg| msg.id == view.message_id),
+            None => self.selected_loaded_message(),
+        }
+    }
+
+    fn target_message_mut(&mut self) -> Option<&mut Message> {
+        match self.message_view.as_ref().map(|view| view.message_id) {
+            Some(id) => self.mailbox.messages.iter_mut().find(|msg| msg.id == id),
+            None => self.selected_loaded_message_mut(),
+        }
     }
 
     pub(crate) fn inbox_action_bar(&self) -> String {
@@ -3618,9 +3642,10 @@ impl App {
         }
     }
 
-    /// Start loading the selected message so compose can be seeded from it.
+    /// Start loading the message on screen -- the selected one, outside the
+    /// viewer -- so compose can be seeded from it.
     fn begin_compose_from_selected(&mut self, purpose: MessageLoadPurpose) {
-        let Some(message) = self.selected_loaded_message().cloned() else {
+        let Some(message) = self.target_message().cloned() else {
             self.mailbox
                 .status_line
                 .get_or_insert_with(|| "Message is still loading.".to_string());
@@ -4726,11 +4751,11 @@ impl App {
     }
 
     fn toggle_star(&mut self) {
-        if self.mailbox.selected.is_none() {
+        if self.message_view.is_none() && self.mailbox.selected.is_none() {
             return;
         }
 
-        let Some(msg) = self.selected_loaded_message_mut() else {
+        let Some(msg) = self.target_message_mut() else {
             self.mailbox
                 .status_line
                 .get_or_insert_with(|| "Message is still loading.".to_string());
@@ -4754,11 +4779,11 @@ impl App {
     }
 
     fn mark_selected_important(&mut self, important: bool) {
-        if self.mailbox.selected.is_none() {
+        if self.message_view.is_none() && self.mailbox.selected.is_none() {
             return;
         }
 
-        let Some(msg) = self.selected_loaded_message_mut() else {
+        let Some(msg) = self.target_message_mut() else {
             self.mailbox
                 .status_line
                 .get_or_insert_with(|| "Message is still loading.".to_string());
@@ -5295,6 +5320,19 @@ impl App {
         // Defocus search when opening a message so mailbox keys work on return.
         if let Some(search) = self.search.as_mut() {
             search.focused = false;
+        }
+
+        // The selection may have moved on while the body loaded; bring it back
+        // to the message the viewer is about to show, so the two agree.
+        let visible_idx = match &self.search {
+            Some(search) => search
+                .filtered_indices
+                .iter()
+                .position(|&idx| idx == real_idx),
+            None => Some(real_idx),
+        };
+        if visible_idx.is_some() {
+            self.mailbox.selected = visible_idx;
         }
 
         self.message_view = Some(MessageViewState {
@@ -8631,5 +8669,92 @@ mod tests {
         // The removal is still applied, just on the next poll.
         app.poll_backend_events();
         assert_eq!(app.mailbox.messages.len(), 1);
+    }
+
+    // -- The viewer acts on the message it shows -------------------------------
+
+    /// The ids of the actions handed to the backend, in submission order.
+    fn submitted_ids(backend: &DeferredBackend) -> Vec<MessageId> {
+        backend
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(actions, _)| actions.iter().map(|action| action.message_id))
+            .collect()
+    }
+
+    /// `j`/`k` move the list selection before the next body has arrived, so
+    /// for that long the viewer shows one message and the list another.  A key
+    /// pressed in the viewer belongs to the one on screen.
+    #[test]
+    fn keys_in_the_viewer_act_on_the_message_it_shows() {
+        let backend = Arc::new(DeferredBackend::new());
+        let mut app = test_app_with_backend(
+            vec![
+                make_message(1, MessageStatus::Read),
+                make_message(2, MessageStatus::Read),
+            ],
+            Arc::clone(&backend) as Arc<dyn MailBackend>,
+        );
+        app.show_loaded_message(1, MessageContent::default());
+        app.mailbox.selected = Some(1);
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('s'))).unwrap();
+        app.handle_key(KeyEvent::from(KeyCode::Char('+'))).unwrap();
+
+        assert!(app.mailbox.messages[0].starred && app.mailbox.messages[0].important);
+        assert!(!app.mailbox.messages[1].starred && !app.mailbox.messages[1].important);
+        assert_eq!(submitted_ids(&backend), vec![1, 1]);
+    }
+
+    #[test]
+    fn replying_from_the_viewer_answers_the_message_it_shows() {
+        let mut app = test_app(vec![
+            make_message(1, MessageStatus::Read),
+            make_message(2, MessageStatus::Read),
+        ]);
+        app.show_loaded_message(1, MessageContent::default());
+        app.mailbox.selected = Some(1);
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('r'))).unwrap();
+
+        let compose = app.compose.as_ref().expect("the reply opens compose");
+        assert_eq!(compose.field_data(ComposeField::To).0, "sender-1");
+    }
+
+    #[test]
+    fn the_read_timer_marks_the_message_it_was_started_for() {
+        let backend = Arc::new(DeferredBackend::new());
+        let mut app = test_app_with_backend(
+            vec![
+                make_message(1, MessageStatus::New),
+                make_message(2, MessageStatus::New),
+            ],
+            Arc::clone(&backend) as Arc<dyn MailBackend>,
+        );
+        app.show_loaded_message(1, MessageContent::default());
+        app.mailbox.selected = Some(1);
+        app.message_view.as_mut().unwrap().read_at = Some(Instant::now());
+
+        app.poll_backend_events();
+
+        assert_eq!(app.mailbox.messages[0].status, MessageStatus::Read);
+        assert_eq!(app.mailbox.messages[1].status, MessageStatus::New);
+        assert_eq!(submitted_ids(&backend), vec![1]);
+    }
+
+    #[test]
+    fn the_selection_follows_the_message_the_viewer_shows() {
+        let mut app = test_app(vec![
+            make_message(1, MessageStatus::Read),
+            make_message(2, MessageStatus::Read),
+        ]);
+        // Enter on the first message, then a step down while it loads.
+        app.mailbox.selected = Some(1);
+
+        app.show_loaded_message(1, MessageContent::default());
+
+        assert_eq!(app.mailbox.selected, Some(0));
     }
 }
