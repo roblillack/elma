@@ -151,7 +151,8 @@ fn load_accounts(demo_mode: bool, config: Option<Config>) -> Result<Vec<AccountD
         }
         None => {
             eprintln!(
-                "No configuration file found; using demo backend (use --demo to hide this message)."
+                "No configuration file at {}; using demo backend (use --demo to hide this message).",
+                config_path_display()
             );
             Ok(vec![AccountDescriptor::new(
                 "Demo",
@@ -490,8 +491,10 @@ fn account_names(candidates: &[(usize, AccountConfig)]) -> String {
         .join(", ")
 }
 
+/// `.elmarc` in the home directory: `$HOME` on Unix, the user profile
+/// (`%USERPROFILE%`) on Windows, where `HOME` is usually not set at all.
 fn config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".elmarc"))
+    std::env::home_dir().map(|home| home.join(".elmarc"))
 }
 
 /// Where the configuration would be, for an error message about what is in it.

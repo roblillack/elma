@@ -31,8 +31,9 @@ setting up an email account:
 cargo run -- --demo
 ```
 
-Without that flag the application loads accounts from `~/.elmarc`. Multiple
-accounts are supported via the `[[accounts]]` table:
+Without that flag the application loads accounts from `~/.elmarc` -- on
+Windows, `%USERPROFILE%\.elmarc`. Multiple accounts are supported via the
+`[[accounts]]` table:
 
 ```toml
 [[accounts]]

@@ -5624,8 +5624,7 @@ fn default_download_dir() -> PathBuf {
             return path;
         }
     }
-    if let Some(home) = env::var_os("HOME") {
-        let mut path = PathBuf::from(home);
+    if let Some(mut path) = env::home_dir() {
         path.push("Downloads");
         return path;
     }
@@ -5861,17 +5860,16 @@ fn expand_user_path(raw: &str) -> PathBuf {
     };
 
     if let Some(rest) = normalised.strip_prefix("~/")
-        && let Some(home) = env::var_os("HOME")
+        && let Some(mut home) = env::home_dir()
     {
-        let mut buf = PathBuf::from(home);
-        buf.push(rest);
-        return buf;
+        home.push(rest);
+        return home;
     }
 
     if normalised == "~"
-        && let Some(home) = env::var_os("HOME")
+        && let Some(home) = env::home_dir()
     {
-        return PathBuf::from(home);
+        return home;
     }
 
     PathBuf::from(normalised)
@@ -6993,14 +6991,14 @@ mod tests {
 
     #[test]
     fn expand_user_path_unescapes_before_expanding_tilde() {
-        let Some(home) = env::var_os("HOME") else {
+        let Some(home) = env::home_dir() else {
             return;
         };
         // Escapes have to be stripped first, or the file name keeps the
         // backslash and the read fails.
         assert_eq!(
             expand_user_path("~/My\\ File.pdf"),
-            PathBuf::from(home).join("My File.pdf")
+            home.join("My File.pdf")
         );
     }
 

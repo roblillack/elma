@@ -172,11 +172,10 @@ impl TokenStore {
     /// `~/.elma/oauth.toml`, kept out of `~/.elmarc` so the configuration file
     /// stays something one can paste into a bug report.
     pub fn at_default_path() -> Result<Self> {
-        let home = std::env::var_os("HOME")
-            .ok_or_else(|| anyhow!("HOME is not set, so there is nowhere to keep the sign-in"))?;
-        Ok(Self::new(
-            PathBuf::from(home).join(".elma").join("oauth.toml"),
-        ))
+        let home = std::env::home_dir().ok_or_else(|| {
+            anyhow!("there is no home directory, so there is nowhere to keep the sign-in")
+        })?;
+        Ok(Self::new(home.join(".elma").join("oauth.toml")))
     }
 
     pub fn path(&self) -> &Path {
