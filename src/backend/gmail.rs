@@ -21,7 +21,7 @@ use async_imap::{
     types::{Flag, UnsolicitedResponse},
 };
 use futures::TryStreamExt;
-use imap_proto::types::{
+use imap_proto::{
     AttributeValue, BodyContentCommon, BodyContentSinglePart, BodyParams, BodyStructure,
     MailboxDatum, NameAttribute, Response, Status,
 };
@@ -2717,7 +2717,7 @@ fn collect_parts(
     Ok(())
 }
 
-fn parse_envelope_date(envelope: &imap_proto::types::Envelope<'_>) -> Option<OffsetDateTime> {
+fn parse_envelope_date(envelope: &imap_proto::Envelope<'_>) -> Option<OffsetDateTime> {
     envelope.date.as_ref().and_then(|raw| {
         let text = str::from_utf8(raw.as_ref()).ok()?;
         let ts = mailparse::dateparse(text).ok()?;
@@ -2813,7 +2813,7 @@ fn decode_header(value: Option<&std::borrow::Cow<'_, [u8]>>, field_name: &str) -
     }
 }
 
-fn extract_sender(envelope: &imap_proto::types::Envelope<'_>) -> String {
+fn extract_sender(envelope: &imap_proto::Envelope<'_>) -> String {
     envelope
         .from
         .as_ref()
@@ -2822,7 +2822,7 @@ fn extract_sender(envelope: &imap_proto::types::Envelope<'_>) -> String {
         .unwrap_or_else(|| "Unknown sender".to_string())
 }
 
-fn extract_recipients(envelope: &imap_proto::types::Envelope<'_>) -> Vec<String> {
+fn extract_recipients(envelope: &imap_proto::Envelope<'_>) -> Vec<String> {
     envelope
         .to
         .as_ref()
@@ -2835,10 +2835,7 @@ fn extract_recipients(envelope: &imap_proto::types::Envelope<'_>) -> Vec<String>
         .unwrap_or_default()
 }
 
-fn decode_envelope_address(
-    address: &imap_proto::types::Address<'_>,
-    field_name: &str,
-) -> Option<String> {
+fn decode_envelope_address(address: &imap_proto::Address<'_>, field_name: &str) -> Option<String> {
     if let Some(name) = &address.name {
         let decoded = decode_header(Some(name), field_name);
         if !decoded.is_empty() {
@@ -2935,7 +2932,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use imap_proto::types::{ContentDisposition, ContentEncoding, ContentType};
+    use imap_proto::{ContentDisposition, ContentEncoding, ContentType};
     use std::borrow::Cow;
 
     /// Nothing else in the suite opens a TLS connection, so a dependency that
@@ -3689,8 +3686,7 @@ mod tests {
 
     /// Parse one untagged FETCH line the way the session loop sees it.
     fn fetch_line(line: &[u8]) -> (u32, Vec<AttributeValue<'_>>) {
-        let (rest, response) =
-            imap_proto::parser::parse_response(line).expect("the fixture has to parse");
+        let (rest, response) = Response::parse(line).expect("the fixture has to parse");
         assert!(rest.is_empty(), "the whole line has to be consumed");
         match response {
             Response::Fetch(seq, attrs) => (seq, attrs),
