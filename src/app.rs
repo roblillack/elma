@@ -1668,8 +1668,10 @@ impl App {
 
     /// Entry point for keyboard handling used by the main event loop.
     ///
-    /// The method polls backend state before dispatching so the UI reacts to new
-    /// messages even while the user is idle.
+    /// Deliberately does not poll the backend first.  The main loop polls right
+    /// before every frame, so the key acts on exactly the list the user saw
+    /// when they pressed it; polling here would let a batch of headers or a
+    /// removed message shift the selection between that frame and the key.
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         // Windows reports releasing a key as an event of its own, which would
         // otherwise act on every keystroke a second time.
@@ -1688,8 +1690,6 @@ impl App {
             }
             return Ok(());
         }
-
-        self.poll_backend_events();
 
         if self.process_pending_navigation(key)? {
             return Ok(());
@@ -8538,5 +8538,41 @@ mod tests {
         ctrl_q(&mut app);
 
         assert!(app.should_quit());
+    }
+
+    /// The main loop polls the backend right before each frame.  Anything
+    /// arriving after that waits for the next frame, rather than changing what
+    /// the key the user is pressing applies to.
+    #[test]
+    fn a_key_acts_on_the_list_as_it_was_drawn() {
+        let backend = Arc::new(DeferredBackend::new());
+        let mut app = test_app_with_backend(
+            vec![
+                make_message(1, MessageStatus::Read),
+                make_message(2, MessageStatus::Read),
+            ],
+            Arc::clone(&backend) as Arc<dyn MailBackend>,
+        );
+        let events = subscribe(&mut app);
+        events.send(BackendEvent::MessageDeleted(1)).unwrap();
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('s'))).unwrap();
+
+        let starred: Vec<MessageId> = backend
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(actions, _)| actions.iter().map(|action| action.message_id))
+            .collect();
+        assert_eq!(
+            starred,
+            vec![1],
+            "the star belongs to the message on screen"
+        );
+
+        // The removal is still applied, just on the next poll.
+        app.poll_backend_events();
+        assert_eq!(app.mailbox.messages.len(), 1);
     }
 }
