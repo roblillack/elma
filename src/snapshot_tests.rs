@@ -256,6 +256,21 @@ fn compose_blank() {
     assert_svg("compose_blank", &mut app);
 }
 
+/// Esc on a message with something in it asks before throwing it away, and the
+/// question sits where compose shows its status.
+#[test]
+fn compose_asks_before_discarding() {
+    let mut app = inbox();
+    app.char('c');
+    app.type_text("ada@example.com");
+
+    app.key(KeyCode::Esc);
+    assert_on_screen(&app, "Discard this message? (y/n)");
+
+    app.char('n');
+    assert_on_screen(&app, "ada@example.com");
+}
+
 /// A reply quotes the message and fills in recipient and subject.
 #[test]
 fn compose_reply() {

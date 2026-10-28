@@ -465,6 +465,21 @@ pub struct App {
     /// frame has to be painted in full rather than diffed against a screen that
     /// no longer holds what the renderer last drew.
     needs_full_redraw: bool,
+    /// A yes/no question the next key answers, asked before something the
+    /// user wrote or asked for would be thrown away.
+    confirmation: Option<PendingConfirmation>,
+}
+
+/// What a `y` to the pending question goes ahead with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Confirmation {
+    DiscardCompose,
+    Quit,
+}
+
+struct PendingConfirmation {
+    kind: Confirmation,
+    question: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -820,6 +835,18 @@ impl ComposeState {
 
     pub(crate) fn is_editing_draft(&self) -> bool {
         self.draft_id.is_some()
+    }
+
+    /// Whether closing compose now would throw away anything: a field, the
+    /// body or an attachment.  A blank message closes without asking.
+    fn has_content(&self) -> bool {
+        [&self.to, &self.cc, &self.bcc, &self.subject]
+            .iter()
+            .any(|field| !field.value.trim().is_empty())
+            || !self.attachments.is_empty()
+            || self
+                .body_markdown()
+                .map_or(true, |body| !body.trim().is_empty())
     }
 
     pub(crate) fn field_data(&self, field: ComposeField) -> (&str, usize) {
@@ -1566,6 +1593,7 @@ impl App {
             save_attachment: None,
             outgoing: None,
             needs_full_redraw: false,
+            confirmation: None,
         };
 
         for index in 0..app.accounts.len() {
@@ -1625,6 +1653,18 @@ impl App {
         // Windows reports releasing a key as an event of its own, which would
         // otherwise act on every keystroke a second time.
         if key.kind == KeyEventKind::Release {
+            return Ok(());
+        }
+
+        // A pending question takes the key, whatever view is up: `y` goes
+        // ahead, anything else backs out.
+        if let Some(pending) = self.confirmation.take() {
+            if matches!(key.code, KeyCode::Char('y' | 'Y')) {
+                match pending.kind {
+                    Confirmation::DiscardCompose => self.cancel_compose(),
+                    Confirmation::Quit => self.should_quit = true,
+                }
+            }
             return Ok(());
         }
 
@@ -2886,7 +2926,7 @@ impl App {
     fn handle_search_key(&mut self, key: KeyEvent) -> Result<()> {
         // Allow Ctrl+Q even in search mode.
         if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.should_quit = true;
+            self.request_quit();
             return Ok(());
         }
 
@@ -2951,7 +2991,7 @@ impl App {
 
     fn handle_mailbox_key(&mut self, key: KeyEvent) -> Result<()> {
         if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.should_quit = true;
+            self.request_quit();
             return Ok(());
         }
 
@@ -3660,7 +3700,7 @@ impl App {
 
     fn handle_compose_key(&mut self, key: KeyEvent) -> Result<()> {
         if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.should_quit = true;
+            self.request_quit();
             return Ok(());
         }
 
@@ -3686,7 +3726,7 @@ impl App {
 
         match key.code {
             KeyCode::Esc => {
-                self.cancel_compose();
+                self.request_cancel_compose();
                 return Ok(());
             }
             KeyCode::Tab => {
@@ -3860,7 +3900,7 @@ impl App {
                 Ok(())
             }
             ComposeButton::Cancel => {
-                self.cancel_compose();
+                self.request_cancel_compose();
                 Ok(())
             }
             ComposeButton::Edit => self.edit_compose_body(),
@@ -4313,6 +4353,89 @@ impl App {
         self.needs_full_redraw = true;
 
         status
+    }
+
+    /// Close compose, asking first if that would throw away anything written.
+    fn request_cancel_compose(&mut self) {
+        let Some(compose) = self.compose.as_ref() else {
+            return;
+        };
+        if !compose.has_content() {
+            self.cancel_compose();
+            return;
+        }
+        let question = if compose.is_editing_draft() {
+            "Discard your changes to this draft? (y/n)"
+        } else {
+            "Discard this message? (y/n)"
+        };
+        self.confirmation = Some(PendingConfirmation {
+            kind: Confirmation::DiscardCompose,
+            question: question.to_string(),
+        });
+    }
+
+    /// Quit, asking first if that would throw something away.
+    fn request_quit(&mut self) {
+        match self.quit_question() {
+            Some(question) => {
+                self.confirmation = Some(PendingConfirmation {
+                    kind: Confirmation::Quit,
+                    question,
+                });
+            }
+            None => self.should_quit = true,
+        }
+    }
+
+    /// What to ask before quitting, if quitting now would lose anything.
+    ///
+    /// Quitting ends the process, worker threads included: a send in flight
+    /// may or may not reach the server, and anything not yet handed to the
+    /// backend is simply gone.
+    fn quit_question(&self) -> Option<String> {
+        if let Some(op) = self.outgoing.as_ref() {
+            let what = match op.kind {
+                OutgoingKind::Send => "The message is still being sent",
+                OutgoingKind::Draft => "The draft is still being saved",
+            };
+            return Some(format!("{what}. Quit anyway? (y/n)"));
+        }
+        if self
+            .compose
+            .as_ref()
+            .is_some_and(|compose| compose.has_content())
+        {
+            return Some("Quit and discard the message you are writing? (y/n)".to_string());
+        }
+        if self
+            .accounts
+            .iter()
+            .any(|account| !account.commit_batches.is_empty())
+        {
+            return Some("Changes are still being applied. Quit anyway? (y/n)".to_string());
+        }
+        let scheduled: usize = self
+            .accounts
+            .iter()
+            .map(|account| account.scheduled_actions.len())
+            .sum();
+        if scheduled > 0 {
+            return Some(format!(
+                "Quit without applying {scheduled} scheduled action(s)? (y/n)"
+            ));
+        }
+        None
+    }
+
+    /// The question waiting for a yes or no, if there is one.
+    ///
+    /// Shown in place of whatever status the current view would otherwise
+    /// carry, since the next key answers it.
+    pub(crate) fn confirmation_prompt(&self) -> Option<&str> {
+        self.confirmation
+            .as_ref()
+            .map(|pending| pending.question.as_str())
     }
 
     fn cancel_compose(&mut self) {
@@ -5960,6 +6083,7 @@ mod tests {
             save_attachment: None,
             outgoing: None,
             needs_full_redraw: false,
+            confirmation: None,
         }
     }
 
@@ -8193,5 +8317,102 @@ mod tests {
             "the overlay has to carry the backend's reason, got {reason:?}"
         );
         assert!(!app.loaded, "a failed load must not count as loaded");
+    }
+
+    // -- Asking before throwing work away ---------------------------------------
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key(KeyEvent::from(code)).unwrap();
+    }
+
+    fn ctrl_q(app: &mut App) {
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL))
+            .unwrap();
+    }
+
+    #[test]
+    fn esc_asks_before_discarding_a_message() {
+        let mut app = test_app(vec![]);
+        app.open_compose();
+        app.compose
+            .as_mut()
+            .unwrap()
+            .set_field_text(ComposeField::To, "ada@example.com");
+
+        press(&mut app, KeyCode::Esc);
+        assert!(app.compose.is_some(), "one key must not lose the message");
+        assert_eq!(
+            app.confirmation_prompt(),
+            Some("Discard this message? (y/n)")
+        );
+
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.compose.is_some());
+        assert_eq!(app.confirmation_prompt(), None);
+
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.compose.is_none());
+    }
+
+    #[test]
+    fn a_blank_message_closes_without_asking() {
+        let mut app = test_app(vec![]);
+        app.open_compose();
+
+        press(&mut app, KeyCode::Esc);
+
+        assert!(app.compose.is_none());
+        assert_eq!(app.confirmation_prompt(), None);
+    }
+
+    #[test]
+    fn quitting_asks_while_a_message_is_being_sent() {
+        let mut app = test_app(vec![]);
+        app.open_compose();
+        let (_sender, receiver) = mpsc::channel();
+        app.outgoing = Some(OutgoingOperation {
+            kind: OutgoingKind::Send,
+            draft_id: None,
+            receiver,
+            started: Instant::now(),
+        });
+
+        ctrl_q(&mut app);
+        assert!(!app.should_quit());
+        assert_eq!(
+            app.confirmation_prompt(),
+            Some("The message is still being sent. Quit anyway? (y/n)")
+        );
+
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn quitting_asks_before_dropping_scheduled_actions() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        press(&mut app, KeyCode::Char('d'));
+
+        ctrl_q(&mut app);
+        assert!(!app.should_quit());
+        assert_eq!(
+            app.confirmation_prompt(),
+            Some("Quit without applying 1 scheduled action(s)? (y/n)")
+        );
+
+        // Anything but `y` backs out, and is not taken as a command as well.
+        press(&mut app, KeyCode::Char('$'));
+        assert!(!app.should_quit());
+        assert_eq!(app.scheduled_actions.len(), 1);
+    }
+
+    #[test]
+    fn quitting_with_nothing_to_lose_does_not_ask() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+
+        ctrl_q(&mut app);
+
+        assert!(app.should_quit());
     }
 }
