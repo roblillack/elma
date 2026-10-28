@@ -2057,6 +2057,11 @@ impl App {
             }
         };
 
+        // Read before the list shifts: with a search open, the selection is a
+        // position among the matches and is rebuilt around this id below.
+        let selected_id = self.selected_message_id();
+        let searching = self.search.is_some();
+
         let removed_id;
         {
             let mailbox = self.mailbox_mut();
@@ -2064,7 +2069,7 @@ impl App {
             removed_id = removed.id;
             resequence_messages(&mut mailbox.messages);
 
-            if let Some(selected) = mailbox.selected {
+            if !searching && let Some(selected) = mailbox.selected {
                 if mailbox.messages.is_empty() {
                     mailbox.selected = None;
                 } else if selected >= mailbox.messages.len() {
@@ -2085,8 +2090,8 @@ impl App {
             self.set_message_view(None);
         }
 
-        if self.search.is_some() {
-            self.recompute_search_filter();
+        if searching {
+            self.refilter_keeping(selected_id);
         }
         self.normalize_scroll();
         true
@@ -2346,7 +2351,11 @@ impl App {
                     };
                 }
 
-                if let Some(last_loaded) = last_loaded_index(&self.mailbox.messages) {
+                // A search opened while the list fills in keeps its own
+                // selection; the filter below is rebuilt around it.
+                if self.search.is_none()
+                    && let Some(last_loaded) = last_loaded_index(&self.mailbox.messages)
+                {
                     self.mailbox.selected = Some(last_loaded);
                     self.normalize_scroll();
                 }
@@ -2381,11 +2390,14 @@ impl App {
                         self.current_mailbox
                     ))
                 });
-                if let Some(last_loaded) = last_loaded_index(&self.mailbox.messages) {
-                    self.mailbox.selected = Some(last_loaded);
-                    self.normalize_scroll();
-                } else if total > 0 {
-                    self.mailbox.selected = Some(total - 1);
+                // Same as for a batch: an open search keeps its selection.
+                if self.search.is_none() {
+                    if let Some(last_loaded) = last_loaded_index(&self.mailbox.messages) {
+                        self.mailbox.selected = Some(last_loaded);
+                        self.normalize_scroll();
+                    } else if total > 0 {
+                        self.mailbox.selected = Some(total - 1);
+                    }
                 }
             }
             MailboxLoadUpdate::Failed(message) => {
@@ -2615,15 +2627,32 @@ impl App {
             .map(|s| (s.input.value.as_str(), s.input.cursor, s.focused))
     }
 
+    /// The id of the selected message, read through the search filter.
+    ///
+    /// Only meaningful while the filter still matches the message list, so
+    /// anything that is about to reshuffle the list asks before it does.
+    fn selected_message_id(&self) -> Option<MessageId> {
+        self.real_selected_index()
+            .and_then(|idx| self.mailbox.messages.get(idx))
+            .map(|msg| msg.id)
+    }
+
     fn recompute_search_filter(&mut self) {
+        let keep = self.selected_message_id();
+        self.refilter_keeping(keep);
+    }
+
+    /// Rebuild the search filter and select `keep` among the matches.
+    ///
+    /// With a search open, `selected` counts matches rather than messages.
+    /// Once the list has changed underneath the filter, the old position no
+    /// longer says which message it was, so callers that reshuffle the list
+    /// pass the id they read before they did.
+    fn refilter_keeping(&mut self, keep: Option<MessageId>) {
         if self.search.is_none() {
             return;
         }
-        // Remember which real message is currently selected.
-        let previously_selected_id = self
-            .real_selected_index()
-            .and_then(|idx| self.mailbox.messages.get(idx))
-            .map(|msg| msg.id);
+        let previously_selected_id = keep;
         let prev_selected = self.mailbox.selected.unwrap_or(0);
 
         let query = self.search.as_ref().unwrap().input.value.clone();
@@ -5183,10 +5212,7 @@ impl App {
         // Remember which message the cursor is on so we can restore it.
         // Use real_selected_index() to map through filtered indices when
         // search is active.
-        let selected_id = self
-            .real_selected_index()
-            .and_then(|idx| self.mailbox.messages.get(idx))
-            .map(|msg| msg.id);
+        let selected_id = self.selected_message_id();
 
         let mut removed = Vec::new();
         let mut kept = Vec::new();
@@ -5210,6 +5236,12 @@ impl App {
         if self.mailbox.messages.is_empty() {
             self.mailbox.selected = None;
             self.message_view = None;
+            self.refilter_keeping(None);
+        } else if self.search.is_some() {
+            // The old filtered indices are stale now; rebuild them around the
+            // message the cursor was on.  If that one was removed, the cursor
+            // keeps its position among the matches, clamped.
+            self.refilter_keeping(selected_id);
         } else if let Some(id) = selected_id {
             if let Some((new_idx, _)) = self
                 .mailbox
@@ -5224,12 +5256,6 @@ impl App {
                 let idx = self.mailbox.selected.unwrap_or(0);
                 self.mailbox.selected = Some(idx.min(self.mailbox.messages.len() - 1));
             }
-        }
-
-        // Recompute the search filter since messages were removed and
-        // resequenced — the old filtered_indices are now stale.
-        if self.search.is_some() {
-            self.recompute_search_filter();
         }
 
         self.sync_message_view_state();
@@ -5410,7 +5436,12 @@ impl App {
             return;
         }
 
-        if let Some(id) = current_id {
+        if self.search.is_some() {
+            // `selected` counts matches here, so the message index below would
+            // land on whichever match happens to sit at that position.
+            let keep = current_id.or_else(|| self.selected_message_id());
+            self.refilter_keeping(keep);
+        } else if let Some(id) = current_id {
             if let Some((idx, _)) = self
                 .mailbox
                 .messages
@@ -7331,6 +7362,101 @@ mod tests {
             split_addresses(" a@example.com ;b@example.com,, "),
             ["a@example.com", "b@example.com"]
         );
+    }
+
+    // -- A search keeps the cursor on its message ------------------------------
+
+    /// Seven messages, of which a search for "lunch" matches ids 2, 4 and 6.
+    fn searching_app() -> App {
+        let messages = (1..=7)
+            .map(|id| {
+                let mut message = make_message(id, MessageStatus::Read);
+                if id % 2 == 0 {
+                    message.subject = format!("lunch {id}");
+                }
+                message
+            })
+            .collect();
+        let mut app = test_app(messages);
+        app.open_search();
+        app.search.as_mut().unwrap().input.value = "lunch".to_string();
+        app.recompute_search_filter();
+        app
+    }
+
+    fn select_match(app: &mut App, id: MessageId) {
+        let real = app
+            .mailbox
+            .messages
+            .iter()
+            .position(|msg| msg.id == id)
+            .unwrap();
+        let visible = app
+            .search
+            .as_ref()
+            .unwrap()
+            .filtered_indices
+            .iter()
+            .position(|&idx| idx == real)
+            .unwrap();
+        app.mailbox.selected = Some(visible);
+    }
+
+    #[test]
+    fn an_event_keeps_the_viewer_on_its_match() {
+        let mut app = searching_app();
+        select_match(&mut app, 4);
+        app.show_loaded_message(4, MessageContent::default());
+        let events = subscribe(&mut app);
+
+        let mut changed = make_message(1, MessageStatus::Read);
+        changed.starred = true;
+        events
+            .send(BackendEvent::MessageFlagsChanged(changed))
+            .unwrap();
+        app.poll_backend_events();
+
+        assert_eq!(app.selected_message_id(), Some(4));
+    }
+
+    #[test]
+    fn a_deleted_message_does_not_move_the_cursor_off_its_match() {
+        let mut app = searching_app();
+        select_match(&mut app, 6);
+        let events = subscribe(&mut app);
+
+        events.send(BackendEvent::MessageDeleted(1)).unwrap();
+        app.poll_backend_events();
+
+        assert_eq!(app.selected_message_id(), Some(6));
+    }
+
+    #[test]
+    fn committing_with_a_search_open_keeps_the_cursor_on_its_match() {
+        let mut app = searching_app();
+        select_match(&mut app, 4);
+        app.scheduled_actions.push(Action::with_original_status(
+            ActionType::Delete,
+            1,
+            MessageStatus::Read,
+        ));
+
+        app.commit_actions().unwrap();
+
+        assert_eq!(app.selected_message_id(), Some(4));
+    }
+
+    #[test]
+    fn messages_arriving_during_a_search_leave_the_cursor_alone() {
+        let mut app = searching_app();
+        select_match(&mut app, 2);
+
+        app.apply_mailbox_loader_update(MailboxLoadUpdate::Batch(vec![make_message(
+            8,
+            MessageStatus::New,
+        )]));
+
+        assert_eq!(app.selected_message_id(), Some(2));
     }
 
     // -- Paste routing --------------------------------------------------------
