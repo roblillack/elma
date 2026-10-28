@@ -15,11 +15,15 @@
 //! The authorization code then comes back to a listener on loopback and is
 //! exchanged for tokens with PKCE (RFC 7636), which is what keeps the flow off
 //! any server of ours: the token goes from the provider straight to the machine
-//! the user is sitting at.
+//! the user is sitting at.  Every request for a token names the JMAP endpoint it
+//! is meant for (RFC 8707), since one authorization server may stand in front
+//! of several protocols.
 //!
 //! FastMail satisfies all four; a JMAP server that does not is told apart from
 //! one that does by [`discover`] failing, and the account can still use a
-//! password or a token.
+//! password or a token.  The way the pieces are used follows the profile for
+//! open mail clients, draft-ietf-mailmaint-oauth-public, which is what FastMail
+//! implements.
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -31,7 +35,7 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::Mutex,
+    sync::{Mutex, PoisonError},
     time::Duration,
 };
 use url::Url;
@@ -74,6 +78,9 @@ pub struct AuthorizationServer {
     pub token_endpoint: String,
     pub registration_endpoint: Option<String>,
     pub scopes_supported: Vec<String>,
+    /// The protected resource the tokens are wanted for, as it names itself:
+    /// the JMAP session URL.  Sent as `resource` with every token request.
+    pub resource: String,
 }
 
 /// What a completed sign-in leaves behind.
@@ -95,6 +102,10 @@ pub struct StoredCredential {
     pub issuer: String,
     pub client_id: String,
     pub token_endpoint: String,
+    /// The resource indicator the sign-in was made with, repeated on every
+    /// refresh so the renewed token is for the same endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
     pub access_token: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
@@ -115,6 +126,7 @@ impl fmt::Debug for StoredCredential {
             .field("issuer", &self.issuer)
             .field("client_id", &self.client_id)
             .field("token_endpoint", &self.token_endpoint)
+            .field("resource", &self.resource)
             .field("access_token", &"***")
             .field("refresh_token", &self.refresh_token.as_ref().map(|_| "***"))
             .field("expires_at", &self.expires_at)
@@ -176,7 +188,18 @@ impl TokenStore {
     }
 
     /// Write `credential`, replacing any earlier sign-in for the same account.
+    ///
+    /// The whole read-modify-write runs under one lock.  Every account keeps its
+    /// sign-in in the same file, and two of them renewing at once -- which is
+    /// what happens at startup when both tokens ran out overnight -- would
+    /// otherwise each write back the other's old entry.  With refresh tokens
+    /// that rotate, the one lost that way is the only one that still works.
     pub fn save(&self, credential: &StoredCredential) -> Result<()> {
+        static SAVING: Mutex<()> = Mutex::new(());
+        // Nothing the lock guards can be left half-done by a panic: the file is
+        // only ever replaced whole.
+        let _saving = SAVING.lock().unwrap_or_else(PoisonError::into_inner);
+
         let mut file = self.read()?;
         file.credentials.retain(|existing| {
             existing.endpoint != credential.endpoint || existing.username != credential.username
@@ -300,6 +323,7 @@ impl OAuthCredential {
             &credential.token_endpoint,
             &credential.client_id,
             &refresh_token,
+            credential.resource.as_deref(),
         )
         .await
         .with_context(|| {
@@ -374,6 +398,9 @@ pub async fn discover(session_url: &str) -> Result<AuthorizationServer> {
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("{metadata_url} names no authorization server"))?;
+    // RFC 9728 makes `resource` mandatory; a document without one is taken to
+    // describe the URL it was looked up for.
+    let resource = resource.resource.unwrap_or_else(|| session_url.to_string());
 
     let metadata = fetch_server_metadata(&http, &issuer).await?;
     if !metadata
@@ -394,6 +421,7 @@ pub async fn discover(session_url: &str) -> Result<AuthorizationServer> {
         token_endpoint: metadata.token_endpoint,
         registration_endpoint: metadata.registration_endpoint,
         scopes_supported: metadata.scopes_supported,
+        resource,
     })
 }
 
@@ -411,7 +439,12 @@ pub fn sign_in_blocking(
         .enable_all()
         .build()
         .context("unable to start the runtime for the sign-in")?;
-    runtime.block_on(sign_in(endpoint, username, requested_scopes))
+    let result = runtime.block_on(sign_in(endpoint, username, requested_scopes));
+    // Not dropped: dropping waits for every blocking task, and when the sign-in
+    // timed out, the listener is still sat in `accept` for a browser that is
+    // not coming.  The process exits right after this anyway.
+    runtime.shutdown_background();
+    result
 }
 
 async fn sign_in(
@@ -419,22 +452,24 @@ async fn sign_in(
     username: &str,
     requested_scopes: Option<&[String]>,
 ) -> Result<SignIn> {
-    // The port comes first: it is part of the redirect URI, and registering the
-    // exact URI the listener will answer on avoids depending on the server to
-    // allow an arbitrary loopback port (RFC 8252 asks it to, not all do).
     let listener = TcpListener::bind("127.0.0.1:0")
         .context("unable to listen on loopback for the browser to come back")?;
     let port = listener
         .local_addr()
         .context("unable to read back the loopback port")?
         .port();
+    // Registered without the port, used with it.  The profile FastMail follows
+    // rejects a registered loopback URI that does not start with exactly
+    // `http://127.0.0.1/`, and in return obliges the server to accept whatever
+    // port the authorization request adds -- as RFC 8252 already asks of it.
+    let registered_redirect_uri = format!("http://127.0.0.1{REDIRECT_PATH}");
     let redirect_uri = format!("http://127.0.0.1:{port}{REDIRECT_PATH}");
 
     println!("Looking up how {endpoint} wants to be signed in to...");
     let server = discover(endpoint).await?;
     let scopes = choose_scopes(&server, requested_scopes)?;
 
-    let client_id = register_client(&server, &redirect_uri, &scopes).await?;
+    let client_id = register_client(&server, &registered_redirect_uri, &scopes).await?;
     let pkce = Pkce::generate()?;
     let state = random_token(16)?;
     let authorize_url = authorize_url(&server, &client_id, &redirect_uri, &scopes, &state, &pkce)?;
@@ -464,6 +499,7 @@ async fn sign_in(
         &code,
         &pkce.verifier,
         &redirect_uri,
+        &server.resource,
     )
     .await?;
 
@@ -480,6 +516,7 @@ async fn sign_in(
             issuer: server.issuer,
             client_id,
             token_endpoint: server.token_endpoint,
+            resource: Some(server.resource),
             access_token: tokens.access_token,
             refresh_token: tokens.refresh_token,
             expires_at: tokens
@@ -604,7 +641,8 @@ fn authorize_url(
         .append_pair("scope", &scopes.join(" "))
         .append_pair("state", state)
         .append_pair("code_challenge", &pkce.challenge)
-        .append_pair("code_challenge_method", "S256");
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("resource", &server.resource);
     Ok(url.to_string())
 }
 
@@ -713,6 +751,7 @@ async fn exchange_code(
     code: &str,
     verifier: &str,
     redirect_uri: &str,
+    resource: &str,
 ) -> Result<TokenResponse> {
     let response = http_client()?
         .post(token_endpoint)
@@ -722,6 +761,7 @@ async fn exchange_code(
             ("redirect_uri", redirect_uri),
             ("client_id", client_id),
             ("code_verifier", verifier),
+            ("resource", resource),
         ])
         .send()
         .await
@@ -735,18 +775,26 @@ async fn exchange_code(
 }
 
 /// Trade a refresh token for a new access token.
+///
+/// `resource` is absent only for a sign-in stored before Elma began recording
+/// it, which is left to get whatever the server hands out by default.
 pub async fn refresh(
     token_endpoint: &str,
     client_id: &str,
     refresh_token: &str,
+    resource: Option<&str>,
 ) -> Result<TokenResponse> {
+    let mut form = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", client_id),
+    ];
+    if let Some(resource) = resource {
+        form.push(("resource", resource));
+    }
     let response = http_client()?
         .post(token_endpoint)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", client_id),
-        ])
+        .form(&form)
         .send()
         .await
         .with_context(|| format!("refreshing the access token at {token_endpoint}"))?;
@@ -795,6 +843,7 @@ fn random_token(bytes: usize) -> Result<String> {
 
 #[derive(Deserialize)]
 struct ProtectedResourceMetadata {
+    resource: Option<String>,
     #[serde(default)]
     authorization_servers: Vec<String>,
 }
@@ -946,23 +995,32 @@ fn http_client() -> Result<reqwest::Client> {
 
 /// Ask the desktop to open `url`, reporting whether it took.
 fn open_in_browser(url: &str) -> bool {
-    let mut command = if cfg!(target_os = "macos") {
-        Command::new("open")
-    } else if cfg!(target_os = "windows") {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "start", ""]);
-        command
-    } else {
-        Command::new("xdg-open")
-    };
-
-    command
-        .arg(url)
+    browser_command(url)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+/// The command that hands `url` to the desktop's browser.
+///
+/// On Windows that is the shell's URL handler, reached without `cmd.exe`: the
+/// usual `cmd /C start "" <url>` hands the URL to a command line that treats
+/// every `&` as the end of one command and the start of the next, so the
+/// browser would open at everything up to the first query parameter.
+fn browser_command(url: &str) -> Command {
+    let mut command = if cfg!(target_os = "macos") {
+        Command::new("open")
+    } else if cfg!(target_os = "windows") {
+        let mut command = Command::new("rundll32");
+        command.arg("url.dll,FileProtocolHandler");
+        command
+    } else {
+        Command::new("xdg-open")
+    };
+    command.arg(url);
+    command
 }
 
 #[cfg(test)]
@@ -976,6 +1034,7 @@ mod tests {
             issuer: "https://api.example.com".to_string(),
             client_id: "a-client".to_string(),
             token_endpoint: "https://api.example.com/oauth/refresh".to_string(),
+            resource: Some("https://api.example.com/jmap/session".to_string()),
             access_token: "an-access-token".to_string(),
             refresh_token: Some("a-refresh-token".to_string()),
             expires_at: Some(Utc::now().timestamp() + 3600),
@@ -994,6 +1053,7 @@ mod tests {
                 "urn:ietf:params:oauth:scope:calendars".to_string(),
                 OFFLINE_SCOPE.to_string(),
             ],
+            resource: "https://api.example.com/jmap/session".to_string(),
         }
     }
 
@@ -1017,6 +1077,75 @@ mod tests {
         assert_eq!(found.access_token, "an-access-token");
         assert_eq!(found.refresh_token.as_deref(), Some("a-refresh-token"));
         assert_eq!(found.scopes, vec!["urn:ietf:params:oauth:scope:mail"]);
+        assert_eq!(
+            found.resource.as_deref(),
+            Some("https://api.example.com/jmap/session")
+        );
+    }
+
+    /// A sign-in stored before the resource was recorded still reads.
+    #[test]
+    fn a_stored_sign_in_without_a_resource_still_reads() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let store = TokenStore::new(directory.path().join("oauth.toml"));
+        store
+            .save(&StoredCredential {
+                resource: None,
+                ..credential()
+            })
+            .expect("the sign-in should save");
+
+        let found = store
+            .find("https://api.example.com/jmap/session", "rob@example.com")
+            .expect("the store should be readable")
+            .expect("the sign-in should be found");
+        assert_eq!(found.resource, None);
+    }
+
+    /// Accounts renewing at the same moment must not write back each other's
+    /// old entries: with rotating refresh tokens, the one dropped that way is
+    /// the only one the server still takes.
+    #[test]
+    fn accounts_saving_at_once_keep_each_others_sign_ins() {
+        const ACCOUNTS: usize = 8;
+        const ROUNDS: usize = 10;
+
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let store = TokenStore::new(directory.path().join("oauth.toml"));
+
+        let writers: Vec<_> = (0..ACCOUNTS)
+            .map(|account| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for round in 0..ROUNDS {
+                        store
+                            .save(&StoredCredential {
+                                username: format!("user{account}@example.com"),
+                                access_token: format!("token-{account}-{round}"),
+                                ..credential()
+                            })
+                            .expect("every save should succeed");
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().expect("the writer should finish");
+        }
+
+        for account in 0..ACCOUNTS {
+            let found = store
+                .find(
+                    "https://api.example.com/jmap/session",
+                    &format!("user{account}@example.com"),
+                )
+                .expect("the store should be readable")
+                .unwrap_or_else(|| panic!("account {account} lost its sign-in"));
+            assert_eq!(
+                found.access_token,
+                format!("token-{account}-{}", ROUNDS - 1)
+            );
+        }
     }
 
     #[test]
@@ -1240,6 +1369,10 @@ mod tests {
             "{request}"
         );
         assert!(request.contains("client_id=a-client"), "{request}");
+        assert!(
+            request.contains("resource=https%3A%2F%2Fapi.example.com%2Fjmap%2Fsession"),
+            "the renewed token is asked for the same endpoint: {request}"
+        );
 
         let stored = store
             .find("https://api.example.com/jmap/session", "rob@example.com")
@@ -1419,6 +1552,10 @@ mod tests {
         assert_eq!(pairs["code_challenge_method"], "S256");
         assert_eq!(pairs["code_challenge"], pkce.challenge);
         assert_eq!(pairs["state"], "a-state");
+        assert_eq!(
+            pairs["resource"], "https://api.example.com/jmap/session",
+            "the token is asked for the JMAP endpoint specifically"
+        );
         assert!(!pkce.verifier.is_empty());
         assert_ne!(
             pkce.challenge, pkce.verifier,
@@ -1466,13 +1603,20 @@ mod tests {
             "registration is what saves Elma from shipping a client of its own"
         );
 
+        assert_eq!(server.resource, "https://api.fastmail.com/jmap/session");
+
         let scopes = choose_scopes(&server, None).expect("a mail scope should be on offer");
         assert!(scopes.contains(&OFFLINE_SCOPE.to_string()), "{scopes:?}");
 
-        let redirect_uri = "http://127.0.0.1:1/oauth/callback";
+        // Registered without a port, used with one -- as `sign_in` does.
         let client_id = runtime
-            .block_on(register_client(&server, redirect_uri, &scopes))
+            .block_on(register_client(
+                &server,
+                "http://127.0.0.1/oauth/callback",
+                &scopes,
+            ))
             .expect("registration should succeed");
+        let redirect_uri = "http://127.0.0.1:1/oauth/callback";
         assert!(!client_id.is_empty());
 
         let pkce = Pkce::generate().expect("PKCE");
@@ -1489,6 +1633,23 @@ mod tests {
         assert!(
             status.is_success() || status.is_redirection(),
             "the authorization endpoint refused the request: {status}"
+        );
+    }
+
+    /// The URL reaches the browser whole, `&`s and all.
+    #[test]
+    fn the_browser_is_handed_the_url_whole() {
+        let url = "https://api.example.com/oauth/authorize?response_type=code&client_id=a&state=b";
+        let command = browser_command(url);
+
+        assert_eq!(
+            command.get_args().last().and_then(|arg| arg.to_str()),
+            Some(url)
+        );
+        assert_ne!(
+            command.get_program(),
+            "cmd",
+            "cmd.exe would cut the URL short at the first `&`"
         );
     }
 

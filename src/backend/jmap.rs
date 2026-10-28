@@ -488,27 +488,22 @@ impl JmapBackend {
     /// worker threads, so blocking on the connection is expected.  The lock is
     /// held across the connect so that two threads racing to be first produce
     /// one session rather than two; the loser waits and gets the same one.
+    ///
+    /// A session that is already up is checked for a credential that has moved
+    /// on -- an OAuth access token about to run out -- and reconnected in place
+    /// if so.  See [`JmapInner::ensure_authorized`].
     fn inner(&self) -> Result<Arc<JmapInner>> {
         let mut guard = self.inner.lock().unwrap();
 
-        // Asked for before the cache is consulted, because for an OAuth account
-        // this is what renews an access token that has run out -- and a renewed
-        // token is precisely the case where the cached session has to go.
+        if let Some(inner) = guard.as_ref() {
+            let inner = Arc::clone(inner);
+            drop(guard);
+            self.runtime.block_on(inner.ensure_authorized())?;
+            return Ok(inner);
+        }
+
         let secret = self.runtime.block_on(self.config.auth.secret_now())?;
         debug_logging::register_secret(&secret);
-
-        if let Some(inner) = guard.as_ref() {
-            if inner.authorized_with == secret && !inner.session_rejected() {
-                return Ok(Arc::clone(inner));
-            }
-            // Either the credential has moved on or the server stopped accepting
-            // this one.  The session cannot be re-authorized in place -- the
-            // library fixes the header when it connects -- so it is torn down,
-            // background tasks and all, and built again below.
-            debug_logging::log_session("credential changed, rebuilding the JMAP session");
-            self.runtime.block_on(inner.shutdown());
-            *guard = None;
-        }
 
         // No context is added here: everything [`JmapInner::initialize`] can
         // fail at already names the server, and a wrapper would only hide the
@@ -621,7 +616,7 @@ impl MailBackend for JmapBackend {
     fn fetch_attachment_blob(&self, blob_id: &str) -> Result<Vec<u8>> {
         let inner = self.inner()?;
         let runtime = Arc::clone(&inner.runtime);
-        let client = Arc::clone(&inner.client);
+        let client = inner.client();
         let blob_id = blob_id.to_string();
         runtime.block_on(async move {
             let trace = debug_logging::request("Blob/download", format_args!("blobId={blob_id}"));
@@ -636,14 +631,21 @@ impl MailBackend for JmapBackend {
 
 struct JmapInner {
     runtime: Arc<Runtime>,
-    client: Arc<Client>,
-    /// The secret this session's `Authorization` header was built from.  An
-    /// access token that has since been refreshed no longer matches, which is
-    /// how [`JmapBackend::inner`] knows to build a new session.
-    authorized_with: String,
-    /// Set when the server turned this session's credential down, so the next
-    /// call reconnects instead of retrying with something it has stopped
-    /// accepting.
+    /// What the session was set up with, kept for connecting again.
+    config: JmapConfig,
+    /// The connected client.  Swapped for a new one when the credential
+    /// changes, which is why it is reached through [`Self::client`]; calls
+    /// already in flight finish on the one they started with.
+    client: Mutex<Arc<Client>>,
+    /// The secret the current client's `Authorization` header was built from.
+    /// An access token that has since been refreshed no longer matches, which
+    /// is how [`Self::ensure_authorized`] knows to connect again.  Held across
+    /// the check and the reconnect, so one caller renews and the rest wait for
+    /// what it got -- a refresh token that rotates can only be spent once.
+    authorized_with: AsyncMutex<String>,
+    /// Set when the server turned the current client's credential down, so the
+    /// next call connects again instead of retrying with something it has
+    /// stopped accepting.
     rejected: AtomicBool,
     mailboxes: AsyncMutex<MailboxCache>,
     state: AsyncMutex<JmapState>,
@@ -664,42 +666,16 @@ impl JmapInner {
         config: JmapConfig,
         secret: String,
     ) -> Result<Arc<Self>> {
-        let JmapConfig {
-            base_url,
-            auth,
-            trusted_hosts,
-        } = config;
-
-        let mut builder = Client::new()
-            .credentials(auth.credentials_with(&secret))
-            .timeout(REQUEST_TIMEOUT);
-        if !trusted_hosts.is_empty() {
-            builder = builder.follow_redirects(trusted_hosts);
-        }
-
-        let trace = debug_logging::request(
-            "Session/get",
-            format_args!("url={} auth={auth}", debug_logging::redact_url(&base_url)),
-        );
-        let client = trace
-            .response(builder.connect(&base_url).await, |client| {
-                format!(
-                    "account={} api={}",
-                    client.default_account_id(),
-                    debug_logging::redact_url(client.session().api_url())
-                )
-            })
-            .map_err(|err| connect_error(err, &auth, &base_url))?;
-
-        let client = Arc::new(client);
+        let client = Arc::new(Self::connect(&config, &secret).await?);
 
         let mailboxes = Self::load_mailboxes(&client).await?;
         let identity = Self::load_identity(&client).await?;
 
         Ok(Arc::new(Self {
             runtime,
-            client,
-            authorized_with: secret,
+            config,
+            client: Mutex::new(client),
+            authorized_with: AsyncMutex::new(secret),
             rejected: AtomicBool::new(false),
             mailboxes: AsyncMutex::new(mailboxes),
             state: AsyncMutex::new(JmapState::default()),
@@ -713,28 +689,69 @@ impl JmapInner {
         }))
     }
 
-    /// Whether the server has refused this session's credential.
-    fn session_rejected(&self) -> bool {
-        self.rejected.load(AtomicOrdering::SeqCst)
+    /// Fetch the session object with `secret` in the `Authorization` header.
+    async fn connect(config: &JmapConfig, secret: &str) -> Result<Client> {
+        let JmapConfig {
+            base_url,
+            auth,
+            trusted_hosts,
+        } = config;
+
+        let mut builder = Client::new()
+            .credentials(auth.credentials_with(secret))
+            .timeout(REQUEST_TIMEOUT);
+        if !trusted_hosts.is_empty() {
+            builder = builder.follow_redirects(trusted_hosts.iter().cloned());
+        }
+
+        let trace = debug_logging::request(
+            "Session/get",
+            format_args!("url={} auth={auth}", debug_logging::redact_url(base_url)),
+        );
+        trace
+            .response(builder.connect(base_url).await, |client| {
+                format!(
+                    "account={} api={}",
+                    client.default_account_id(),
+                    debug_logging::redact_url(client.session().api_url())
+                )
+            })
+            .map_err(|err| connect_error(err, auth, base_url))
     }
 
-    /// Stop everything running on behalf of this session.
+    /// The client to send the next request with.
+    fn client(&self) -> Arc<Client> {
+        Arc::clone(&self.client.lock().unwrap())
+    }
+
+    /// Make sure the client carries a credential the server will take.
     ///
-    /// The background tasks hold their own handle on the session, so dropping
-    /// the last outside reference would not end them -- they have to be told.
-    async fn shutdown(&self) {
-        self.stop_backfill().await;
-        self.stop_event_loop().await;
-    }
+    /// For an OAuth account this is where an access token about to run out is
+    /// traded for a new one.  `jmap-client` fixes the `Authorization` header
+    /// when it connects, so a new token means connecting again -- but only the
+    /// client is replaced.  The message ids the UI holds, the mailbox cache, the
+    /// event channel and the tasks feeding it all belong to the account rather
+    /// than to the header, and carry on as they were: throwing them away with
+    /// the old client would leave the UI holding ids nothing recognises, and
+    /// nothing polling for new mail until the next mailbox switch.
+    ///
+    /// Called before every request the UI makes and before every background
+    /// poll, so a token is renewed whichever of the two comes first.
+    async fn ensure_authorized(&self) -> Result<()> {
+        let mut authorized_with = self.authorized_with.lock().await;
 
-    async fn stop_event_loop(&self) {
-        if let Some(cancel) = self.event_cancel.lock().await.take() {
-            cancel.store(true, AtomicOrdering::SeqCst);
+        let secret = self.config.auth.secret_now().await?;
+        debug_logging::register_secret(&secret);
+        if *authorized_with == secret && !self.rejected.load(AtomicOrdering::SeqCst) {
+            return Ok(());
         }
-        if let Some(handle) = self.event_handle.lock().await.take() {
-            handle.abort();
-            let _ = handle.await;
-        }
+
+        debug_logging::log_session("credential changed, reconnecting the JMAP session");
+        let client = Self::connect(&self.config, &secret).await?;
+        *self.client.lock().unwrap() = Arc::new(client);
+        *authorized_with = secret;
+        self.rejected.store(false, AtomicOrdering::SeqCst);
+        Ok(())
     }
 
     fn set_current_mailbox(&self, mailbox: MailboxKind) {
@@ -857,7 +874,8 @@ impl JmapInner {
                 .ok_or_else(|| anyhow!("message {message_id} not found in cache"))?
         };
 
-        let mut request = self.client.build();
+        let client = self.client();
+        let mut request = client.build();
         let get = request.get_email();
         get.ids([jmap_id.as_str()]);
         get.properties([
@@ -970,7 +988,7 @@ impl JmapInner {
             );
             let created = trace
                 .response(
-                    self.client
+                    self.client()
                         .email_import(raw.clone(), [drafts_id.clone()], Some(["$draft"]), None)
                         .await,
                     |email| format!("id={:?}", email.id()),
@@ -984,7 +1002,7 @@ impl JmapInner {
             let trace = debug_logging::request("Email/import", format_args!("bytes={}", raw.len()));
             let created = trace
                 .response(
-                    self.client
+                    self.client()
                         .email_import(
                             raw.clone(),
                             std::iter::empty::<String>(),
@@ -1015,7 +1033,8 @@ impl JmapInner {
         // `AHashMap<String, bool>` that can only ever send `false`.  FastMail
         // rejects that with `invalidProperties`.  Replacing the set outright
         // sidesteps the patch and is what marks the sent copy read.
-        let mut request = self.client.build();
+        let client = self.client();
+        let mut request = client.build();
         let create_id = {
             let submission = request.set_email_submission();
             let create_id = submission
@@ -1103,7 +1122,7 @@ impl JmapInner {
         );
         trace
             .response(
-                self.client
+                self.client()
                     .email_import(raw, [drafts_id], Some(["$draft"]), None)
                     .await,
                 |email| format!("id={:?}", email.id()),
@@ -1163,7 +1182,11 @@ impl JmapInner {
                 return;
             }
 
-            match self.refresh_current_mailbox().await {
+            let poll = async {
+                self.ensure_authorized().await?;
+                self.refresh_current_mailbox().await
+            };
+            match poll.await {
                 Ok(()) => {
                     if failures > 0 {
                         debug_logging::log_session(format_args!(
@@ -1177,17 +1200,16 @@ impl JmapInner {
                     reported = false;
                 }
                 Err(err) => {
-                    // A credential the server has stopped accepting -- most
-                    // often an access token that ran out while the mailbox sat
-                    // idle -- will not start working on a retry.  The session is
-                    // marked instead, so the next thing the user does rebuilds
-                    // it with a fresh credential rather than polling in vain.
+                    // A credential the server has stopped accepting will not
+                    // start working on a retry with the same client.  Marked,
+                    // the next attempt -- this loop's or the user's -- connects
+                    // again first.  It still counts as a failure: if connecting
+                    // again does not help either, the status line has to say so.
                     if credential_was_refused(&err) {
                         self.rejected.store(true, AtomicOrdering::SeqCst);
                         debug_logging::log_session(
-                            "server refused the credential; the session will be rebuilt on the next call",
+                            "server refused the credential; connecting again on the next attempt",
                         );
-                        return;
                     }
                     failures += 1;
                     debug_logging::log_session(format_args!(
@@ -1273,7 +1295,9 @@ impl JmapInner {
         );
         trace
             .response(
-                self.client.email_set_mailboxes(&jmap_id, [target_id]).await,
+                self.client()
+                    .email_set_mailboxes(&jmap_id, [target_id])
+                    .await,
                 |_| "updated".to_owned(),
             )
             .context("updating mailbox assignment")?;
@@ -1317,7 +1341,8 @@ impl JmapInner {
                     moved.join(" ")
                 ),
             );
-            let mut request = self.client.build();
+            let client = self.client();
+            let mut request = client.build();
             let set = request.set_email();
             set.if_in_state(state);
             set.update(jmap_id.as_str())
@@ -1340,7 +1365,8 @@ impl JmapInner {
 
     /// The mailboxes a message is in, with the `Email` state they were read at.
     async fn mailbox_ids_of(&self, jmap_id: &str) -> Result<(String, Vec<String>)> {
-        let mut request = self.client.build();
+        let client = self.client();
+        let mut request = client.build();
         request
             .get_email()
             .ids([jmap_id])
@@ -1401,7 +1427,9 @@ impl JmapInner {
             );
             trace
                 .response(
-                    self.client.email_set_keyword(&jmap_id, keyword, true).await,
+                    self.client()
+                        .email_set_keyword(&jmap_id, keyword, true)
+                        .await,
                     |_| "updated".to_owned(),
                 )
                 .with_context(|| format!("setting keyword {keyword}"))?;
@@ -1415,7 +1443,7 @@ impl JmapInner {
         );
         trace
             .response(
-                self.client
+                self.client()
                     .email_set_keywords(&jmap_id, remaining.iter().map(String::as_str))
                     .await,
                 |_| "updated".to_owned(),
@@ -1432,7 +1460,7 @@ impl JmapInner {
         );
         let email = trace
             .response(
-                self.client
+                self.client()
                     .email_get(jmap_id, Some([EmailProperty::Keywords]))
                     .await,
                 |email| match email {
@@ -1657,7 +1685,8 @@ impl JmapInner {
         let filter = cache.filter_for(mailbox)?;
         drop(cache);
 
-        let mut request = self.client.build();
+        let client = self.client();
+        let mut request = client.build();
         let query = request.query_email();
         if let Some(filter) = filter {
             query.filter(filter);
@@ -1692,7 +1721,8 @@ impl JmapInner {
             });
         }
 
-        let mut request = self.client.build();
+        let client = self.client();
+        let mut request = client.build();
         let get = request.get_email();
         get.ids(ids.iter().map(|id| id.as_str()));
         get.properties([
@@ -2622,6 +2652,300 @@ mod tests {
             message.contains("rejected the password for rob@example.com"),
             "{message}"
         );
+    }
+
+    /// One request as [`fake_jmap_server`] saw it.
+    #[derive(Debug)]
+    struct SeenRequest {
+        /// `GET /.well-known/jmap`, `POST /api`, ...
+        line: String,
+        authorization: Option<String>,
+        body: String,
+    }
+
+    /// A JMAP server on loopback that knows just enough to be connected to: the
+    /// session object, an empty mailbox list and no identities.  It doubles as
+    /// an OAuth token endpoint, handing out `token-1`, `token-2`, ... with a
+    /// lifetime short enough that every one of them is due for renewal at once.
+    ///
+    /// Answers `requests` requests and hands back what they were.
+    fn fake_jmap_server(requests: usize) -> (u16, std::thread::JoinHandle<Vec<SeenRequest>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port to listen on");
+        let port = listener.local_addr().expect("an address").port();
+        let base = format!("http://127.0.0.1:{port}");
+
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let mut tokens_issued = 0;
+            for _ in 0..requests {
+                let (stream, _) = listener.accept().expect("the client to connect");
+                let mut reader = BufReader::new(&stream);
+
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("a request line");
+                let mut authorization = None;
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
+                        break;
+                    }
+                    let (name, value) = header.split_once(':').unwrap_or((&header, ""));
+                    match name.to_ascii_lowercase().as_str() {
+                        "authorization" => authorization = Some(value.trim().to_string()),
+                        "content-length" => length = value.trim().parse().unwrap_or(0),
+                        _ => {}
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).expect("the request body");
+                let body = String::from_utf8_lossy(&body).to_string();
+
+                let payload = if line.starts_with("GET /.well-known/jmap ") {
+                    serde_json::json!({
+                        "capabilities": {
+                            "urn:ietf:params:jmap:core": {
+                                "maxSizeUpload": 50_000_000,
+                                "maxConcurrentUpload": 4,
+                                "maxSizeRequest": 10_000_000,
+                                "maxConcurrentRequests": 4,
+                                "maxCallsInRequest": 16,
+                                "maxObjectsInGet": 500,
+                                "maxObjectsInSet": 500,
+                                "collationAlgorithms": []
+                            },
+                            "urn:ietf:params:jmap:mail": {}
+                        },
+                        "accounts": {
+                            "u1": {
+                                "name": "rob@example.com",
+                                "isPersonal": true,
+                                "isReadOnly": false,
+                                "accountCapabilities": {}
+                            }
+                        },
+                        "primaryAccounts": { "urn:ietf:params:jmap:mail": "u1" },
+                        "username": "rob@example.com",
+                        "apiUrl": format!("{base}/api"),
+                        "downloadUrl": format!("{base}/download/{{accountId}}/{{blobId}}/{{name}}?type={{type}}"),
+                        "uploadUrl": format!("{base}/upload/{{accountId}}/"),
+                        "eventSourceUrl": format!("{base}/events?types={{types}}&closeafter={{closeafter}}&ping={{ping}}"),
+                        "state": "session-1"
+                    })
+                } else if line.starts_with("POST /token ") {
+                    tokens_issued += 1;
+                    serde_json::json!({
+                        "access_token": format!("token-{tokens_issued}"),
+                        "refresh_token": format!("refresh-{tokens_issued}"),
+                        "expires_in": 1
+                    })
+                } else {
+                    let method = ["Mailbox/get", "Identity/get"]
+                        .into_iter()
+                        .find(|method| body.contains(method))
+                        .unwrap_or_else(|| panic!("an unexpected request: {line} {body}"));
+                    serde_json::json!({
+                        "sessionState": "session-1",
+                        "methodResponses": [[method, {
+                            "accountId": "u1",
+                            "state": "1",
+                            "list": [],
+                            "notFound": []
+                        }, "s0"]]
+                    })
+                }
+                .to_string();
+
+                (&stream)
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                            payload.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .expect("the response to go out");
+                seen.push(SeenRequest {
+                    line: line.trim_end().to_string(),
+                    authorization,
+                    body,
+                });
+            }
+            seen
+        });
+
+        (port, server)
+    }
+
+    /// A credential the server turned down is replaced by connecting again --
+    /// and only the connection is replaced.  The message ids the UI holds and
+    /// the event channel belong to the account, and outlive the header.
+    #[test]
+    fn a_refused_credential_reconnects_without_losing_the_session() {
+        // Session, mailboxes and identity to connect; the session again after.
+        let (port, server) = fake_jmap_server(4);
+        let backend = JmapBackend::new(JmapConfig {
+            base_url: format!("http://127.0.0.1:{port}"),
+            auth: bearer_auth(),
+            trusted_hosts: Vec::new(),
+        })
+        .expect("the backend to be constructed");
+
+        let first = backend.inner().expect("the first connection to succeed");
+        let first_client = first.client();
+        first.runtime.block_on(async {
+            first.state.lock().await.next_message_id = 42;
+        });
+        let (sender, _receiver) = mpsc::channel();
+        *first.events.lock().unwrap() = Some(sender);
+
+        // What the event loop does on a 401.
+        first.rejected.store(true, AtomicOrdering::SeqCst);
+        let second = backend.inner().expect("connecting again to succeed");
+        let seen = server.join().expect("the server thread to finish");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the session itself carries on"
+        );
+        assert!(
+            !Arc::ptr_eq(&first_client, &second.client()),
+            "the refused client is replaced"
+        );
+        assert!(!second.rejected.load(AtomicOrdering::SeqCst));
+        assert_eq!(
+            second
+                .runtime
+                .block_on(async { second.state.lock().await.next_message_id }),
+            42,
+            "the ids handed to the UI still mean what they meant"
+        );
+        assert!(
+            second.events.lock().unwrap().is_some(),
+            "the UI still hears about new mail"
+        );
+
+        let lines: Vec<_> = seen.iter().map(|request| request.line.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "GET /.well-known/jmap HTTP/1.1",
+                "POST /api HTTP/1.1",
+                "POST /api HTTP/1.1",
+                "GET /.well-known/jmap HTTP/1.1",
+            ],
+            "connecting again fetches the session object and nothing more"
+        );
+    }
+
+    /// An OAuth access token that runs out is renewed on the next call, and the
+    /// renewed one goes out on a fresh connection under the same session.
+    #[test]
+    fn a_renewed_access_token_reconnects_without_losing_the_session() {
+        use crate::backend::oauth::{StoredCredential, TokenStore};
+
+        // Renewal, session, mailboxes and identity to connect; renewal and
+        // session again on the next call.
+        let (port, server) = fake_jmap_server(6);
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let store = TokenStore::new(directory.path().join("oauth.toml"));
+        store
+            .save(&StoredCredential {
+                endpoint: base_url.clone(),
+                username: "rob@example.com".to_string(),
+                issuer: base_url.clone(),
+                client_id: "a-client".to_string(),
+                token_endpoint: format!("{base_url}/token"),
+                resource: Some(format!("{base_url}/jmap/session")),
+                access_token: "token-0".to_string(),
+                refresh_token: Some("refresh-0".to_string()),
+                expires_at: Some(0),
+                scopes: Vec::new(),
+            })
+            .expect("the sign-in to be stored");
+
+        let backend = JmapBackend::new(JmapConfig {
+            base_url: base_url.clone(),
+            auth: JmapAuth::OAuth(Arc::new(OAuthCredential::new(
+                store,
+                &base_url,
+                "rob@example.com",
+                "Work",
+            ))),
+            trusted_hosts: Vec::new(),
+        })
+        .expect("the backend to be constructed");
+
+        let first = backend.inner().expect("the first connection to succeed");
+        first.runtime.block_on(async {
+            first.state.lock().await.next_message_id = 42;
+        });
+        let second = backend.inner().expect("the renewal to succeed");
+        let seen = server.join().expect("the server thread to finish");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the session itself carries on"
+        );
+        assert_eq!(
+            second
+                .runtime
+                .block_on(async { second.state.lock().await.next_message_id }),
+            42,
+            "the ids handed to the UI still mean what they meant"
+        );
+
+        let lines: Vec<_> = seen.iter().map(|request| request.line.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "POST /token HTTP/1.1",
+                "GET /.well-known/jmap HTTP/1.1",
+                "POST /api HTTP/1.1",
+                "POST /api HTTP/1.1",
+                "POST /token HTTP/1.1",
+                "GET /.well-known/jmap HTTP/1.1",
+            ]
+        );
+        assert_eq!(seen[1].authorization.as_deref(), Some("Bearer token-1"));
+        assert_eq!(
+            seen[5].authorization.as_deref(),
+            Some("Bearer token-2"),
+            "the renewed token is the one that goes out"
+        );
+        assert!(
+            seen[4].body.contains("refresh_token=refresh-1"),
+            "the rotated refresh token is the one spent next: {}",
+            seen[4].body
+        );
+        assert!(
+            seen[4].body.contains("resource="),
+            "the renewal names the endpoint it is for: {}",
+            seen[4].body
+        );
+    }
+
+    /// What reaches the event loop is a `JmapError` under whatever context the
+    /// call site added; the refusal has to be recognised through that.
+    #[test]
+    fn a_refusal_is_recognised_under_added_context() {
+        let refused = anyhow::Error::new(JmapError::from(jmap_client::Error::Server(
+            "401 Unauthorized".to_string(),
+        )))
+        .context("refreshing the mailbox");
+        assert!(credential_was_refused(&refused));
+
+        let unavailable = anyhow::Error::new(JmapError::from(jmap_client::Error::Server(
+            "503 Service Unavailable".to_string(),
+        )))
+        .context("refreshing the mailbox");
+        assert!(!credential_was_refused(&unavailable));
     }
 
     #[test]
