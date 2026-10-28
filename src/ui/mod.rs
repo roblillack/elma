@@ -227,8 +227,12 @@ fn render_inbox(frame: &mut Frame<'_>, app: &mut App, theme: Theme) {
     }
 
     let mut info_text = app.inbox_info_bar();
-    // A load in flight outranks the last status: it is what the user is waiting for.
-    if let Some((label, elapsed)) = app.pending_message_load() {
+    // A question outranks everything: the next key answers it.  After that, a
+    // load in flight outranks the last status: it is what the user is waiting for.
+    if let Some(question) = app.confirmation_prompt() {
+        info_text.push_str(" — ");
+        info_text.push_str(question);
+    } else if let Some((label, elapsed)) = app.pending_message_load() {
         info_text.push_str(" — ");
         info_text.push_str(&progress_text(label, elapsed));
     } else if let Some(status) = app.inbox_status_line()
@@ -584,12 +588,16 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
     }
 
     // The frame lists the keys, so the line under the buttons is left with what
-    // no key can tell the user.
-    let status_text = pending_outgoing
+    // no key can tell the user -- or the question the next key answers, which
+    // has to be readable even while a send is in flight.
+    let question = app.confirmation_prompt().map(|text| text.to_string());
+    let asking = question.is_some();
+    let status_text = question
+        .or(pending_outgoing)
         .or_else(|| app.compose_status_line().map(|text| text.to_string()))
         .unwrap_or_else(|| "Drop a file on the terminal to attach it.".to_string());
     let status = Paragraph::new(status_text)
-        .style(if busy {
+        .style(if busy || asking {
             surface.style().patch(surface.warning_style())
         } else {
             surface.style()
@@ -1052,9 +1060,10 @@ fn render_message(frame: &mut Frame<'_>, app: &mut App, theme: Theme) {
 
     render_message_body(frame, view, layout[1]);
 
-    let info_text = match app.pending_message_load() {
-        Some((label, elapsed)) => progress_text(label, elapsed),
-        None => view.info_line.clone().unwrap_or_default(),
+    let info_text = match (app.confirmation_prompt(), app.pending_message_load()) {
+        (Some(question), _) => question.to_string(),
+        (None, Some((label, elapsed))) => progress_text(label, elapsed),
+        (None, None) => view.info_line.clone().unwrap_or_default(),
     };
     let info_bar = Paragraph::new(info_text)
         .style(theme.bar_style())
