@@ -34,7 +34,6 @@ use std::{
     io::{BufRead, BufReader, Write},
     net::TcpListener,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::{
         Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
@@ -1086,32 +1085,7 @@ fn http_client() -> Result<reqwest::Client> {
 
 /// Ask the desktop to open `url`, reporting whether it took.
 fn open_in_browser(url: &str) -> bool {
-    browser_command(url)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-/// The command that hands `url` to the desktop's browser.
-///
-/// On Windows that is the shell's URL handler, reached without `cmd.exe`: the
-/// usual `cmd /C start "" <url>` hands the URL to a command line that treats
-/// every `&` as the end of one command and the start of the next, so the
-/// browser would open at everything up to the first query parameter.
-fn browser_command(url: &str) -> Command {
-    let mut command = if cfg!(target_os = "macos") {
-        Command::new("open")
-    } else if cfg!(target_os = "windows") {
-        let mut command = Command::new("rundll32");
-        command.arg("url.dll,FileProtocolHandler");
-        command
-    } else {
-        Command::new("xdg-open")
-    };
-    command.arg(url);
-    command
+    open::that(url).is_ok()
 }
 
 #[cfg(test)]
@@ -1962,23 +1936,6 @@ mod tests {
         )
         .expect("the metadata to parse");
         assert!(metadata.authorization_response_iss_parameter_supported);
-    }
-
-    /// The URL reaches the browser whole, `&`s and all.
-    #[test]
-    fn the_browser_is_handed_the_url_whole() {
-        let url = "https://api.example.com/oauth/authorize?response_type=code&client_id=a&state=b";
-        let command = browser_command(url);
-
-        assert_eq!(
-            command.get_args().last().and_then(|arg| arg.to_str()),
-            Some(url)
-        );
-        assert_ne!(
-            command.get_program(),
-            "cmd",
-            "cmd.exe would cut the URL short at the first `&`"
-        );
     }
 
     /// The challenge is the SHA-256 of the verifier, base64url without padding.

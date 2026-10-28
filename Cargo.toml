@@ -78,6 +78,10 @@ base64 = "0.22"
 # built with rather than a second crypto crate.
 ring = "0.17"
 url = "2"
+# Opens the sign-in page in the browser. On Windows it goes through
+# ShellExecute rather than `cmd /C start`, which cuts a URL short at its first
+# `&`.
+open = "5"
 
 # Only for `poll(2)` on stdin, which is what puts a timeout on the terminal's
 # answer to the background-colour query. See src/terminal.rs.
