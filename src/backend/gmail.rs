@@ -4310,7 +4310,7 @@ mod tests {
         let line = b"* 3 FETCH (UID 9 ENVELOPE (NIL \"Hi\" ((NIL NIL \"ada\" \"example.com\")) NIL NIL ((NIL NIL \"bob\" \"example.org\")) NIL NIL NIL NIL))\r\n";
         let (seq, attrs) = fetch_line(line);
 
-        let stored = build_message_from_attrs(seq, &attrs)
+        let stored = build_message_from_attrs(MailboxKind::Inbox, seq, &attrs)
             .expect("building the message")
             .expect("a FETCH with UID and ENVELOPE is a message");
 
