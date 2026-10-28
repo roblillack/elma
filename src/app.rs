@@ -43,7 +43,6 @@ use tdoc::{
     Document, Paragraph, Span,
     formatter::{Formatter, FormattingStyle},
     html, markdown,
-    writer::Writer,
 };
 use tempfile::NamedTempFile;
 use time::{OffsetDateTime, format_description::well_known::Rfc2822};
@@ -857,10 +856,9 @@ impl ComposeState {
     }
 
     fn serialize_body_html(&self) -> Result<String> {
-        let writer = Writer::new();
-        writer
-            .write_to_string(&self.body)
-            .context("failed to convert FTML body to HTML")
+        let mut buffer = Vec::new();
+        html::write(&mut buffer, &self.body).context("failed to convert FTML body to HTML")?;
+        String::from_utf8(buffer).context("HTML serialization produced invalid UTF-8")
     }
 
     pub(crate) fn to_outgoing(&self) -> Result<OutgoingMessage> {
