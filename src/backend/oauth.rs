@@ -308,19 +308,36 @@ impl OAuthCredential {
 
     /// An access token that is good right now, refreshing it if it has aged out.
     pub async fn access_token(&self) -> Result<String> {
+        self.token(false).await
+    }
+
+    /// A new access token, in place of one the server has turned down.
+    ///
+    /// The expiry the server named is only a promise: a token can be withdrawn
+    /// before it, and then the clock still calls it fresh.  This renews it
+    /// regardless.  A sign-in without a refresh token has nothing to renew with
+    /// and hands back what it has, for the server's refusal to speak for itself.
+    pub async fn renewed_access_token(&self) -> Result<String> {
+        self.token(true).await
+    }
+
+    async fn token(&self, refused: bool) -> Result<String> {
         let credential = self.current()?;
-        if credential.is_fresh() {
+        if credential.is_fresh() && !refused {
             return Ok(credential.access_token);
         }
 
-        let refresh_token = credential.refresh_token.clone().ok_or_else(|| {
-            anyhow!(
+        let Some(refresh_token) = credential.refresh_token.clone() else {
+            if credential.is_fresh() {
+                return Ok(credential.access_token);
+            }
+            bail!(
                 "the access token for {} has expired and the sign-in carries no refresh token; \
                  run `elma --login {}` to sign in again",
                 self.username,
                 self.account,
-            )
-        })?;
+            );
+        };
 
         let refreshed = refresh(
             &credential.token_endpoint,
@@ -1103,6 +1120,27 @@ mod tests {
         }
     }
 
+    /// A token endpoint on loopback that answers one refresh with
+    /// `a-newer-token` and `a-rotated-token`, handing back the request body.
+    fn one_refresh_server() -> (u16, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let port = listener.local_addr().expect("an address").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the client to connect");
+            let body = read_request_body(&mut stream);
+            let payload = "{\"access_token\":\"a-newer-token\",\"refresh_token\":\"a-rotated-token\",\
+                           \"expires_in\":3600}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            body
+        });
+        (port, server)
+    }
+
     #[test]
     fn a_stored_sign_in_survives_the_round_trip() {
         let directory = tempfile::tempdir().expect("a temporary directory");
@@ -1443,6 +1481,73 @@ mod tests {
                 .expect("the fresh token should be reused"),
             "a-newer-token"
         );
+    }
+
+    /// A token the server turned down is renewed even though the clock still
+    /// calls it fresh.
+    #[test]
+    fn a_refused_token_is_renewed_before_it_expires() {
+        let (port, server) = one_refresh_server();
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let store = TokenStore::new(directory.path().join("oauth.toml"));
+        store
+            .save(&StoredCredential {
+                token_endpoint: format!("http://127.0.0.1:{port}/oauth/refresh"),
+                ..credential()
+            })
+            .expect("the sign-in should save");
+
+        let live = OAuthCredential::new(
+            store,
+            "https://api.example.com/jmap/session",
+            "rob@example.com",
+            "Work",
+        );
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+
+        assert_eq!(
+            runtime
+                .block_on(live.access_token())
+                .expect("the stored token is fresh"),
+            "an-access-token"
+        );
+        assert_eq!(
+            runtime
+                .block_on(live.renewed_access_token())
+                .expect("the refused token to be renewed"),
+            "a-newer-token"
+        );
+        server.join().expect("the renewal to have happened");
+    }
+
+    /// With no refresh token there is nothing to renew with; the token there
+    /// is goes out again, and the server's answer is what the user sees.
+    #[test]
+    fn a_refused_token_without_a_refresh_token_is_handed_back() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let store = TokenStore::new(directory.path().join("oauth.toml"));
+        store
+            .save(&StoredCredential {
+                refresh_token: None,
+                ..credential()
+            })
+            .expect("the sign-in should save");
+
+        let live = OAuthCredential::new(
+            store,
+            "https://api.example.com/jmap/session",
+            "rob@example.com",
+            "Work",
+        );
+        let token = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime")
+            .block_on(live.renewed_access_token())
+            .expect("there is a token to hand back");
+        assert_eq!(token, "an-access-token");
     }
 
     /// A sign-in the server has withdrawn says what to do about it.
