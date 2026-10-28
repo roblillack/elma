@@ -16,7 +16,9 @@ use crate::model::{
 use anyhow::{Context, Result, anyhow};
 use crossterm::{
     cursor::Show,
-    event::{DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -1622,6 +1624,12 @@ impl App {
     /// The method polls backend state before dispatching so the UI reacts to new
     /// messages even while the user is idle.
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        // Windows reports releasing a key as an event of its own, which would
+        // otherwise act on every keystroke a second time.
+        if key.kind == KeyEventKind::Release {
+            return Ok(());
+        }
+
         self.poll_backend_events();
 
         if self.process_pending_navigation(key)? {
@@ -7739,6 +7747,27 @@ mod tests {
         assert_eq!(backend.sent.lock().unwrap().len(), 1);
         assert_eq!(app.mailbox.status_line.as_deref(), Some("Message sent."));
         assert!(app.pending_outgoing().is_none());
+    }
+
+    /// Windows follows every key press with a release event; acting on that as
+    /// well would close the menu `g` just opened.
+    #[test]
+    fn key_releases_are_ignored() {
+        let mut app = test_app(vec![]);
+        let press = KeyEvent::from(KeyCode::Char('g'));
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('g'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+
+        app.handle_key(press).expect("press");
+        app.handle_key(release).expect("release");
+
+        assert!(
+            app.shortcut_menu().is_some(),
+            "releasing `g` must leave the menu it opened"
+        );
     }
 
     #[test]
