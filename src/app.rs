@@ -159,11 +159,21 @@ struct CommitBatchState {
     /// this batch was committed.  Stored so they can be re-inserted if the
     /// backend reports a failure.
     removed_messages: Vec<Message>,
+    /// The mailbox the batch was committed in, and which load of it
+    /// ([`AccountState::mailbox_generation`]).  A failure is only folded back
+    /// into the list if that list is still the one on screen.
+    mailbox: MailboxKind,
+    mailbox_generation: u64,
 }
 
 impl CommitBatchState {
     /// Create a new batch around `actions` with progress updates streaming from `receiver`.
-    fn new(actions: Vec<Action>, receiver: Receiver<ActionStatus>) -> Self {
+    fn new(
+        actions: Vec<Action>,
+        receiver: Receiver<ActionStatus>,
+        mailbox: MailboxKind,
+        mailbox_generation: u64,
+    ) -> Self {
         Self {
             actions,
             receiver,
@@ -172,18 +182,20 @@ impl CommitBatchState {
             finished: false,
             immediate: false,
             removed_messages: Vec::new(),
+            mailbox,
+            mailbox_generation,
         }
     }
 
-    fn new_immediate(actions: Vec<Action>, receiver: Receiver<ActionStatus>) -> Self {
+    fn new_immediate(
+        actions: Vec<Action>,
+        receiver: Receiver<ActionStatus>,
+        mailbox: MailboxKind,
+        mailbox_generation: u64,
+    ) -> Self {
         Self {
-            actions,
-            receiver,
-            completed: 0,
-            failed: Vec::new(),
-            finished: false,
             immediate: true,
-            removed_messages: Vec::new(),
+            ..Self::new(actions, receiver, mailbox, mailbox_generation)
         }
     }
 
@@ -400,6 +412,9 @@ pub struct AccountState {
     message_loader: Option<MessageLoadOperation>,
     scheduled_actions: Vec<Action>,
     current_mailbox: MailboxKind,
+    /// Bumped by every mailbox load, so work started against one list can
+    /// tell whether that list is still the one on screen.
+    mailbox_generation: u64,
     search: Option<SearchState>,
 }
 
@@ -1599,6 +1614,7 @@ impl App {
                     message_loader: None,
                     scheduled_actions: Vec::new(),
                     current_mailbox: MailboxKind::Inbox,
+                    mailbox_generation: 0,
                     search: None,
                 }
             })
@@ -1979,6 +1995,7 @@ impl App {
             account.message_view = None;
             account.search = None;
             account.current_mailbox = target;
+            account.mailbox_generation += 1;
             account.mailbox.messages.clear();
             account.mailbox.selected = None;
             account.mailbox.scroll_top = 0;
@@ -2120,7 +2137,12 @@ impl App {
         self.check_read_timer();
         self.poll_mailbox_loader();
         self.poll_message_loader();
-        self.poll_commit_updates();
+        // Every account's batches, not just the visible one's: a commit made
+        // right before switching accounts settles in the account it was made
+        // in, instead of waiting for the user to come back to it.
+        for index in 0..self.accounts.len() {
+            self.with_account(index, |app| app.poll_commit_updates());
+        }
         self.poll_save_attachment_operation();
         self.poll_outgoing_operation();
 
@@ -2474,7 +2496,23 @@ impl App {
                 }
             }
 
-            if batch.immediate {
+            if batch.mailbox_generation != self.mailbox_generation {
+                // The list this batch acted on has been replaced since -- the
+                // user opened another mailbox or reloaded this one.  Folding a
+                // failure back in would put its messages into a list they do
+                // not belong to (or into this one twice), and re-queue actions
+                // for rows nobody can see.  On the server they are still where
+                // they were, so saying what failed is all there is to do.
+                if !batch.failed.is_empty() {
+                    self.mailbox.status_line = Some(format!(
+                        "Failed to apply {} action(s) in {}.",
+                        batch.failed.len(),
+                        batch.mailbox
+                    ));
+                } else if !batch.immediate {
+                    self.mailbox.status_line = Some("Actions committed.".to_string());
+                }
+            } else if batch.immediate {
                 // Immediate batches: never remove messages from the view.
                 // On failure, revert the local flag change.
                 if !batch.failed.is_empty() {
@@ -5118,8 +5156,11 @@ impl App {
             }
         };
 
+        let (mailbox, generation) = (self.current_mailbox, self.mailbox_generation);
         self.commit_batches
-            .push_back(CommitBatchState::new_immediate(actions, receiver));
+            .push_back(CommitBatchState::new_immediate(
+                actions, receiver, mailbox, generation,
+            ));
 
         Ok(())
     }
@@ -5159,8 +5200,10 @@ impl App {
             }
         };
 
-        self.commit_batches
-            .push_back(CommitBatchState::new(actions, receiver));
+        let (mailbox, generation) = (self.current_mailbox, self.mailbox_generation);
+        self.commit_batches.push_back(CommitBatchState::new(
+            actions, receiver, mailbox, generation,
+        ));
 
         Ok(())
     }
@@ -6136,6 +6179,7 @@ mod tests {
             message_loader: None,
             scheduled_actions: vec![],
             current_mailbox: MailboxKind::Inbox,
+            mailbox_generation: 0,
             search: None,
         };
 
@@ -6759,6 +6803,67 @@ mod tests {
             app.scheduled_actions.iter().map(|a| a.message_id).collect();
         assert!(requeued_ids.contains(&2));
         assert!(requeued_ids.contains(&4));
+    }
+
+    // -- Commits settle where they were made -----------------------------------
+
+    /// Answering `y` to "Apply now?" commits and opens the next mailbox at
+    /// once, so a failure arrives while another list is on screen.
+    #[test]
+    fn a_failure_after_switching_mailbox_is_reported_not_folded_into_the_new_list() {
+        let backend = Arc::new(DeferredBackend::new());
+        let mut app = test_app_with_backend(
+            vec![
+                make_message(1, MessageStatus::Read),
+                make_message(2, MessageStatus::Read),
+            ],
+            Arc::clone(&backend) as Arc<dyn MailBackend>,
+        );
+        app.scheduled_actions.push(Action::with_original_status(
+            ActionType::Archive,
+            1,
+            MessageStatus::Read,
+        ));
+        app.commit_actions().unwrap();
+
+        app.switch_mailbox(MailboxKind::Archive).unwrap();
+        pump_until(&mut app, "the archive to load", |app| {
+            app.mailbox_loader.is_none()
+        });
+
+        backend.complete_with_failures(&std::collections::HashSet::from([1]));
+        app.poll_backend_events();
+
+        assert!(
+            app.mailbox.messages.is_empty(),
+            "the Inbox message must not turn up in Archive"
+        );
+        assert!(app.scheduled_actions.is_empty());
+        assert_eq!(
+            app.mailbox.status_line.as_deref(),
+            Some("Failed to apply 1 action(s) in Inbox.")
+        );
+    }
+
+    #[test]
+    fn a_commit_settles_in_its_account_while_another_is_on_screen() {
+        let mut app =
+            test_app_with_two_accounts(vec![make_message(1, MessageStatus::Read)], vec![]);
+        app.scheduled_actions.push(Action::with_original_status(
+            ActionType::Archive,
+            1,
+            MessageStatus::Read,
+        ));
+        app.commit_actions().unwrap();
+        app.active_account = 1;
+
+        app.poll_backend_events();
+
+        assert!(app.accounts[0].commit_batches.is_empty());
+        assert_eq!(
+            app.accounts[0].mailbox.status_line.as_deref(),
+            Some("Actions committed.")
+        );
     }
 
     // -- Attachment paths -----------------------------------------------------
