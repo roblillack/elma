@@ -20,6 +20,7 @@ use jmap_client::{
     Method, Set as JmapSet, URI,
     client::{Client, Credentials},
     core::{
+        error::MethodErrorType,
         response::{EmailSetResponse, EmailSubmissionSetResponse, TaggedMethodResponse},
         set::SetObject,
     },
@@ -58,6 +59,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// longer a draft.  The compose path imports the message with `$draft` set, and
 /// delivery replaces the whole set with this one.
 const SENT_KEYWORDS: [&str; 1] = ["$seen"];
+/// What archiving takes a message out of: the inbox, and Trash or Spam for a
+/// message that is being rescued from either.
+const ARCHIVE_FROM: [MailboxKind; 3] = [MailboxKind::Inbox, MailboxKind::Trash, MailboxKind::Spam];
+/// What moving a message back to the inbox takes it out of.
+const RESTORE_FROM: [MailboxKind; 3] =
+    [MailboxKind::Trash, MailboxKind::Spam, MailboxKind::Archive];
+/// How many times a move reads a message's mailboxes and tries to write them
+/// back before giving up on a server that keeps reporting changes in between.
+const MOVE_ATTEMPTS: u32 = 3;
 
 /// Debug builds trace the JMAP conversation into `jmap-log-<stamp>-<pid>.log`,
 /// the counterpart of the IMAP trace the Gmail backend writes.
@@ -811,20 +821,20 @@ impl JmapInner {
     async fn process_action(self: &Arc<Self>, action: Action) -> Result<()> {
         match action.action_type {
             ActionType::Delete => {
-                self.move_to_mailbox(action.message_id, MailboxKind::Trash)
+                self.move_exclusively(action.message_id, MailboxKind::Trash)
                     .await
             }
             ActionType::Archive => {
-                self.move_to_mailbox(action.message_id, MailboxKind::Archive)
+                self.move_to_mailbox(action.message_id, &ARCHIVE_FROM, MailboxKind::Archive)
                     .await
             }
             ActionType::MoveToInboxUnread => {
-                self.move_to_mailbox(action.message_id, MailboxKind::Inbox)
+                self.move_to_mailbox(action.message_id, &RESTORE_FROM, MailboxKind::Inbox)
                     .await?;
                 self.set_keyword(action.message_id, "$seen", false).await
             }
             ActionType::MoveToInboxRead => {
-                self.move_to_mailbox(action.message_id, MailboxKind::Inbox)
+                self.move_to_mailbox(action.message_id, &RESTORE_FROM, MailboxKind::Inbox)
                     .await?;
                 self.set_keyword(action.message_id, "$seen", true).await
             }
@@ -844,7 +854,7 @@ impl JmapInner {
                     .await
             }
             ActionType::MoveToSpam => {
-                self.move_to_mailbox(action.message_id, MailboxKind::Spam)
+                self.move_exclusively(action.message_id, MailboxKind::Spam)
                     .await
             }
         }
@@ -1145,15 +1155,17 @@ impl JmapInner {
         }
     }
 
-    async fn move_to_mailbox(&self, message_id: MessageId, target: MailboxKind) -> Result<()> {
-        let target_id = self
-            .mailboxes
-            .lock()
-            .await
-            .id_for_kind(target)
-            .cloned()
-            .ok_or_else(|| anyhow!("mailbox {target} is not available"))?;
-
+    /// File a message under `target` and nothing else: what deleting it and
+    /// reporting it as spam do.
+    ///
+    /// RFC 8621 (section 2) counts a message that is in the trash and in
+    /// another mailbox as being in both, and has clients show it in both.
+    /// Moving a message to Trash or Spam while leaving its other mailboxes
+    /// alone would keep it on display in every one of them, so these two moves
+    /// replace the whole set rather than only taking it out of the folder it
+    /// was in.
+    async fn move_exclusively(&self, message_id: MessageId, target: MailboxKind) -> Result<()> {
+        let target_id = self.mailbox_id(target).await?;
         let jmap_id = self.lookup_message(message_id).await?;
 
         let trace = debug_logging::request(
@@ -1168,6 +1180,103 @@ impl JmapInner {
             .context("updating mailbox assignment")?;
 
         Ok(())
+    }
+
+    /// Move a message out of the mailboxes in `from` and into `target`,
+    /// leaving every other mailbox it is in -- a label, a project folder --
+    /// as it was.
+    ///
+    /// Taking one mailbox away is a patch to `mailboxIds/<id>: null`, which
+    /// jmap-client cannot send: its patch map holds booleans, and `false` is
+    /// not a value RFC 8621 allows there.  So the message's mailboxes are
+    /// read, adjusted and written back whole.  The write carries the state the
+    /// read saw (`ifInState`), and a server that has seen any change since
+    /// turns it down rather than have it undo that change; the move then reads
+    /// again and retries, a few times at most.
+    async fn move_to_mailbox(
+        &self,
+        message_id: MessageId,
+        from: &[MailboxKind],
+        target: MailboxKind,
+    ) -> Result<()> {
+        let target_id = self.mailbox_id(target).await?;
+        let source_ids = self.mailboxes.lock().await.ids_for_kinds(from);
+        let jmap_id = self.lookup_message(message_id).await?;
+
+        let mut attempt = 1;
+        loop {
+            let (state, current) = self.mailbox_ids_of(&jmap_id).await?;
+            let moved = moved_membership(&current, &source_ids, &target_id);
+            if moved.iter().collect::<HashSet<_>>() == current.iter().collect::<HashSet<_>>() {
+                return Ok(());
+            }
+
+            let trace = debug_logging::request(
+                "Email/set",
+                format_args!(
+                    "update id={jmap_id} mailboxIds=[{}] ({target}) ifInState={state}",
+                    moved.join(" ")
+                ),
+            );
+            let mut request = self.client.build();
+            let set = request.set_email();
+            set.if_in_state(state);
+            set.update(jmap_id.as_str())
+                .mailbox_ids(moved.iter().map(String::as_str));
+            let result = trace.response(
+                match request.send_single::<EmailSetResponse>().await {
+                    Ok(mut response) => response.updated(&jmap_id),
+                    Err(err) => Err(err),
+                },
+                |_| "updated".to_owned(),
+            );
+
+            match result {
+                Ok(_) => return Ok(()),
+                Err(err) if is_state_mismatch(&err) && attempt < MOVE_ATTEMPTS => attempt += 1,
+                Err(err) => return Err(err).context("updating mailbox assignment"),
+            }
+        }
+    }
+
+    /// The mailboxes a message is in, with the `Email` state they were read at.
+    async fn mailbox_ids_of(&self, jmap_id: &str) -> Result<(String, Vec<String>)> {
+        let mut request = self.client.build();
+        request
+            .get_email()
+            .ids([jmap_id])
+            .properties([EmailProperty::MailboxIds]);
+
+        let trace = debug_logging::request(
+            "Email/get",
+            format_args!("id={jmap_id} properties=mailboxIds"),
+        );
+        let mut response = trace
+            .response(request.send_get_email().await, |response| {
+                format!(
+                    "state={} emails={}",
+                    response.state(),
+                    response.list().len()
+                )
+            })
+            .with_context(|| format!("reading mailboxes of {jmap_id}"))?;
+
+        let state = response.state().to_owned();
+        let email = response
+            .take_list()
+            .pop()
+            .ok_or_else(|| anyhow!("message {jmap_id} not found on server"))?;
+        let mailbox_ids = email.mailbox_ids().into_iter().map(str::to_owned).collect();
+        Ok((state, mailbox_ids))
+    }
+
+    async fn mailbox_id(&self, kind: MailboxKind) -> Result<String> {
+        self.mailboxes
+            .lock()
+            .await
+            .id_for_kind(kind)
+            .cloned()
+            .ok_or_else(|| anyhow!("mailbox {kind} is not available"))
     }
 
     /// Turn one keyword on or off for a message.
@@ -1698,6 +1807,14 @@ impl MailboxCache {
         self.by_kind.get(&kind)
     }
 
+    /// The ids of those of `kinds` the account has a mailbox for.
+    fn ids_for_kinds(&self, kinds: &[MailboxKind]) -> Vec<String> {
+        kinds
+            .iter()
+            .filter_map(|kind| self.id_for_kind(*kind).cloned())
+            .collect()
+    }
+
     fn name_for_id(&self, id: &str) -> Option<&str> {
         self.by_id.get(id).map(|info| info.name.as_str())
     }
@@ -2046,6 +2163,29 @@ fn format_address(addr: &email::EmailAddress) -> String {
         (Some(name), email) if !name.is_empty() => format!("{name} <{email}>"),
         (_, email) => email.to_string(),
     }
+}
+
+/// The mailboxes a message is in once it has moved to `target`: out of every
+/// mailbox in `sources`, into `target`, and still in everything else.
+fn moved_membership(current: &[String], sources: &[String], target: &str) -> Vec<String> {
+    let mut moved: Vec<String> = current
+        .iter()
+        .filter(|id| !sources.contains(id))
+        .cloned()
+        .collect();
+    if !moved.iter().any(|id| id == target) {
+        moved.push(target.to_owned());
+    }
+    moved
+}
+
+/// Whether the server turned a write down because what it was based on has
+/// changed since (`ifInState`).
+fn is_state_mismatch(err: &JmapError) -> bool {
+    matches!(
+        &err.0,
+        jmap_client::Error::Method(method) if *method.error() == MethodErrorType::StateMismatch
+    )
 }
 
 fn flags_changed(before: &Message, after: &Message) -> bool {
@@ -2700,5 +2840,96 @@ mod tests {
                 .created("c0")
                 .is_err()
         );
+    }
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    /// Where a message filed under `current` ends up when it is moved out of
+    /// `from` and into `target`, in an account with every role.
+    fn moved(current: &[&str], from: &[MailboxKind], target: &str) -> Vec<String> {
+        let cache = cache(&[
+            ("mb-inbox", "Inbox", Some(MailboxKind::Inbox)),
+            ("mb-archive", "Archive", Some(MailboxKind::Archive)),
+            ("mb-trash", "Trash", Some(MailboxKind::Trash)),
+            ("mb-spam", "Spam", Some(MailboxKind::Spam)),
+            ("mb-sent", "Sent", Some(MailboxKind::Sent)),
+            ("mb-news", "Newsletters", None),
+        ]);
+        moved_membership(&ids(current), &cache.ids_for_kinds(from), target)
+    }
+
+    /// Archiving used to replace every mailbox a message was in with Archive,
+    /// so a label or project folder went with the inbox.
+    #[test]
+    fn archiving_keeps_the_other_mailboxes_a_message_is_in() {
+        assert_eq!(
+            moved(&["mb-inbox", "mb-news"], &ARCHIVE_FROM, "mb-archive"),
+            ids(&["mb-news", "mb-archive"])
+        );
+    }
+
+    /// RFC 8621 shows a message that is in the trash and somewhere else in
+    /// both places, so archiving one from Trash or Spam has to take it out.
+    #[test]
+    fn archiving_rescues_a_message_from_trash_or_spam() {
+        assert_eq!(
+            moved(&["mb-trash"], &ARCHIVE_FROM, "mb-archive"),
+            ids(&["mb-archive"])
+        );
+        assert_eq!(
+            moved(&["mb-spam", "mb-news"], &ARCHIVE_FROM, "mb-archive"),
+            ids(&["mb-news", "mb-archive"])
+        );
+    }
+
+    #[test]
+    fn moving_back_to_the_inbox_leaves_trash_spam_and_archive() {
+        assert_eq!(
+            moved(&["mb-trash", "mb-news"], &RESTORE_FROM, "mb-inbox"),
+            ids(&["mb-news", "mb-inbox"])
+        );
+        assert_eq!(
+            moved(&["mb-archive", "mb-spam"], &RESTORE_FROM, "mb-inbox"),
+            ids(&["mb-inbox"])
+        );
+    }
+
+    /// The read/unread toggle goes through the same move, so a message filed
+    /// somewhere the move does not come from -- Sent, here -- has to stay
+    /// there rather than be carried off to the inbox.
+    #[test]
+    fn a_move_from_elsewhere_only_adds_the_target() {
+        assert_eq!(
+            moved(&["mb-sent"], &RESTORE_FROM, "mb-inbox"),
+            ids(&["mb-sent", "mb-inbox"])
+        );
+    }
+
+    #[test]
+    fn a_message_already_in_the_target_is_not_filed_there_twice() {
+        assert_eq!(
+            moved(&["mb-inbox", "mb-news"], &RESTORE_FROM, "mb-inbox"),
+            ids(&["mb-inbox", "mb-news"])
+        );
+    }
+
+    /// A move only retries when the server says its read went stale; any
+    /// other refusal is final.
+    #[test]
+    fn only_a_stale_read_counts_as_a_state_mismatch() {
+        let method_error = |kind: &str| {
+            let error: jmap_client::core::error::MethodError =
+                serde_json::from_value(serde_json::json!({ "type": kind }))
+                    .expect("parsing the method error");
+            JmapError::from(jmap_client::Error::Method(error))
+        };
+
+        assert!(is_state_mismatch(&method_error("stateMismatch")));
+        assert!(!is_state_mismatch(&method_error("invalidArguments")));
+        assert!(!is_state_mismatch(&JmapError::from(
+            jmap_client::Error::Server("503 Service Unavailable".to_string())
+        )));
     }
 }
