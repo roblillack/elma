@@ -807,6 +807,11 @@ impl MailBackend for GmailBackend {
 
         let snapshot = self.inner.runtime.block_on(async {
             self.inner.ensure_connected().await?;
+            // Held while the new folder is opened and cached, so an action
+            // still queued from the old folder runs either before the switch or
+            // after it, never halfway through.  Taken before IDLE is paused:
+            // an action restarts IDLE as it finishes.
+            let _actions = self.inner.action_lock.lock().await;
             self.inner.stop_backfill_task().await;
             self.inner.pause_idle().await?;
 
@@ -819,10 +824,6 @@ impl MailBackend for GmailBackend {
             }
             let exists = self.inner.select_mailbox(mailbox).await?;
             let messages = self.inner.refresh_selected_mailbox(exists).await?;
-            {
-                let mut current = self.inner.current_mailbox.lock().await;
-                *current = mailbox;
-            }
             // Backfill first: when it has work it claims the session, and
             // `start_idle_loop` then declines rather than starting an IDLE the
             // backfill would immediately have to stop.
@@ -841,6 +842,13 @@ impl MailBackend for GmailBackend {
     /// Download the full MIME body for `message_id`.
     fn load_message(&self, message_id: MessageId) -> Result<MessageContent> {
         self.inner.runtime.block_on(async {
+            // A load that outlived a folder switch.  The UI has stopped waiting
+            // for it, so there is no point in interrupting IDLE to fetch it.
+            let open = *self.inner.current_mailbox.lock().await;
+            if message_location(message_id).map(|(folder, _)| folder) != Some(open) {
+                return Err(anyhow!("message {message_id} is not in {open}"));
+            }
+
             self.inner.stop_backfill_task().await;
             self.inner.pause_idle().await?;
             let uid = {
@@ -1275,6 +1283,10 @@ impl GmailInner {
             .select(&name)
             .await
             .with_context(|| format!("selecting mailbox {name}"))?;
+        // Recorded before the session is released, so whoever holds it next
+        // sees the folder that is actually open -- even if fetching its
+        // contents goes on to fail.
+        *self.current_mailbox.lock().await = mailbox;
         Ok(mailbox_info.exists)
     }
 
@@ -1364,6 +1376,7 @@ impl GmailInner {
             format!("{start}:{end}")
         };
 
+        let mailbox = *self.current_mailbox.lock().await;
         let command = format!("FETCH {range} {FETCH_MESSAGE_QUERY}");
         let tag = session
             .run_command(&command)
@@ -1384,12 +1397,14 @@ impl GmailInner {
 
             let parsed = response.parsed();
             match parsed {
-                Response::Fetch(seq, attrs) => match build_message_from_attrs(*seq, attrs)? {
-                    Some(stored) => collected.push(stored),
-                    None => {
-                        let _ = self.handle_fetch_update(*seq, attrs).await?;
+                Response::Fetch(seq, attrs) => {
+                    match build_message_from_attrs(mailbox, *seq, attrs)? {
+                        Some(stored) => collected.push(stored),
+                        None => {
+                            let _ = self.handle_fetch_update(*seq, attrs).await?;
+                        }
                     }
-                },
+                }
                 Response::Expunge(seq) => {
                     self.handle_expunge(*seq).await;
                 }
@@ -2198,57 +2213,88 @@ impl GmailInner {
     }
 
     async fn apply_action_internal(&self, action: &Action) -> Result<()> {
-        match action.action_type {
-            ActionType::Archive => {
-                let mailbox = {
-                    let labels = self.labels.lock().await;
-                    labels.archive.clone()
-                };
-                self.move_message(action.message_id, &mailbox).await
+        let id = action.message_id;
+        let command = {
+            let labels = self.labels.lock().await;
+            ActionCommand::for_action(action.action_type, &labels)
+        };
+
+        let (folder, uid) =
+            message_location(id).ok_or_else(|| anyhow!("message {id} names no folder"))?;
+        let open = *self.current_mailbox.lock().await;
+        if folder != open {
+            return self.apply_in_folder(folder, open, uid, &command).await;
+        }
+
+        match command {
+            ActionCommand::Move(target) => self.move_message(id, &target).await,
+            ActionCommand::Flags(query) => self.update_flags(id, query).await,
+            ActionCommand::Labels(query) => self.update_gmail_labels(id, query).await,
+        }
+    }
+
+    /// Run `command` on `uid` in `folder`, which is not the folder the session
+    /// has open.
+    ///
+    /// The UI goes on committing a batch after the user has moved to another
+    /// folder, and a UID means nothing outside its own folder.  So the command
+    /// runs where the message was listed: select that folder, act, and select
+    /// the open one again, all under one hold of the session so that nothing
+    /// else issues a command in between.  The cache describes the open folder
+    /// only and is left alone.
+    async fn apply_in_folder(
+        &self,
+        folder: MailboxKind,
+        open: MailboxKind,
+        uid: u32,
+        command: &ActionCommand,
+    ) -> Result<()> {
+        let folder_name = self.mailbox_name(folder).await?;
+        let open_name = self.mailbox_name(open).await?;
+        let mut guard = self.session.lock().await;
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("IMAP session is not available"))?;
+
+        let result = async {
+            session
+                .select(&folder_name)
+                .await
+                .with_context(|| format!("selecting mailbox {folder_name}"))?;
+            match command {
+                ActionCommand::Move(target) => session.uid_mv(uid.to_string(), target).await,
+                ActionCommand::Flags(query) | ActionCommand::Labels(query) => {
+                    session
+                        .run_command_and_check_ok(format!("UID STORE {uid} {query}"))
+                        .await
+                }
             }
-            ActionType::Delete => {
-                let mailbox = {
-                    let labels = self.labels.lock().await;
-                    labels.trash.clone()
-                };
-                self.move_message(action.message_id, &mailbox).await
+            .with_context(|| format!("applying the action in {folder_name}"))
+        }
+        .await;
+
+        // Whatever that folder announced in the meantime is about that folder.
+        while session.unsolicited_responses.try_recv().is_ok() {}
+
+        match session.select(&open_name).await {
+            // Mail may have arrived while the other folder was open.
+            Ok(mailbox) => {
+                if let Err(err) = self.drain_exists(session, Some(mailbox.exists)).await {
+                    log_backend_event("BACKEND", &format!("EXISTS handling failed: {err:?}"));
+                }
             }
-            ActionType::MoveToSpam => {
-                let mailbox = {
-                    let labels = self.labels.lock().await;
-                    labels.spam.clone()
-                };
-                self.move_message(action.message_id, &mailbox).await
-            }
-            ActionType::MoveToInboxUnread => {
-                self.update_flags(action.message_id, "-FLAGS.SILENT (\\Seen)")
-                    .await
-            }
-            ActionType::MoveToInboxRead => {
-                self.update_flags(action.message_id, "+FLAGS.SILENT (\\Seen)")
-                    .await
-            }
-            ActionType::MarkAsRead => {
-                self.update_flags(action.message_id, "+FLAGS.SILENT (\\Seen)")
-                    .await
-            }
-            ActionType::MarkAsStarred => {
-                self.update_flags(action.message_id, "+FLAGS.SILENT (\\Flagged)")
-                    .await
-            }
-            ActionType::MarkAsUnstarred => {
-                self.update_flags(action.message_id, "-FLAGS.SILENT (\\Flagged)")
-                    .await
-            }
-            ActionType::MarkAsImportant => {
-                self.update_gmail_labels(action.message_id, "+X-GM-LABELS (\\Important)")
-                    .await
-            }
-            ActionType::MarkAsUnimportant => {
-                self.update_gmail_labels(action.message_id, "-X-GM-LABELS (\\Important)")
-                    .await
+            // Kept, the session would carry on in the wrong folder.  Without
+            // one, the next IDLE dials afresh and opens the right one.
+            Err(err) => {
+                log_backend_event(
+                    "BACKEND",
+                    &format!("reselecting {open_name} failed: {err:?}"),
+                );
+                *guard = None;
             }
         }
+
+        result
     }
 
     async fn move_message(&self, message_id: MessageId, target: &str) -> Result<()> {
@@ -2511,7 +2557,57 @@ fn has_important_attribute(attrs: &[NameAttribute<'_>]) -> bool {
     })
 }
 
+/// The id of the message with `uid` in `mailbox`.
+///
+/// Gmail numbers messages per folder, so UID 7 in the Inbox and UID 7 in All
+/// Mail are as a rule two different messages.  The folder goes into the upper
+/// half of the id, which keeps ids apart across folders and lets an action
+/// find its way back to the folder the message was listed in.
+fn message_id(mailbox: MailboxKind, uid: u32) -> MessageId {
+    let folder = MailboxKind::ALL
+        .iter()
+        .position(|kind| *kind == mailbox)
+        .unwrap_or_default() as MessageId;
+    ((folder + 1) << 32) | MessageId::from(uid)
+}
+
+/// The folder and UID a [`message_id`] was made from.
+fn message_location(id: MessageId) -> Option<(MailboxKind, u32)> {
+    let folder = usize::try_from(id >> 32).ok()?.checked_sub(1)?;
+    let mailbox = *MailboxKind::ALL.get(folder)?;
+    Some((mailbox, id as u32))
+}
+
+/// The IMAP command behind an action, whichever folder it runs in.
+enum ActionCommand {
+    /// `UID MOVE` to the named mailbox.
+    Move(String),
+    /// `UID STORE` of standard flags.
+    Flags(&'static str),
+    /// `UID STORE` of Gmail labels.
+    Labels(&'static str),
+}
+
+impl ActionCommand {
+    fn for_action(action_type: ActionType, labels: &SpecialMailboxes) -> Self {
+        match action_type {
+            ActionType::Archive => Self::Move(labels.archive.clone()),
+            ActionType::Delete => Self::Move(labels.trash.clone()),
+            ActionType::MoveToSpam => Self::Move(labels.spam.clone()),
+            ActionType::MoveToInboxUnread => Self::Flags("-FLAGS.SILENT (\\Seen)"),
+            ActionType::MoveToInboxRead | ActionType::MarkAsRead => {
+                Self::Flags("+FLAGS.SILENT (\\Seen)")
+            }
+            ActionType::MarkAsStarred => Self::Flags("+FLAGS.SILENT (\\Flagged)"),
+            ActionType::MarkAsUnstarred => Self::Flags("-FLAGS.SILENT (\\Flagged)"),
+            ActionType::MarkAsImportant => Self::Labels("+X-GM-LABELS (\\Important)"),
+            ActionType::MarkAsUnimportant => Self::Labels("-X-GM-LABELS (\\Important)"),
+        }
+    }
+}
+
 fn build_message_from_attrs(
+    mailbox: MailboxKind,
     seq: u32,
     attrs: &[AttributeValue<'_>],
 ) -> Result<Option<StoredMessage>> {
@@ -2560,7 +2656,7 @@ fn build_message_from_attrs(
         .unwrap_or(false);
 
     let message = Message {
-        id: uid as u64,
+        id: message_id(mailbox, uid),
         sent,
         sender,
         recipients,
@@ -3632,6 +3728,53 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
+    //  Message ids
+    // ---------------------------------------------------------------
+
+    /// Gmail numbers each folder on its own, so one UID turns up in several
+    /// folders as different messages.  An action committed in the Inbox and
+    /// run after the user had opened All Mail used to land on whatever All
+    /// Mail had under that UID.
+    #[test]
+    fn the_same_uid_in_different_folders_gets_different_ids() {
+        let ids: std::collections::HashSet<MessageId> = MailboxKind::ALL
+            .iter()
+            .map(|kind| message_id(*kind, 7))
+            .collect();
+        assert_eq!(ids.len(), MailboxKind::ALL.len());
+    }
+
+    #[test]
+    fn an_id_leads_back_to_its_folder_and_uid() {
+        for mailbox in MailboxKind::ALL {
+            for uid in [1, 7, u32::MAX] {
+                assert_eq!(
+                    message_location(message_id(mailbox, uid)),
+                    Some((mailbox, uid))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ids_stay_clear_of_the_placeholders() {
+        // The UI numbers the rows it has no message for yet down from the top
+        // of the range: `u64::MAX - seq`.
+        let highest = MailboxKind::ALL
+            .iter()
+            .map(|kind| message_id(*kind, u32::MAX))
+            .max()
+            .unwrap();
+        assert!(highest < u64::MAX - u64::from(u32::MAX));
+        assert_eq!(message_location(u64::MAX - 1), None);
+    }
+
+    #[test]
+    fn a_bare_uid_names_no_folder() {
+        assert_eq!(message_location(7), None);
+    }
+
+    // ---------------------------------------------------------------
     //  EXISTS bookkeeping
     // ---------------------------------------------------------------
 
@@ -3717,13 +3860,17 @@ mod tests {
         let line = message_fetch_line("\"Wed, 25 Feb 2026 07:00:00 +0000\"");
         let (seq, attrs) = fetch_line(&line);
 
-        let stored = build_message_from_attrs(seq, &attrs)
+        let stored = build_message_from_attrs(MailboxKind::Archive, seq, &attrs)
             .expect("building the message")
             .expect("a full FETCH response is a message");
 
         assert_eq!(stored.uid, 77);
         assert_eq!(stored.seq, 3);
-        assert_eq!(stored.message.id, 77);
+        assert_eq!(stored.message.uid, 77);
+        assert_eq!(
+            message_location(stored.message.id),
+            Some((MailboxKind::Archive, 77))
+        );
         assert_eq!(stored.message.subject, "Hello there");
         assert_eq!(stored.message.sender, "Ada");
         assert_eq!(stored.message.recipients, vec!["Bob"]);
@@ -3744,7 +3891,7 @@ mod tests {
         let line = message_fetch_line("NIL");
         let (seq, attrs) = fetch_line(&line);
 
-        let stored = build_message_from_attrs(seq, &attrs)
+        let stored = build_message_from_attrs(MailboxKind::Inbox, seq, &attrs)
             .expect("building the message")
             .expect("a full FETCH response is a message");
 
@@ -3770,7 +3917,7 @@ mod tests {
         let (seq, attrs) = fetch_line(line);
 
         assert!(
-            build_message_from_attrs(seq, &attrs)
+            build_message_from_attrs(MailboxKind::Inbox, seq, &attrs)
                 .expect("a flag update is not an error")
                 .is_none()
         );
@@ -3782,7 +3929,7 @@ mod tests {
         let (seq, attrs) = fetch_line(line);
 
         assert!(
-            build_message_from_attrs(seq, &attrs)
+            build_message_from_attrs(MailboxKind::Inbox, seq, &attrs)
                 .expect("a flag update is not an error")
                 .is_none()
         );
@@ -3803,7 +3950,7 @@ mod tests {
         .as_bytes();
         let (seq, attrs) = fetch_line(line);
 
-        let stored = build_message_from_attrs(seq, &attrs)
+        let stored = build_message_from_attrs(MailboxKind::Inbox, seq, &attrs)
             .expect("building the message")
             .expect("a full FETCH response is a message");
 
