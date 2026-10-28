@@ -449,6 +449,9 @@ impl MockBackend {
             ActionType::MarkAsRead => {
                 mock.message.status = MessageStatus::Read;
             }
+            ActionType::MarkAsUnread => {
+                mock.message.status = MessageStatus::New;
+            }
             ActionType::MarkAsStarred => {
                 mock.message.starred = true;
                 if !mock
@@ -1270,5 +1273,22 @@ mod tests {
         let inbox = backend.messages_in(MailboxKind::Inbox);
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].status, MessageStatus::Read);
+    }
+
+    /// Unlike [`ActionType::MoveToInboxUnread`], which brings the message back
+    /// from wherever it is.
+    #[test]
+    fn marking_as_unread_leaves_the_message_where_it_is() {
+        let backend = MockBackend::empty();
+        let mut archived = message(5);
+        archived.labels = vec!["Archive".to_string()];
+        backend.insert(MailboxKind::Archive, archived);
+
+        apply(&backend, ActionType::MarkAsUnread, 5);
+
+        assert!(backend.messages_in(MailboxKind::Inbox).is_empty());
+        let archive = backend.messages_in(MailboxKind::Archive);
+        assert_eq!(archive.len(), 1);
+        assert_eq!(archive[0].status, MessageStatus::New);
     }
 }
