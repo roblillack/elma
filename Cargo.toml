@@ -89,3 +89,6 @@ resvg = "0.49"
 # serialise to, and what a canned server response deserialises into. Already in
 # the tree as a jmap-client dependency, so this costs no extra build.
 serde_json = "1"
+# Paused time, so the tests of the IMAP timeouts jump to the limit instead of
+# sitting it out.
+tokio = { version = "1", features = ["test-util"] }

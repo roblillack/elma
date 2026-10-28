@@ -646,6 +646,21 @@ const MAX_BACKFILL_RECONNECTS: u32 = 3;
 /// has arrived.  Bounds how late a message shows up while backfill has IDLE
 /// switched off.
 const NEW_MAIL_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// How long dialling, TLS and logging in may take together.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the server may leave a command unanswered.
+///
+/// A connection can stay open while nothing comes back over it -- a network
+/// that went away under a sleeping laptop, a captive portal -- and without a
+/// limit the command waiting on it holds the session, and everything queued
+/// behind the session, for good.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+/// The slowest a message body may download, or a draft upload, before it
+/// counts as stalled: 256 kbit/s.  See [`transfer_timeout`].
+const MIN_TRANSFER_RATE: usize = 32 * 1024;
+/// How long [`GmailInner::pause_idle`] waits for the IDLE task to hand the
+/// session back before giving up on it.
+const IDLE_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// TLS settings shared by every connection to Gmail.
 ///
@@ -843,12 +858,12 @@ impl MailBackend for GmailBackend {
         self.inner.runtime.block_on(async {
             self.inner.stop_backfill_task().await;
             self.inner.pause_idle().await?;
-            let uid = {
+            let (uid, size) = {
                 let state = self.inner.state.lock().await;
                 state
                     .messages
                     .get(&message_id)
-                    .map(|stored| stored.uid)
+                    .map(|stored| (stored.uid, stored.message.size))
                     .ok_or_else(|| anyhow!("message {message_id} not found in cache"))?
             };
 
@@ -857,27 +872,39 @@ impl MailBackend for GmailBackend {
                 .as_mut()
                 .ok_or_else(|| anyhow!("IMAP session is not available"))?;
 
-            let mut content = None;
-            {
-                let mut fetches = session
-                    .uid_fetch(uid.to_string(), "(BODY.PEEK[])")
-                    .await
-                    .context("fetching full message")?;
+            let loaded = async {
+                // The body arrives as a single response, so its limit grows
+                // with the message instead of allowing one round trip.
+                let content = bounded_by(transfer_timeout(size), async {
+                    let mut content = None;
+                    let mut fetches = session
+                        .uid_fetch(uid.to_string(), "(BODY.PEEK[])")
+                        .await
+                        .context("fetching full message")?;
 
-                while let Some(fetch) = fetches.try_next().await? {
-                    if let Some(body) = fetch.body() {
-                        let parsed = mailparse::parse_mail(body)
-                            .context("parsing message MIME structure")?;
-                        content = Some(build_message_content(&parsed)?);
+                    while let Some(fetch) = fetches.try_next().await? {
+                        if let Some(body) = fetch.body() {
+                            let parsed = mailparse::parse_mail(body)
+                                .context("parsing message MIME structure")?;
+                            content = Some(build_message_content(&parsed)?);
+                        }
                     }
-                }
-            }
-
-            let label_exists = self
-                .inner
-                .fetch_gmail_labels_command(session, &format!("UID FETCH {uid} (UID X-GM-LABELS)"))
+                    Ok::<_, anyhow::Error>(content)
+                })
                 .await?;
-            self.inner.drain_exists(session, label_exists).await?;
+
+                let label_exists = self
+                    .inner
+                    .fetch_gmail_labels_command(
+                        session,
+                        &format!("UID FETCH {uid} (UID X-GM-LABELS)"),
+                    )
+                    .await?;
+                self.inner.drain_exists(session, label_exists).await?;
+                Ok::<_, anyhow::Error>(content)
+            }
+            .await;
+            let content = retire_if_lost(&mut session_guard, loaded)?;
 
             drop(session_guard);
             self.inner.start_backfill_if_needed().await?;
@@ -938,29 +965,33 @@ impl GmailInner {
         // protocol, or a future version of async-imap, happens to frame it.
         register_secret(&self.password);
 
-        let tcp = TcpStream::connect((GMAIL_HOST, GMAIL_PORT))
-            .await
-            .context("connecting to Gmail IMAP server")?;
-        let connector = TlsConnector::from(tls_config()?);
-        let server_name = rustls::pki_types::ServerName::try_from(GMAIL_HOST)
-            .context("invalid TLS server name")?
-            .to_owned();
-        let tls_stream = connector
-            .connect(server_name, tcp)
-            .await
-            .context("starting TLS handshake with Gmail")?;
-        let tls_stream = wrap_stream(tls_stream).context("enabling Gmail IMAP debug logging")?;
-        let mut client = async_imap::Client::new(tls_stream);
-        client
-            .read_response()
-            .await
-            .context("reading IMAP greeting")?
-            .ok_or_else(|| anyhow!("connection closed before IMAP greeting"))?;
-        let session = client
-            .login(&self.email, &self.password)
-            .await
-            .map_err(|(err, _)| err)
-            .context("logging in to Gmail")?;
+        let session = bounded_by(CONNECT_TIMEOUT, async {
+            let tcp = TcpStream::connect((GMAIL_HOST, GMAIL_PORT))
+                .await
+                .context("connecting to Gmail IMAP server")?;
+            let connector = TlsConnector::from(tls_config()?);
+            let server_name = rustls::pki_types::ServerName::try_from(GMAIL_HOST)
+                .context("invalid TLS server name")?
+                .to_owned();
+            let tls_stream = connector
+                .connect(server_name, tcp)
+                .await
+                .context("starting TLS handshake with Gmail")?;
+            let tls_stream =
+                wrap_stream(tls_stream).context("enabling Gmail IMAP debug logging")?;
+            let mut client = async_imap::Client::new(tls_stream);
+            client
+                .read_response()
+                .await
+                .context("reading IMAP greeting")?
+                .ok_or_else(|| anyhow!("connection closed before IMAP greeting"))?;
+            client
+                .login(&self.email, &self.password)
+                .await
+                .map_err(|(err, _)| err)
+                .context("logging in to Gmail")
+        })
+        .await?;
 
         *guard = Some(session);
 
@@ -1072,15 +1103,18 @@ impl GmailInner {
             .as_mut()
             .ok_or_else(|| anyhow!("IMAP session is not available"))?;
 
-        session
-            .noop()
-            .await
-            .context("polling for new mail with NOOP")?;
+        let polled = async {
+            bounded(session.noop())
+                .await
+                .context("polling for new mail with NOOP")?;
 
-        // `noop` answers through async-imap's own command path, which parks the
-        // untagged EXISTS in the unsolicited-response channel rather than
-        // handing it back; `drain_exists` reads it out of there.
-        self.drain_exists(session, None).await
+            // `noop` answers through async-imap's own command path, which parks
+            // the untagged EXISTS in the unsolicited-response channel rather
+            // than handing it back; `drain_exists` reads it out of there.
+            self.drain_exists(session, None).await
+        }
+        .await;
+        retire_if_lost(&mut guard, polled)
     }
 
     async fn run_backfill_batches(self: &Arc<Self>, cancel: &Arc<AtomicBool>) {
@@ -1166,6 +1200,11 @@ impl GmailInner {
                 "BACKEND",
                 &format!("backfill EXISTS handling failed: {err:?}"),
             );
+            if is_connection_lost(&err) {
+                drop(session_guard);
+                self.discard_session().await;
+                return Err(err);
+            }
         }
 
         let (stored_messages, fetch_exists) = match self
@@ -1271,9 +1310,8 @@ impl GmailInner {
         let session = guard
             .as_mut()
             .ok_or_else(|| anyhow!("IMAP session is not available"))?;
-        let mailbox_info = session
-            .select(&name)
-            .await
+        let selected = bounded(session.select(&name)).await;
+        let mailbox_info = retire_if_lost(&mut guard, selected)
             .with_context(|| format!("selecting mailbox {name}"))?;
         Ok(mailbox_info.exists)
     }
@@ -1301,37 +1339,41 @@ impl GmailInner {
                 .as_mut()
                 .ok_or_else(|| anyhow!("IMAP session is not available"))?;
 
-            let (stored_messages, fetch_exists) = self
-                .fetch_message_range(session, start, end)
-                .await
-                .context("fetching initial mailbox slice")?;
-            for stored in stored_messages {
-                message_ids.push(stored.message.id);
-                new_state.insert(stored);
-            }
+            let refreshed = async {
+                let (stored_messages, fetch_exists) = self
+                    .fetch_message_range(session, start, end)
+                    .await
+                    .context("fetching initial mailbox slice")?;
+                for stored in stored_messages {
+                    message_ids.push(stored.message.id);
+                    new_state.insert(stored);
+                }
 
-            // Install new_state before the label fetch so handle_fetch_update
-            // finds the messages in the correct state.
-            {
-                let mut state_guard = self.state.lock().await;
-                *state_guard = new_state;
-            }
+                // Install new_state before the label fetch so handle_fetch_update
+                // finds the messages in the correct state.
+                {
+                    let mut state_guard = self.state.lock().await;
+                    *state_guard = new_state;
+                }
 
-            let mut label_exists = None;
-            if !message_ids.is_empty() {
-                let command = if start == end {
-                    format!("FETCH {start} (UID X-GM-LABELS)")
-                } else {
-                    format!("FETCH {start}:{end} (UID X-GM-LABELS)")
-                };
-                label_exists = self.fetch_gmail_labels_command(session, &command).await?;
-            }
+                let mut label_exists = None;
+                if !message_ids.is_empty() {
+                    let command = if start == end {
+                        format!("FETCH {start} (UID X-GM-LABELS)")
+                    } else {
+                        format!("FETCH {start}:{end} (UID X-GM-LABELS)")
+                    };
+                    label_exists = self.fetch_gmail_labels_command(session, &command).await?;
+                }
 
-            // Mail that landed while we were reading the initial slice sits
-            // above `exists` and would otherwise stay invisible until the next
-            // reconnect.
-            self.drain_exists(session, max_exists(fetch_exists, label_exists))
-                .await?;
+                // Mail that landed while we were reading the initial slice sits
+                // above `exists` and would otherwise stay invisible until the
+                // next reconnect.
+                self.drain_exists(session, max_exists(fetch_exists, label_exists))
+                    .await
+            }
+            .await;
+            retire_if_lost(&mut session_guard, refreshed)?;
         }
 
         // Re-read messages from state after labels have been applied.
@@ -1365,8 +1407,7 @@ impl GmailInner {
         };
 
         let command = format!("FETCH {range} {FETCH_MESSAGE_QUERY}");
-        let tag = session
-            .run_command(&command)
+        let tag = bounded(session.run_command(&command))
             .await
             .with_context(|| format!("issuing FETCH command for range {range}"))?;
 
@@ -1374,8 +1415,9 @@ impl GmailInner {
         let mut highest_exists: Option<u32> = None;
 
         loop {
-            let Some(response) = session
-                .read_response()
+            // Each response in turn, not the whole range: a long one is fine
+            // as long as it keeps coming.
+            let Some(response) = bounded(session.read_response())
                 .await
                 .context("reading FETCH response")?
             else {
@@ -1416,10 +1458,15 @@ impl GmailInner {
             .as_mut()
             .ok_or_else(|| anyhow!("IMAP session is not available"))?;
 
-        let mut list_stream = session
-            .list(Some(""), Some("*"))
-            .await
-            .context("listing mailboxes")?;
+        let listed = bounded(async {
+            session
+                .list(Some(""), Some("*"))
+                .await?
+                .try_collect::<Vec<_>>()
+                .await
+        })
+        .await;
+        let names = retire_if_lost(&mut guard, listed).context("listing mailboxes")?;
 
         let mut archive = None;
         let mut trash = None;
@@ -1429,7 +1476,7 @@ impl GmailInner {
         let mut sent = None;
         let mut drafts = None;
 
-        while let Some(name) = list_stream.try_next().await? {
+        for name in &names {
             let attrs = name.attributes();
             let entry_name = name.name().to_string();
             if attrs.iter().any(|attr| matches!(attr, NameAttribute::All)) {
@@ -1506,16 +1553,14 @@ impl GmailInner {
         command: &str,
     ) -> Result<Option<u32>> {
         let command_text = command.to_string();
-        let tag = session
-            .run_command(&command_text)
+        let tag = bounded(session.run_command(&command_text))
             .await
             .with_context(|| format!("issuing command `{command_text}`"))?;
 
         let mut highest_exists: Option<u32> = None;
 
         loop {
-            let Some(response) = session
-                .read_response()
+            let Some(response) = bounded(session.read_response())
                 .await
                 .context("reading Gmail label response")?
             else {
@@ -1659,10 +1704,12 @@ impl GmailInner {
         } else {
             Some(format!("({})", flags.join(" ")))
         };
-        session
-            .append(&name, flags_literal.as_deref(), None, raw)
-            .await
-            .context("appending message to mailbox")?;
+        let appended = bounded_by(
+            transfer_timeout(raw.len()),
+            session.append(&name, flags_literal.as_deref(), None, raw),
+        )
+        .await;
+        retire_if_lost(&mut guard, appended).context("appending message to mailbox")?;
         Ok(())
     }
 
@@ -1700,6 +1747,10 @@ impl GmailInner {
     /// Locks `idle_handle` first, then `idle_stop` — matching the order used by
     /// [`start_idle_loop`] — so that a concurrent start cannot insert a new
     /// (stop_tx, handle) pair between our two reads.
+    ///
+    /// The task only notices the stop between commands.  If it is stuck in one
+    /// for longer than [`IDLE_STOP_TIMEOUT`], it is cut off, and the session
+    /// with it, rather than left to hold up whoever is waiting here.
     async fn pause_idle(&self) -> Result<()> {
         let mut handle_guard = self.idle_handle.lock().await;
         let stop = {
@@ -1709,8 +1760,17 @@ impl GmailInner {
         if let Some(stop_tx) = stop {
             let _ = stop_tx.send(());
         }
-        if let Some(handle) = handle_guard.take() {
+        if let Some(mut handle) = handle_guard.take()
+            && tokio_time::timeout(IDLE_STOP_TIMEOUT, &mut handle)
+                .await
+                .is_err()
+        {
+            log_backend_event("BACKEND", "idle did not stop in time; abandoning it");
+            handle.abort();
             let _ = handle.await;
+            // Whatever the task was in the middle of may still be answered,
+            // and the next command would read that answer as its own.
+            self.discard_session().await;
         }
 
         Ok(())
@@ -1763,14 +1823,9 @@ impl GmailInner {
             };
 
             let mut idle_handle = session.idle();
-            if let Err(err) = idle_handle.init().await {
+            if let Err(err) = bounded(idle_handle.init()).await {
                 if !self
-                    .idle_setback(
-                        "idle init",
-                        &anyhow::Error::new(err),
-                        &mut failures,
-                        &mut stop_rx,
-                    )
+                    .idle_setback("idle init", &err, &mut failures, &mut stop_rx)
                     .await
                 {
                     return;
@@ -1813,9 +1868,10 @@ impl GmailInner {
                     self.collect_pending_idle(&mut idle_handle, &mut exists, &mut label_refresh)
                         .await;
 
-                    if let Ok(mut sess) = idle_handle.done().await {
-                        self.apply_idle_updates(&mut sess, exists, label_refresh).await;
-                        self.reinsert_session(sess).await;
+                    if let Ok(mut sess) = bounded(idle_handle.done()).await {
+                        let applied =
+                            self.apply_idle_updates(&mut sess, exists, label_refresh).await;
+                        self.reinsert_unless_lost(sess, applied).await;
                     }
                     break;
                 }
@@ -1824,19 +1880,16 @@ impl GmailInner {
 
             match result {
                 Ok(IdleResponse::Timeout) | Ok(IdleResponse::ManualInterrupt) => {
-                    if let Ok(mut sess) = idle_handle.done().await {
-                        let _ = sess.noop().await;
-                        // NOOP is how the server reports anything it has been
-                        // holding back, but async-imap answers it through
-                        // `run_command_and_check_ok`, which parks untagged
-                        // responses out of reach.  Pick them up.
-                        if let Err(err) = self.drain_exists(&mut sess, None).await {
-                            log_backend_event(
-                                "BACKEND",
-                                &format!("idle EXISTS handling failed: {err:?}"),
-                            );
-                        }
-                        self.reinsert_session(sess).await;
+                    if let Ok(mut sess) = bounded(idle_handle.done()).await {
+                        let polled = match bounded(sess.noop()).await {
+                            Err(err) if is_connection_lost(&err) => Err(err),
+                            // NOOP is how the server reports anything it has
+                            // been holding back, but async-imap answers it
+                            // through `run_command_and_check_ok`, which parks
+                            // untagged responses out of reach.  Pick them up.
+                            _ => self.drain_exists(&mut sess, None).await,
+                        };
+                        self.reinsert_unless_lost(sess, polled).await;
                     }
                 }
                 Ok(IdleResponse::NewData(resp)) => {
@@ -1858,11 +1911,12 @@ impl GmailInner {
                         continue;
                     }
 
-                    match idle_handle.done().await {
+                    match bounded(idle_handle.done()).await {
                         Ok(mut sess) => {
-                            self.apply_idle_updates(&mut sess, exists, label_refresh)
+                            let applied = self
+                                .apply_idle_updates(&mut sess, exists, label_refresh)
                                 .await;
-                            self.reinsert_session(sess).await;
+                            self.reinsert_unless_lost(sess, applied).await;
                         }
                         Err(err) => {
                             log_backend_event(
@@ -1873,7 +1927,7 @@ impl GmailInner {
                     }
                 }
                 Err(err) => {
-                    if let Ok(sess) = idle_handle.done().await {
+                    if let Ok(sess) = bounded(idle_handle.done()).await {
                         self.reinsert_session(sess).await;
                     }
                     if !self
@@ -1960,20 +2014,23 @@ impl GmailInner {
 
     /// Act on the notifications gathered while IDLE was running, now that the
     /// session is usable again.
+    ///
+    /// Fails only if the connection is lost along the way.
     async fn apply_idle_updates(
         &self,
         session: &mut AsyncSession,
         exists: Vec<u32>,
         mut label_refresh: Vec<u32>,
-    ) {
+    ) -> Result<()> {
         for count in exists {
-            if let Err(err) = self.drain_exists(session, Some(count)).await {
-                log_backend_event("BACKEND", &format!("idle EXISTS handling failed: {err:?}"));
-            }
+            tolerate(
+                "idle EXISTS handling",
+                self.drain_exists(session, Some(count)).await,
+            )?;
         }
 
         if label_refresh.is_empty() {
-            return;
+            return Ok(());
         }
 
         label_refresh.sort_unstable();
@@ -1984,15 +2041,21 @@ impl GmailInner {
             .collect::<Vec<_>>()
             .join(",");
         let command = format!("UID FETCH {uid_set} (UID X-GM-LABELS)");
-        match self.fetch_gmail_labels_command(session, &command).await {
-            Ok(label_exists) => {
-                if let Err(err) = self.drain_exists(session, label_exists).await {
-                    log_backend_event("BACKEND", &format!("idle EXISTS handling failed: {err:?}"));
-                }
-            }
-            Err(err) => {
-                log_backend_event("BACKEND", &format!("label refresh failed: {err:?}"));
-            }
+        let refreshed = async {
+            let label_exists = self.fetch_gmail_labels_command(session, &command).await?;
+            self.drain_exists(session, label_exists).await
+        }
+        .await;
+        tolerate("label refresh", refreshed)
+    }
+
+    /// Hand an IDLE session back for others to use -- unless `outcome` says
+    /// the connection behind it is gone, in which case it is dropped and the
+    /// next user connects afresh.
+    async fn reinsert_unless_lost(&self, session: AsyncSession, outcome: Result<()>) {
+        match tolerate("idle follow-up", outcome) {
+            Ok(()) => self.reinsert_session(session).await,
+            Err(err) => log_backend_event("BACKEND", &format!("idle session lost: {err:?}")),
         }
     }
 
@@ -2267,9 +2330,8 @@ impl GmailInner {
             let session = guard
                 .as_mut()
                 .ok_or_else(|| anyhow!("IMAP session is not available"))?;
-            session
-                .uid_mv(&uid_arg, target)
-                .await
+            let moved = bounded(session.uid_mv(&uid_arg, target)).await;
+            retire_if_lost(&mut guard, moved)
                 .with_context(|| format!("moving message {message_id} to {target}"))?;
         }
 
@@ -2300,9 +2362,16 @@ impl GmailInner {
             let session = guard
                 .as_mut()
                 .ok_or_else(|| anyhow!("IMAP session is not available"))?;
-            let mut stream = session.uid_store(&uid_arg, query).await?;
+            let stored = bounded(async {
+                session
+                    .uid_store(&uid_arg, query)
+                    .await?
+                    .try_collect::<Vec<_>>()
+                    .await
+            })
+            .await;
 
-            while let Some(fetch) = stream.try_next().await? {
+            for fetch in retire_if_lost(&mut guard, stored)? {
                 let (status, starred, answered, forwarded, important) =
                     summarize_flags_from_flag_iter(fetch.flags());
                 let mut state = self.state.lock().await;
@@ -2348,8 +2417,12 @@ impl GmailInner {
             let session = guard
                 .as_mut()
                 .ok_or_else(|| anyhow!("IMAP session is not available"))?;
-            let label_exists = self.fetch_gmail_labels_command(session, &command).await?;
-            self.drain_exists(session, label_exists).await?;
+            let updated = async {
+                let label_exists = self.fetch_gmail_labels_command(session, &command).await?;
+                self.drain_exists(session, label_exists).await
+            }
+            .await;
+            retire_if_lost(&mut guard, updated)?;
         }
 
         Ok(())
@@ -2741,11 +2814,82 @@ impl std::fmt::Display for ConnectionLost {
 
 impl std::error::Error for ConnectionLost {}
 
+/// The server stopped answering: the connection is still open, but nothing
+/// comes back over it.  As good as lost, and treated that way.
+#[derive(Debug)]
+struct TimedOut;
+
+impl std::fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the IMAP server stopped answering")
+    }
+}
+
+impl std::error::Error for TimedOut {}
+
 /// Does this error mean the session is gone rather than the command failed?
 fn is_connection_lost(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
-        cause.is::<ConnectionLost>() || cause.downcast_ref::<std::io::Error>().is_some()
+        cause.is::<ConnectionLost>()
+            || cause.is::<TimedOut>()
+            || cause.downcast_ref::<std::io::Error>().is_some()
     })
+}
+
+/// Give one IMAP round trip [`COMMAND_TIMEOUT`] to complete.
+async fn bounded<T, E>(future: impl Future<Output = std::result::Result<T, E>>) -> Result<T>
+where
+    E: Into<anyhow::Error>,
+{
+    bounded_by(COMMAND_TIMEOUT, future).await
+}
+
+/// [`bounded`], with a limit of the caller's choosing.  Running out of time is
+/// a [`TimedOut`] error, and so counts as a lost connection.
+async fn bounded_by<T, E>(
+    limit: Duration,
+    future: impl Future<Output = std::result::Result<T, E>>,
+) -> Result<T>
+where
+    E: Into<anyhow::Error>,
+{
+    match tokio_time::timeout(limit, future).await {
+        Ok(result) => result.map_err(Into::into),
+        Err(_) => Err(TimedOut.into()),
+    }
+}
+
+/// The limit for a command that moves `bytes` over the connection: the usual
+/// allowance, plus however long the transfer takes at [`MIN_TRANSFER_RATE`].
+/// A flat limit would cut off a large attachment on a slow line.
+fn transfer_timeout(bytes: usize) -> Duration {
+    COMMAND_TIMEOUT + Duration::from_secs((bytes / MIN_TRANSFER_RATE) as u64)
+}
+
+/// Pass `result` on, emptying `slot` first if it says the connection is gone.
+///
+/// A command that timed out may still be answered later, and the next one
+/// would read that answer as its own.  So the session goes, and whoever needs
+/// one next connects afresh.
+fn retire_if_lost<S, T>(slot: &mut Option<S>, result: Result<T>) -> Result<T> {
+    if let Err(err) = &result
+        && is_connection_lost(err)
+    {
+        *slot = None;
+    }
+    result
+}
+
+/// Log a failure of `what` that leaves the session usable, and carry on; pass
+/// a lost connection back up.
+fn tolerate(what: &str, result: Result<()>) -> Result<()> {
+    match result {
+        Err(err) if !is_connection_lost(&err) => {
+            log_backend_event("BACKEND", &format!("{what} failed: {err:?}"));
+            Ok(())
+        }
+        other => other,
+    }
 }
 
 /// Take any EXISTS async-imap parked in its unsolicited-response channel.
@@ -3678,6 +3822,102 @@ mod tests {
         assert_eq!(max_exists(None, Some(7)), Some(7));
         assert_eq!(max_exists(Some(4), Some(9)), Some(9));
         assert_eq!(max_exists(Some(9), Some(4)), Some(9));
+    }
+
+    // ---------------------------------------------------------------
+    //  Timeouts
+    // ---------------------------------------------------------------
+
+    /// A connection that stays open with nobody answering at the other end:
+    /// before the limit, the command waiting on it never came back.
+    #[tokio::test(start_paused = true)]
+    async fn a_command_that_gets_no_answer_times_out() {
+        let started = tokio_time::Instant::now();
+
+        let err = bounded(std::future::pending::<Result<()>>())
+            .await
+            .expect_err("nothing ever answers");
+
+        assert!(started.elapsed() >= COMMAND_TIMEOUT);
+        assert!(err.is::<TimedOut>());
+        // So every path that already retires a dead session retires this one.
+        assert!(is_connection_lost(
+            &err.context("moving message 7 to Trash")
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_answered_command_passes_through_untouched() {
+        let value = bounded(async { Ok::<_, std::io::Error>(7) })
+            .await
+            .expect("an answer in time");
+        assert_eq!(value, 7);
+
+        let err = bounded(async { Err::<(), _>(anyhow!("NO [CANNOT] not now")) })
+            .await
+            .expect_err("the server said no");
+        assert!(!is_connection_lost(&err), "a refusal is not a dead line");
+    }
+
+    #[test]
+    fn a_large_transfer_gets_time_in_proportion() {
+        assert_eq!(transfer_timeout(0), COMMAND_TIMEOUT);
+        assert_eq!(transfer_timeout(1024), COMMAND_TIMEOUT);
+        assert_eq!(
+            transfer_timeout(25 * 1024 * 1024),
+            COMMAND_TIMEOUT + Duration::from_secs(800)
+        );
+    }
+
+    #[test]
+    fn only_a_lost_connection_retires_the_session() {
+        let mut slot = Some("session");
+        let _ = retire_if_lost(&mut slot, Err::<(), _>(anyhow!("NO [CANNOT] not now")));
+        assert!(
+            slot.is_some(),
+            "a refused command leaves the session usable"
+        );
+
+        let _ = retire_if_lost(&mut slot, Ok(()));
+        assert!(slot.is_some());
+
+        let timed_out = anyhow::Error::from(TimedOut).context("selecting mailbox INBOX");
+        assert!(retire_if_lost(&mut slot, Err::<(), _>(timed_out)).is_err());
+        assert!(
+            slot.is_none(),
+            "a session that stopped answering is dropped"
+        );
+    }
+
+    /// The IDLE task notices a stop only between commands, so one stuck on a
+    /// silent connection used to hold up every action behind `pause_idle`.
+    #[test]
+    fn an_idle_task_that_will_not_stop_is_abandoned() {
+        let backend = GmailBackend::new("user@example.com", "secret").expect("the backend");
+        // Its own runtime, with time paused, so the limit passes at once.  Not
+        // the backend's: that one must not be dropped from inside a runtime.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("a test runtime");
+        let held = Arc::new(());
+
+        runtime.block_on(async {
+            let in_task = Arc::clone(&held);
+            let stuck = tokio::spawn(async move {
+                let _held = in_task;
+                std::future::pending::<()>().await;
+            });
+            *backend.inner.idle_handle.lock().await = Some(stuck);
+
+            backend.inner.pause_idle().await.expect("pausing IDLE");
+
+            assert!(backend.inner.idle_handle.lock().await.is_none());
+            assert!(backend.inner.session.lock().await.is_none());
+        });
+
+        assert_eq!(Arc::strong_count(&held), 1, "the stuck task was dropped");
     }
 
     // ---------------------------------------------------------------
