@@ -2835,13 +2835,18 @@ fn extract_recipients(envelope: &imap_proto::Envelope<'_>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// One envelope address as `Name <user@host>`, or just the address when it
+/// carries no name -- the form the JMAP backend uses as well.
+///
+/// The same text is what the list shows and what compose puts into To and Cc
+/// when replying, so it cannot be the name alone: `Ada` is not something a
+/// reply can be sent to.
 fn decode_envelope_address(address: &imap_proto::Address<'_>, field_name: &str) -> Option<String> {
-    if let Some(name) = &address.name {
-        let decoded = decode_header(Some(name), field_name);
-        if !decoded.is_empty() {
-            return Some(decoded);
-        }
-    }
+    let name = address
+        .name
+        .as_ref()
+        .map(|name| decode_header(Some(name), field_name))
+        .filter(|name| !name.trim().is_empty());
 
     let mailbox = address
         .mailbox
@@ -2851,11 +2856,29 @@ fn decode_envelope_address(address: &imap_proto::Address<'_>, field_name: &str) 
         .host
         .as_ref()
         .and_then(|h| str::from_utf8(h.as_ref()).ok());
-
-    match (mailbox, host) {
+    let email = match (mailbox, host) {
         (Some(mailbox), Some(host)) => Some(format!("{mailbox}@{host}")),
         (Some(mailbox), None) => Some(mailbox.to_string()),
         _ => None,
+    };
+
+    match (name, email) {
+        (Some(name), Some(email)) => Some(format_mailbox(name.trim(), &email)),
+        (None, email) => email,
+        (name, None) => name,
+    }
+}
+
+/// `name <email>`, with the name quoted only where it would otherwise not
+/// read back as one -- a comma would split it into two recipients.  Left
+/// unquoted otherwise, since this is also what the message list shows.
+fn format_mailbox(name: &str, email: &str) -> String {
+    const SPECIALS: &[char] = &['"', '\\', ',', ';', ':', '<', '>', '@', '(', ')', '[', ']'];
+    if name.contains(SPECIALS) {
+        let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\" <{email}>")
+    } else {
+        format!("{name} <{email}>")
     }
 }
 
@@ -3725,14 +3748,59 @@ mod tests {
         assert_eq!(stored.seq, 3);
         assert_eq!(stored.message.id, 77);
         assert_eq!(stored.message.subject, "Hello there");
-        assert_eq!(stored.message.sender, "Ada");
-        assert_eq!(stored.message.recipients, vec!["Bob"]);
+        assert_eq!(stored.message.sender, "Ada <ada@example.com>");
+        assert_eq!(stored.message.recipients, vec!["Bob <bob@example.org>"]);
         assert_eq!(stored.message.size, 4242);
         assert_eq!(stored.message.status, MessageStatus::Read);
         assert!(!stored.message.starred);
         assert!(!stored.message.has_attachments);
         // The envelope's own Date header wins over INTERNALDATE.
         assert_eq!(stored.message.sent.unix_timestamp(), 1_772_002_800);
+    }
+
+    /// A reply addresses whatever the list holds for the sender, so that has
+    /// to read back as a mailbox -- name, quoting and all.
+    #[test]
+    fn listed_addresses_parse_back_as_mailboxes() {
+        for (name, email) in [
+            ("Ada", "ada@example.com"),
+            ("Ada Lovelace", "ada@example.com"),
+            ("Doe, John", "john@example.com"),
+            ("Sam D. Chen", "sam@example.com"),
+            ("Jürgen Müller", "j@example.de"),
+            ("O'Brien", "ob@example.ie"),
+            ("Say \"hi\"", "hi@example.com"),
+        ] {
+            let formatted = format_mailbox(name, email);
+            let parsed: LettreMailbox = formatted
+                .parse()
+                .unwrap_or_else(|err| panic!("{formatted:?} does not parse: {err}"));
+            assert_eq!(parsed.email.to_string(), email, "{formatted:?}");
+            assert_eq!(parsed.name.as_deref(), Some(name), "{formatted:?}");
+        }
+
+        // Only a name that needs it is quoted; the list shows this text too.
+        assert_eq!(
+            format_mailbox("Ada Lovelace", "ada@example.com"),
+            "Ada Lovelace <ada@example.com>"
+        );
+        assert_eq!(
+            format_mailbox("Doe, John", "john@example.com"),
+            "\"Doe, John\" <john@example.com>"
+        );
+    }
+
+    #[test]
+    fn an_address_without_a_name_is_listed_bare() {
+        let line = b"* 3 FETCH (UID 9 ENVELOPE (NIL \"Hi\" ((NIL NIL \"ada\" \"example.com\")) NIL NIL ((NIL NIL \"bob\" \"example.org\")) NIL NIL NIL NIL))\r\n";
+        let (seq, attrs) = fetch_line(line);
+
+        let stored = build_message_from_attrs(seq, &attrs)
+            .expect("building the message")
+            .expect("a FETCH with UID and ENVELOPE is a message");
+
+        assert_eq!(stored.message.sender, "ada@example.com");
+        assert_eq!(stored.message.recipients, vec!["bob@example.org"]);
     }
 
     #[test]
