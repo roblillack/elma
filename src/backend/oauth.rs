@@ -81,6 +81,9 @@ pub struct AuthorizationServer {
     /// The protected resource the tokens are wanted for, as it names itself:
     /// the JMAP session URL.  Sent as `resource` with every token request.
     pub resource: String,
+    /// Whether the server names itself in the redirect back (RFC 9207), which
+    /// makes a redirect that does not an impostor.
+    pub iss_parameter_supported: bool,
 }
 
 /// What a completed sign-in leaves behind.
@@ -422,6 +425,7 @@ pub async fn discover(session_url: &str) -> Result<AuthorizationServer> {
         registration_endpoint: metadata.registration_endpoint,
         scopes_supported: metadata.scopes_supported,
         resource,
+        iss_parameter_supported: metadata.authorization_response_iss_parameter_supported,
     })
 }
 
@@ -486,8 +490,12 @@ async fn sign_in(
     }
     println!("Waiting for the browser to come back, up to five minutes. Ctrl-C aborts.");
 
-    let expected_state = state.clone();
-    let wait = tokio::task::spawn_blocking(move || wait_for_redirect(listener, &expected_state));
+    let expected = ExpectedRedirect {
+        state: state.clone(),
+        issuer: server.issuer.clone(),
+        issuer_required: server.iss_parameter_supported,
+    };
+    let wait = tokio::task::spawn_blocking(move || wait_for_redirect(listener, &expected));
     let code = tokio::time::timeout(SIGN_IN_TIMEOUT, wait)
         .await
         .map_err(|_| anyhow!("gave up waiting for the browser after five minutes"))?
@@ -646,8 +654,19 @@ fn authorize_url(
     Ok(url.to_string())
 }
 
+/// What the redirect back from the authorization server has to carry.
+struct ExpectedRedirect {
+    /// The `state` this sign-in sent out.
+    state: String,
+    /// The issuer this sign-in was started with.
+    issuer: String,
+    /// Whether the server promised to name itself in `iss`, so that a redirect
+    /// without it cannot be from that server.
+    issuer_required: bool,
+}
+
 /// Serve loopback until the browser arrives with the authorization code.
-fn wait_for_redirect(listener: TcpListener, expected_state: &str) -> Result<String> {
+fn wait_for_redirect(listener: TcpListener, expected: &ExpectedRedirect) -> Result<String> {
     loop {
         let (stream, _) = listener
             .accept()
@@ -676,12 +695,14 @@ fn wait_for_redirect(listener: TcpListener, expected_state: &str) -> Result<Stri
 
         let mut code = None;
         let mut state = None;
+        let mut issuer = None;
         let mut error = None;
         let mut description = None;
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
                 "code" => code = Some(value.to_string()),
                 "state" => state = Some(value.to_string()),
+                "iss" => issuer = Some(value.to_string()),
                 "error" => error = Some(value.to_string()),
                 "error_description" => description = Some(value.to_string()),
                 _ => {}
@@ -700,13 +721,35 @@ fn wait_for_redirect(listener: TcpListener, expected_state: &str) -> Result<Stri
 
         // Without this the code could have been planted by any page that guessed
         // the port, and we would redeem a code obtained for someone else.
-        if state.as_deref() != Some(expected_state) {
+        if state.as_deref() != Some(expected.state.as_str()) {
             respond(
                 &stream,
                 "400 Bad Request",
                 "That request did not come from Elma.",
             );
             bail!("the redirect carried the wrong `state`, so it was not the one Elma started");
+        }
+
+        // RFC 9207: a code issued by some other authorization server -- one
+        // that has talked the user into a sign-in meant for this one -- would
+        // otherwise be redeemed here, at the token endpoint of the wrong
+        // server.  The comparison is a plain string match, as the RFC asks.
+        let issuer_matches = match issuer.as_deref() {
+            Some(issuer) => issuer == expected.issuer,
+            None => !expected.issuer_required,
+        };
+        if !issuer_matches {
+            respond(
+                &stream,
+                "400 Bad Request",
+                "That sign-in did not come from the server Elma asked.",
+            );
+            bail!(
+                "the redirect named {} as its issuer rather than {}, so the code it carries is \
+                 not one to redeem",
+                issuer.as_deref().unwrap_or("no one"),
+                expected.issuer
+            );
         }
 
         let Some(code) = code else {
@@ -858,6 +901,8 @@ struct ServerMetadata {
     scopes_supported: Vec<String>,
     #[serde(default)]
     code_challenge_methods_supported: Vec<String>,
+    #[serde(default)]
+    authorization_response_iss_parameter_supported: bool,
 }
 
 /// The `resource_metadata` a `WWW-Authenticate: Bearer` challenge points at.
@@ -1054,6 +1099,7 @@ mod tests {
                 OFFLINE_SCOPE.to_string(),
             ],
             resource: "https://api.example.com/jmap/session".to_string(),
+            iss_parameter_supported: true,
         }
     }
 
@@ -1634,6 +1680,86 @@ mod tests {
             status.is_success() || status.is_redirection(),
             "the authorization endpoint refused the request: {status}"
         );
+    }
+
+    /// Play the browser coming back to [`wait_for_redirect`] with `query`, for
+    /// a sign-in started with `https://api.example.com` and state `a-state`.
+    fn redirect_with(query: &str, issuer_required: bool) -> Result<String> {
+        use std::io::Read;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let port = listener.local_addr().expect("an address").port();
+        let expected = ExpectedRedirect {
+            state: "a-state".to_string(),
+            issuer: "https://api.example.com".to_string(),
+            issuer_required,
+        };
+        let waiting = std::thread::spawn(move || wait_for_redirect(listener, &expected));
+
+        let mut browser =
+            std::net::TcpStream::connect(("127.0.0.1", port)).expect("the listener to answer");
+        write!(
+            browser,
+            "GET {REDIRECT_PATH}?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        )
+        .expect("the request to go out");
+        let mut page = String::new();
+        let _ = browser.read_to_string(&mut page);
+        waiting.join().expect("the listener to finish")
+    }
+
+    #[test]
+    fn a_redirect_from_the_expected_issuer_is_accepted() {
+        let code = redirect_with(
+            "code=a-code&state=a-state&iss=https%3A%2F%2Fapi.example.com",
+            true,
+        )
+        .expect("the issuer is the one the sign-in started with");
+        assert_eq!(code, "a-code");
+    }
+
+    /// RFC 9207's mix-up defence: a code from another server is not redeemed.
+    #[test]
+    fn a_redirect_from_another_issuer_is_refused() {
+        let error = redirect_with(
+            "code=a-code&state=a-state&iss=https%3A%2F%2Fevil.example.com",
+            false,
+        )
+        .expect_err("a different issuer is refused even where `iss` is optional");
+        assert!(
+            error.to_string().contains("https://evil.example.com"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_redirect_without_the_promised_issuer_is_refused() {
+        let error = redirect_with("code=a-code&state=a-state", true)
+            .expect_err("a server that names itself always does");
+        assert!(error.to_string().contains("no one"), "{error}");
+    }
+
+    #[test]
+    fn a_redirect_without_an_issuer_is_fine_where_none_was_promised() {
+        let code = redirect_with("code=a-code&state=a-state", false)
+            .expect("a server that never names itself cannot be held to it");
+        assert_eq!(code, "a-code");
+    }
+
+    /// FastMail promises `iss`, and the metadata says so in a property the
+    /// sign-in has to read.
+    #[test]
+    fn the_issuer_promise_is_read_from_the_metadata() {
+        let metadata: ServerMetadata = serde_json::from_str(
+            r#"{
+                "issuer": "https://api.fastmail.com",
+                "authorization_endpoint": "https://api.fastmail.com/oauth/authorize",
+                "token_endpoint": "https://api.fastmail.com/oauth/refresh",
+                "authorization_response_iss_parameter_supported": true
+            }"#,
+        )
+        .expect("the metadata to parse");
+        assert!(metadata.authorization_response_iss_parameter_supported);
     }
 
     /// The URL reaches the browser whole, `&`s and all.
