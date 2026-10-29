@@ -402,6 +402,22 @@ fn search_filters_while_typing() {
     assert_svg("search_filters_while_typing", &mut app);
 }
 
+/// An umlaut is one character but two bytes, and the line has to draw with the
+/// caret anywhere in the query -- after one, or in the middle of the word.
+#[test]
+fn search_input_takes_umlauts() {
+    let mut app = inbox();
+    app.char('/');
+    app.type_text("grüße");
+    app.key(KeyCode::Left);
+    app.key(KeyCode::Left);
+    app.char('ö');
+    assert_on_screen(&app, "Find: grüöße");
+
+    app.key(KeyCode::Enter);
+    assert_on_screen(&app, "grüöße");
+}
+
 /// Enter hands the list back the keyboard and the query moves into a panel in
 /// the corner, which is what says the list is still filtered.
 #[test]
