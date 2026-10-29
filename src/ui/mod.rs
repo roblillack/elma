@@ -377,21 +377,21 @@ fn render_search_panel(
     }
 
     let label = "Find: ";
-    let (before_cursor, after_cursor) = value.split_at(cursor.min(value.len()));
+    let label_width = label.width() as u16;
+    let (visible, cursor_col) =
+        text_field_view(value, cursor, area.width.saturating_sub(label_width));
     let help = " (input search terms; press <Enter> to activate, <Esc> to cancel)";
 
     let spans = vec![
         Span::raw(label),
-        Span::raw(before_cursor),
-        Span::raw(after_cursor),
+        Span::raw(visible),
         Span::styled(help, theme.hint_style()),
     ];
     let paragraph = Paragraph::new(Line::from(spans));
     frame.render_widget(paragraph, area);
 
-    let label_width = label.chars().count() as u16;
     let max_x = area.x + area.width.saturating_sub(1);
-    let cursor_x = (area.x + label_width + cursor as u16).min(max_x);
+    let cursor_x = (area.x + label_width + cursor_col).min(max_x);
     Some((cursor_x, area.y))
 }
 
@@ -409,7 +409,7 @@ fn render_search_popup(frame: &mut Frame<'_>, area: Rect, app: &App, surface: Su
 
     let line1 = "Showing results for:";
     // 1 char padding on each side inside the border
-    let inner_width = (line1.len() as u16).max(value.len() as u16) + 2;
+    let inner_width = (line1.len() as u16).max(value.width() as u16) + 2;
 
     let bottom_label = "/:Change  Esc:Clear";
     let inner_width = inner_width.max(bottom_label.len() as u16);
