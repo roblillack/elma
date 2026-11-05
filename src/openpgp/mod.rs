@@ -19,12 +19,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use keyring::{Cert, KeyPart, KeyRef, Keyring, Usage};
 use pgp::{
     composed::{
-        ArmorOptions, CleartextSignedMessage, Deserializable, DetachedSignature, Esk, Message,
-        MessageBuilder, PlainSessionKey, SignedSecretKey,
+        ArmorOptions, CleartextSignedMessage, DecryptionOptions, Deserializable, DetachedSignature,
+        Esk, Message, MessageBuilder, PlainSessionKey, SignedSecretKey, TheRing,
     },
     crypto::{hash::HashAlgorithm, sym::SymmetricKeyAlgorithm},
     packet::{PublicKeyEncryptedSessionKey, Signature},
-    types::{DecryptionKey, EskType, KeyDetails, Password, PkeskVersion, SecretParams, SigningKey},
+    types::{
+        DecryptionKey, EskType, KeyDetails, Password, PkeskVersion, SecretParams, SigningKey, Tag,
+    },
 };
 use prompt::{PassphraseRequest, PassphraseSource};
 use std::{
@@ -35,7 +37,7 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-use crate::model::{SignatureState, SignatureVerdict};
+use crate::model::{EncryptionState, SignatureState, SignatureVerdict};
 
 /// The digest every signature Elma makes is computed with.  PGP/MIME names it
 /// in the `micalg` parameter, so it is fixed rather than taken from the key.
@@ -135,6 +137,20 @@ struct Keys {
 pub(crate) struct Decrypted {
     pub(crate) data: Vec<u8>,
     pub(crate) signatures: Vec<SignatureState>,
+    /// Encrypted the way OpenPGP did before integrity protection (the
+    /// Symmetrically Encrypted Data packet, RFC 4880 section 5.7): whoever
+    /// had the ciphertext could have changed it without that showing.
+    pub(crate) unprotected: bool,
+}
+
+impl Decrypted {
+    pub(crate) fn encryption_state(&self) -> EncryptionState {
+        if self.unprotected {
+            EncryptionState::Unprotected
+        } else {
+            EncryptionState::Decrypted
+        }
+    }
 }
 
 /// Something that can make a signature: the agent, or a key read from a file.
@@ -352,16 +368,28 @@ impl Crypto {
     pub(crate) fn decrypt(&self, data: &[u8], sender: Option<&str>) -> Result<Decrypted> {
         let message = parse_message(data)?;
 
+        let mut unprotected = false;
         let message = match message {
-            Message::Encrypted { ref esk, .. } => {
+            Message::Encrypted {
+                ref esk, ref edata, ..
+            } => {
+                unprotected = edata.tag() == Tag::SymEncryptedData;
                 let session_key = self.find_session_key(esk)?;
+                let ring = TheRing {
+                    session_keys: vec![session_key],
+                    decrypt_options: decryption_options(),
+                    ..Default::default()
+                };
                 message
-                    .decrypt_with_session_key(session_key)
+                    .decrypt_the_ring(ring, true)
+                    .map(|(message, _)| message)
                     .map_err(|err| anyhow!("decrypting the message: {err}"))?
             }
             other => other,
         };
-        self.read_message(message, sender)
+        let mut decrypted = self.read_message(message, sender)?;
+        decrypted.unprotected = unprotected;
+        Ok(decrypted)
     }
 
     fn read_message(&self, mut message: Message<'_>, sender: Option<&str>) -> Result<Decrypted> {
@@ -392,7 +420,11 @@ impl Crypto {
                 }));
             }
         }
-        Ok(Decrypted { data, signatures })
+        Ok(Decrypted {
+            data,
+            signatures,
+            unprotected: false,
+        })
     }
 
     /// Find the key a signature claims, run `check` against it, and say what
@@ -831,6 +863,18 @@ fn parse_detached(data: &[u8]) -> Result<Vec<DetachedSignature>> {
         .map_err(|err| anyhow!("{err}"))?
         .collect::<pgp::errors::Result<Vec<_>>>()
         .map_err(|err| anyhow!("{err}"))
+}
+
+/// What `decrypt` reads besides the standard SEIPD packets.
+///
+/// GnuPG's own AEAD packet (type 20, OCB): GnuPG 2.3 and later write it
+/// whenever every recipient's key says it can read it, as the keys they
+/// generate do.  It is as well protected as the standard formats.
+///
+/// The packet from before integrity protection (type 9): mail from that time
+/// should still open.  It is marked as unprotected wherever it is shown.
+fn decryption_options() -> DecryptionOptions {
+    DecryptionOptions::new().enable_gnupg_aead().enable_legacy()
 }
 
 fn parse_message(data: &[u8]) -> Result<Message<'_>> {

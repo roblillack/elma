@@ -162,6 +162,10 @@ pub struct SecurityInfo {
 pub enum EncryptionState {
     /// Encrypted, and decrypted for display.
     Decrypted,
+    /// Decrypted, but encrypted the way OpenPGP did before integrity
+    /// protection: it could have been changed on the way without that
+    /// showing.
+    Unprotected,
     /// Encrypted, and could not be decrypted.
     Failed(String),
 }
@@ -211,6 +215,7 @@ impl SecurityInfo {
     pub fn level(&self) -> SecurityLevel {
         let encryption = match &self.encryption {
             Some(EncryptionState::Failed(_)) => SecurityLevel::Bad,
+            Some(EncryptionState::Unprotected) => SecurityLevel::Uncertain,
             _ => SecurityLevel::Good,
         };
         self.signatures
@@ -226,6 +231,9 @@ impl SecurityInfo {
         let mut parts = Vec::new();
         match &self.encryption {
             Some(EncryptionState::Decrypted) => parts.push("Encrypted".to_string()),
+            Some(EncryptionState::Unprotected) => {
+                parts.push("Encrypted in the old format without integrity protection".to_string())
+            }
             Some(EncryptionState::Failed(reason)) => {
                 parts.push(format!("Encrypted, cannot decrypt: {reason}"))
             }

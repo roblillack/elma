@@ -361,7 +361,9 @@ that needs it. The OpenPGP itself is done by
 - `✔` — a good signature from a key carrying the sender's address, and/or
   successfully decrypted.
 - `?` — a good signature that proves less than it seems: by a key Elma does not
-  have, or by a key that is not the sender's.
+  have, or by a key that is not the sender's. Also mail encrypted the way it
+  was before OpenPGP had integrity protection (into the early 2000s): it
+  opens, but it could have been changed on the way without that showing.
 - `✘` — a bad signature, a revoked or expired signing key, or a message that
   could not be decrypted (its text says why, and the ciphertext is offered as
   `encrypted.asc` in the _Save attachment_ dialog).

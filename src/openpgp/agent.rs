@@ -200,6 +200,14 @@ impl Agent {
                 Atom(b"enc-val"),
                 List(&[Atom(b"rsa"), List(&[Atom(b"a"), Atom(mpi.as_ref())])]),
             ]),
+            PkeskBytes::Elgamal { first, second } => sexp(&[
+                Atom(b"enc-val"),
+                List(&[
+                    Atom(b"elg"),
+                    List(&[Atom(b"a"), Atom(first.as_ref())]),
+                    List(&[Atom(b"b"), Atom(second.as_ref())]),
+                ]),
+            ]),
             PkeskBytes::Ecdh {
                 public_point,
                 encrypted_session_key,
@@ -236,7 +244,11 @@ impl Agent {
             .any(|line| line.trim() == "PADDING 0");
 
         let frame: Zeroizing<Vec<u8>> = match values {
-            PkeskBytes::Rsa { .. } => Zeroizing::new(strip_pkcs1(&value, padding_removed)?),
+            // ElGamal pads the session key the way RSA does (RFC 4880 section
+            // 13.1), and the agent hands it back padded just the same.
+            PkeskBytes::Rsa { .. } | PkeskBytes::Elgamal { .. } => {
+                Zeroizing::new(strip_pkcs1(&value, padding_removed)?)
+            }
             PkeskBytes::Ecdh {
                 encrypted_session_key,
                 ..
@@ -606,7 +618,7 @@ fn left_pad(data: &[u8], len: usize) -> Vec<u8> {
     out
 }
 
-/// Take the session-key frame out of an RSA decryption.
+/// Take the session-key frame out of an RSA or ElGamal decryption.
 ///
 /// A software key comes back with its PKCS#1 v1.5 padding still on; a card
 /// strips it and says so with `PADDING 0`.
@@ -617,12 +629,12 @@ fn strip_pkcs1(value: &[u8], padding_removed: bool) -> Result<Vec<u8>> {
     // The leading zero octet is usually gone already, eaten as an MPI.
     let value = value.strip_prefix(&[0]).unwrap_or(value);
     let Some(rest) = value.strip_prefix(&[2]) else {
-        bail!("RSA decryption returned an unexpected block");
+        bail!("decryption returned an unexpected block");
     };
     let separator = rest
         .iter()
         .position(|b| *b == 0)
-        .ok_or_else(|| anyhow!("RSA decryption returned a block without a separator"))?;
+        .ok_or_else(|| anyhow!("decryption returned a block without a separator"))?;
     Ok(rest[separator + 1..].to_vec())
 }
 
@@ -778,10 +790,31 @@ fn sexp_value(data: &[u8], name: &[u8]) -> Option<Vec<u8>> {
 /// The key material in a `public-key` expression, in the form
 /// [`super::keyring::key_material`] produces from a certificate.
 fn sexp_key_material(data: &[u8]) -> Option<Vec<u8>> {
-    if let Some(q) = sexp_value(data, b"q") {
-        return Some(super::keyring::normalize_point(&q));
+    match sexp_algorithm(data).as_deref() {
+        Some(b"elg") => sexp_value(data, b"y").map(|y| super::keyring::strip_zeros(&y).to_vec()),
+        // A DSA key has a `q` as well, but it is the group order, not a point.
+        Some(b"dsa") => None,
+        _ => {
+            if let Some(q) = sexp_value(data, b"q") {
+                return Some(super::keyring::normalize_point(&q));
+            }
+            sexp_value(data, b"n").map(|n| super::keyring::strip_zeros(&n).to_vec())
+        }
     }
-    sexp_value(data, b"n").map(|n| super::keyring::strip_zeros(&n).to_vec())
+}
+
+/// The algorithm a `public-key` expression is for: `rsa`, `elg`, `ecc`...
+fn sexp_algorithm(data: &[u8]) -> Option<Vec<u8>> {
+    let Sexp::List(items) = parse_sexp(data)? else {
+        return None;
+    };
+    let [_, Sexp::List(key), ..] = items.as_slice() else {
+        return None;
+    };
+    let [Sexp::Atom(algorithm), ..] = key.as_slice() else {
+        return None;
+    };
+    Some(algorithm.clone())
 }
 
 #[cfg(test)]

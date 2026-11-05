@@ -608,7 +608,8 @@ fn keybox_blocks(data: &[u8]) -> Option<Vec<&[u8]>> {
 }
 
 /// The public key material of a key, in a form that can be compared with what
-/// gpg-agent reports: the modulus for RSA, the point for elliptic curves.
+/// gpg-agent reports: the modulus for RSA, the point for elliptic curves, the
+/// public value `y` for ElGamal.
 pub(crate) fn key_material(params: &PublicParams) -> Option<Vec<u8>> {
     let bytes = params.to_bytes().ok()?;
     match params {
@@ -624,6 +625,9 @@ pub(crate) fn key_material(params: &PublicParams) -> Option<Vec<u8>> {
             point.extend_from_slice(&bytes);
             Some(point)
         }
+        // `p`, `g`, then `y`.  Keys made by one program often share `p` and
+        // `g`; `y` is the key's own.
+        PublicParams::Elgamal(_) => nth_mpi(&bytes, 2).map(|y| strip_zeros(y).to_vec()),
         _ => None,
     }
 }
@@ -631,6 +635,15 @@ pub(crate) fn key_material(params: &PublicParams) -> Option<Vec<u8>> {
 fn first_mpi(data: &[u8]) -> Option<&[u8]> {
     let bits = u16::from_be_bytes(data.get(0..2)?.try_into().ok()?) as usize;
     data.get(2..2 + bits.div_ceil(8))
+}
+
+/// The MPI at `index` in a run of them.
+fn nth_mpi(mut data: &[u8], index: usize) -> Option<&[u8]> {
+    for _ in 0..index {
+        let skip = 2 + first_mpi(data)?.len();
+        data = data.get(skip..)?;
+    }
+    first_mpi(data)
 }
 
 pub(crate) fn strip_zeros(data: &[u8]) -> &[u8] {

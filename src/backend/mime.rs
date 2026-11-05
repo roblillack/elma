@@ -206,7 +206,7 @@ impl Collector<'_> {
 
         match outcome {
             Ok(decrypted) => {
-                self.security.encryption = Some(EncryptionState::Decrypted);
+                self.security.encryption = Some(decrypted.encryption_state());
                 self.security.signatures.extend(decrypted.signatures);
                 let inner = mailparse::parse_mail(&decrypted.data)
                     .context("parsing the decrypted message")?;
@@ -335,7 +335,7 @@ impl Collector<'_> {
                 Block::Encrypted => {
                     match crypto.decrypt(block.as_bytes(), self.sender.as_deref()) {
                         Ok(decrypted) => {
-                            self.security.encryption = Some(EncryptionState::Decrypted);
+                            self.security.encryption = Some(decrypted.encryption_state());
                             let signed = !decrypted.signatures.is_empty();
                             self.security.signatures.extend(decrypted.signatures);
                             let label = if signed {

@@ -659,6 +659,9 @@ impl GnupgHome {
         use std::io::Write;
         let mut child = std::process::Command::new("gpg")
             .env("GNUPGHOME", self.path())
+            // The test reads gpg's messages, so they had better be English.
+            .env("LC_ALL", "C")
+            .env("LANGUAGE", "C")
             .args([
                 "--batch",
                 "--yes",
@@ -694,6 +697,17 @@ impl GnupgHome {
             signing_key: None,
         };
         Crypto::new(settings, Box::new(answers))
+    }
+
+    fn fingerprint(&self, email: &str) -> String {
+        String::from_utf8(self.gpg(&["--with-colons", "-k", email], b""))
+            .unwrap()
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("fpr:")
+                    .map(|rest| rest.trim_matches(':').to_string())
+            })
+            .unwrap()
     }
 
     fn keygrips(&self, email: &str) -> Vec<String> {
@@ -758,14 +772,7 @@ fn gnupg_interoperability() {
         ],
         b"",
     );
-    let alice_fpr = String::from_utf8(home.gpg(&["--with-colons", "-k", "alice@example.com"], b""))
-        .unwrap()
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("fpr:")
-                .map(|rest| rest.trim_matches(':').to_string())
-        })
-        .unwrap();
+    let alice_fpr = home.fingerprint("alice@example.com");
     home.gpg(
         &[
             "--passphrase",
@@ -790,14 +797,7 @@ fn gnupg_interoperability() {
         ],
         b"",
     );
-    let bob_fpr = String::from_utf8(home.gpg(&["--with-colons", "-k", "bob@example.com"], b""))
-        .unwrap()
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("fpr:")
-                .map(|rest| rest.trim_matches(':').to_string())
-        })
-        .unwrap();
+    let bob_fpr = home.fingerprint("bob@example.com");
     home.gpg(
         &[
             "--passphrase",
@@ -805,6 +805,33 @@ fn gnupg_interoperability() {
             "--quick-add-key",
             &bob_fpr,
             "rsa2048",
+            "encr",
+            "never",
+        ],
+        b"",
+    );
+
+    // Carol: DSA and ElGamal, the kind of key everyone made around 2000.
+    home.gpg(
+        &[
+            "--passphrase",
+            "",
+            "--quick-gen-key",
+            "Carol <carol@example.com>",
+            "dsa2048",
+            "sign,cert",
+            "never",
+        ],
+        b"",
+    );
+    let carol_fpr = home.fingerprint("carol@example.com");
+    home.gpg(
+        &[
+            "--passphrase",
+            "",
+            "--quick-add-key",
+            &carol_fpr,
+            "elg2048",
             "encr",
             "never",
         ],
@@ -873,6 +900,49 @@ fn gnupg_interoperability() {
         1,
         "asked once, in Elma"
     );
+
+    // Encrypted to Carol (ElGamal, through the agent), as gpg writes it now...
+    let crypto = home.crypto(Answers::default());
+    let armored = home.gpg(&["--armor", "--encrypt", "-r", "carol@example.com"], entity);
+    let raw = pgp_mime_encrypted("alice@example.com", "carol@example.com", &armored);
+    let content = read(&crypto, &raw);
+    let security = content.security.as_ref().expect("a verdict");
+    assert_eq!(
+        security.encryption,
+        Some(EncryptionState::Decrypted),
+        "{security:?}"
+    );
+    assert!(plain_text(&content).contains("Hello from gpg"));
+
+    // ...and as mail was written before integrity protection: it opens, and
+    // says what it is.
+    let armored = home.gpg(
+        &[
+            "--armor",
+            "--rfc2440",
+            "--cipher-algo",
+            "CAST5",
+            "--encrypt",
+            "-r",
+            "carol@example.com",
+        ],
+        entity,
+    );
+    let raw = pgp_mime_encrypted("alice@example.com", "carol@example.com", &armored);
+    let content = read(&crypto, &raw);
+    let security = content.security.as_ref().expect("a verdict");
+    assert_eq!(
+        security.encryption,
+        Some(EncryptionState::Unprotected),
+        "{security:?}"
+    );
+    assert_eq!(security.level(), SecurityLevel::Uncertain);
+    assert!(
+        security.summary().contains("without integrity protection"),
+        "{}",
+        security.summary()
+    );
+    assert!(plain_text(&content).contains("Hello from gpg"));
 
     // A PGP/MIME signature made by gpg.
     // RFC 3156: the CRLF before the boundary is the boundary's, not the
