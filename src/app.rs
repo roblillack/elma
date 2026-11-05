@@ -3814,7 +3814,7 @@ impl App {
                     Some(content) => content,
                     None => backend
                         .load_message(message_id)
-                        .map_err(|err| err.to_string())?,
+                        .map_err(|err| format!("{err:#}"))?,
                 };
                 let (attachments, unavailable) = if needs_attachments {
                     restore_compose_attachments(backend.as_ref(), &content)
@@ -4881,7 +4881,9 @@ impl App {
                 OutgoingKind::Send => backend.send_message(message),
                 OutgoingKind::Draft => backend.save_draft(message),
             };
-            let _ = sender.send(result.map_err(|err| err.to_string()));
+            // The alternate form keeps the cause: "building SMTP message" alone
+            // says nothing about the key that was missing.
+            let _ = sender.send(result.map_err(|err| format!("{err:#}")));
         });
 
         if let Some(compose) = self.compose.as_mut() {

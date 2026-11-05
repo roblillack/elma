@@ -2,7 +2,7 @@
 //!
 //! Read straight from GnuPG's home, so a key imported with `gpg --import` or
 //! fetched with `gpg --locate-keys` is usable here without exporting anything:
-//! `pubring.kbx` for GnuPG 2.1 and later, `pubring.gpg` for older homes.  Files
+//! `pubring.gpg` where it exists, as gpg does, and `pubring.kbx` otherwise.  Files
 //! named in the configuration are read on top of that.  Everything is read
 //! again when one of the files changes, so a key imported while Elma runs is
 //! picked up by the next message that needs it.

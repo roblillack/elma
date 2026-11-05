@@ -86,13 +86,17 @@ impl Settings {
     fn keyring_paths(&self) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         if let Some(home) = &self.gnupg_home {
-            let kbx = home.join("pubring.kbx");
-            // GnuPG 2.1 migrates to the keybox and leaves the old file behind;
-            // reading both would only find the same keys twice, or stale ones.
-            if kbx.exists() {
-                paths.push(kbx);
+            // The file gpg itself reads: an existing `pubring.gpg` wins, and
+            // `pubring.kbx` is only where a home without one keeps its keys.
+            // GnuPG 2.1 does not migrate `pubring.gpg`, so a home can hold
+            // both, with the keys in the old file and an empty keybox some
+            // other tool created beside it.  (gpg tells the two formats apart
+            // by content, not name, and so does `Keyring::load`.)
+            let legacy = home.join("pubring.gpg");
+            if legacy.exists() {
+                paths.push(legacy);
             } else {
-                paths.push(home.join("pubring.gpg"));
+                paths.push(home.join("pubring.kbx"));
             }
         }
         paths.extend(self.key_files.iter().cloned());

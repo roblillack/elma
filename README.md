@@ -347,8 +347,8 @@ signature logo to every forwarded newsletter.
 
 Elma reads and writes OpenPGP mail — PGP/MIME (RFC 3156) and inline PGP —
 using your existing GnuPG setup. There is nothing to export or import: public
-keys come straight from GnuPG's keyring (`pubring.kbx`, or `pubring.gpg` in
-older homes), and secret keys stay in `gpg-agent`, which Elma asks to decrypt
+keys come straight from the keyring `gpg` itself reads (`pubring.gpg` if
+there is one, otherwise `pubring.kbx`), and secret keys stay in `gpg-agent`, which Elma asks to decrypt
 and sign the same way `gpg` does. The agent's passphrase cache is shared with
 `gpg`, keys on a smartcard are reached through the agent like any other, and a
 key you `gpg --import` while Elma is running is picked up by the next message

@@ -391,6 +391,37 @@ fn encrypting_to_someone_without_a_key_names_them() {
 }
 
 #[test]
+fn keys_come_from_the_keyring_gpg_reads_even_beside_an_empty_keybox() {
+    use pgp::ser::Serialize;
+
+    let bob = person("Bob", "bob@example.com", None);
+    let home = tempfile::tempdir().expect("a temporary directory");
+    // GnuPG 2.1 and later keep reading a `pubring.gpg` they find...
+    std::fs::write(
+        home.path().join("pubring.gpg"),
+        bob.public().to_bytes().expect("serialising"),
+    )
+    .unwrap();
+    // ...even with a keybox beside it that holds nothing but its header.
+    let mut kbx = vec![0, 0, 0, 32, 1, 1, 0, 0];
+    kbx.extend(b"KBXf");
+    kbx.resize(32, 0);
+    std::fs::write(home.path().join("pubring.kbx"), kbx).unwrap();
+
+    let settings = Settings {
+        gnupg_home: Some(home.path().to_path_buf()),
+        use_agent: false,
+        loopback_pinentry: true,
+        key_files: Vec::new(),
+        sign_by_default: false,
+        encrypt_by_default: false,
+        signing_key: None,
+    };
+    let crypto = Crypto::new(settings, Box::new(Answers::default()));
+    assert!(crypto.missing_keys(&[bob.address.into()]).is_empty());
+}
+
+#[test]
 fn a_locked_key_asks_for_its_passphrase_and_again_when_it_was_wrong() {
     let alice = person("Alice", "alice@example.com", None);
     let bob = person("Bob", "bob@example.com", Some("correct horse"));
