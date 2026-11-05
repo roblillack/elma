@@ -838,6 +838,22 @@ fn gnupg_interoperability() {
         b"",
     );
 
+    // Dave: a key that expired, made with the clock turned back.
+    home.gpg(
+        &[
+            "--passphrase",
+            "",
+            "--faked-system-time",
+            "20200101T000000",
+            "--quick-gen-key",
+            "Dave <dave@example.com>",
+            "default",
+            "default",
+            "1y",
+        ],
+        b"",
+    );
+
     let forget_bobs_passphrase = || {
         for grip in home.keygrips("bob@example.com") {
             home.agent(&format!("CLEAR_PASSPHRASE --mode=normal {grip}"));
@@ -995,6 +1011,58 @@ fn gnupg_interoperability() {
         SignatureVerdict::Good,
         "{:?}",
         content.security
+    );
+
+    // --- Keys Elma cannot encrypt to --------------------------------------
+
+    // Carol's ElGamal subkey says it is for encryption, but rPGP cannot
+    // encrypt to ElGamal: she has no key here, and the error says why.
+    let crypto = home.crypto(Answers::default());
+    let err = compose(
+        &crypto,
+        "alice@example.com",
+        "carol@example.com",
+        "Hi",
+        vec![],
+        false,
+        true,
+    )
+    .expect_err("there is no key Elma can encrypt to");
+    assert!(
+        format!("{err:#}").contains("carol@example.com") && format!("{err:#}").contains("ElGamal"),
+        "{err:#}"
+    );
+    assert_eq!(
+        crypto.missing_keys(&["carol@example.com".into()]),
+        vec!["carol@example.com".to_string()]
+    );
+    // Writing as Carol to Alice still works: her own copy is the one left
+    // out, not the message.
+    compose(
+        &crypto,
+        "carol@example.com",
+        "alice@example.com",
+        "Hi",
+        vec![],
+        false,
+        true,
+    )
+    .expect("Carol's own ElGamal key does not stop the message");
+
+    // Dave's key expired, and the error says when.
+    let err = compose(
+        &crypto,
+        "alice@example.com",
+        "dave@example.com",
+        "Hi",
+        vec![],
+        false,
+        true,
+    )
+    .expect_err("an expired key is not encrypted to");
+    assert!(
+        format!("{err:#}").contains("the key expired on 2020-12-31"),
+        "{err:#}"
     );
 
     // --- Elma writes, gpg reads -------------------------------------------

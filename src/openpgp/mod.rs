@@ -615,6 +615,7 @@ impl Crypto {
         self.with_keys(|store| {
             for address in recipients {
                 let mut found = false;
+                let mut reasons = Vec::new();
                 for cert in store.keyring.by_email(address) {
                     if cert.valid_user_for(address).is_none() {
                         continue;
@@ -622,10 +623,24 @@ impl Crypto {
                     if let Some(key) = cert.usable_keys(Usage::Encrypt, now).into_iter().next() {
                         keys.push(key);
                         found = true;
+                    } else {
+                        let fpr = cert.fingerprint_hex();
+                        let id = &fpr[fpr.len().saturating_sub(16)..];
+                        reasons.push(format!(
+                            "{id}: {}",
+                            cert.unusable_reason(Usage::Encrypt, now)
+                        ));
                     }
                 }
+                // Keys that are there but cannot be used are named, with why:
+                // "no usable key" alone sends the user looking for a key gpg
+                // shows them plainly.
                 if !found {
-                    missing.push(address.clone());
+                    missing.push(if reasons.is_empty() {
+                        address.clone()
+                    } else {
+                        format!("{address} ({})", reasons.join("; "))
+                    });
                 }
             }
         });

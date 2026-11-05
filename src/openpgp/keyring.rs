@@ -154,10 +154,32 @@ impl Cert {
             return Some("the key has been revoked".to_string());
         }
         let self_sig = self.newest_self_signature()?;
-        if expired(primary.created_at(), self_sig, now) {
-            return Some("the key has expired".to_string());
+        if let Some(expires) = expiry(primary.created_at(), self_sig)
+            && now >= expires
+        {
+            let date = chrono::DateTime::<chrono::Utc>::from(expires).format("%Y-%m-%d");
+            return Some(format!("the key expired on {date}"));
         }
         None
+    }
+
+    /// Why [`Cert::usable_keys`] finds nothing for `usage`, in words the
+    /// user can act on.
+    pub(crate) fn unusable_reason(&self, usage: Usage, now: SystemTime) -> String {
+        if let Some(problem) = self.problem(now) {
+            return problem;
+        }
+        match usage {
+            Usage::Encrypt
+                if self.key.public_subkeys.iter().any(|sub| {
+                    sub.key.algorithm().can_encrypt() && !can_encrypt_to(sub.key.algorithm())
+                }) =>
+            {
+                "its encryption subkey is ElGamal, which Elma cannot encrypt to".to_string()
+            }
+            Usage::Encrypt => "it has no usable encryption subkey".to_string(),
+            Usage::Sign => "it has no usable signing key".to_string(),
+        }
     }
 
     /// The newest valid self-signature over one of the user IDs, which is
@@ -237,7 +259,10 @@ impl Cert {
                 let flags = binding.key_flags();
                 let fits = match usage {
                     Usage::Sign => flags.sign(),
-                    Usage::Encrypt => flags.encrypt_comms() || flags.encrypt_storage(),
+                    Usage::Encrypt => {
+                        (flags.encrypt_comms() || flags.encrypt_storage())
+                            && can_encrypt_to(sub.key.algorithm())
+                    }
                 };
                 if !fits || expired(sub.key.created_at(), binding, now) {
                     return None;
@@ -268,7 +293,7 @@ impl Cert {
             };
             let capable = match usage {
                 Usage::Sign => primary.algorithm().can_sign(),
-                Usage::Encrypt => primary.algorithm().can_encrypt(),
+                Usage::Encrypt => can_encrypt_to(primary.algorithm()),
             };
             if fits && capable {
                 keys.push(KeyPart::Primary(primary.clone()));
@@ -353,16 +378,25 @@ fn current_binding<'a>(
     (newest.typ() == Some(SignatureType::SubkeyBinding)).then_some(newest)
 }
 
+/// Whether rPGP can encrypt to a key of `algorithm`.  It cannot to ElGamal,
+/// the encryption half of the DSA keys of the 2000s: such a key is no
+/// encryption key at all here, rather than one that fails the whole message.
+fn can_encrypt_to(algorithm: pgp::crypto::public_key::PublicKeyAlgorithm) -> bool {
+    use pgp::crypto::public_key::PublicKeyAlgorithm::{Elgamal, ElgamalEncrypt};
+    algorithm.can_encrypt() && !matches!(algorithm, Elgamal | ElgamalEncrypt)
+}
+
 fn expired(created: Timestamp, sig: &Signature, now: SystemTime) -> bool {
-    let Some(lifetime) = sig.key_expiration_time() else {
-        return false;
-    };
+    expiry(created, sig).is_some_and(|expires| now >= expires)
+}
+
+/// When a key created at `created` expires by `sig`, if it does.
+fn expiry(created: Timestamp, sig: &Signature) -> Option<SystemTime> {
+    let lifetime = sig.key_expiration_time()?;
     if lifetime.as_secs() == 0 {
-        return false;
+        return None;
     }
-    let expires =
-        SystemTime::from(created) + std::time::Duration::from_secs(lifetime.as_secs().into());
-    now >= expires
+    Some(SystemTime::from(created) + std::time::Duration::from_secs(lifetime.as_secs().into()))
 }
 
 /// A key as a signature or ciphertext names it.

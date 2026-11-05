@@ -528,6 +528,51 @@ fn render_search_popup(frame: &mut Frame<'_>, area: Rect, app: &App, surface: Su
 /// the two prompts compose puts up itself are found here.  Either way the
 /// dialog steps back to the covered surface, so the box taking keys is the one
 /// that stands out.
+/// How tall the line under the compose buttons may grow.
+const COMPOSE_STATUS_MAX_LINES: usize = 4;
+
+/// `text` broken into lines of at most `width` columns at spaces, a word too
+/// long for a line split where it must.  More than `max_lines` and the last
+/// one ends in `…`.
+fn wrap_words(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let needed = if line.is_empty() { 0 } else { line.width() + 1 } + word.width();
+        if needed <= width {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        for ch in word.chars() {
+            if line.width() + ch.width().unwrap_or(0) > width {
+                lines.push(std::mem::take(&mut line));
+            }
+            line.push(ch);
+        }
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        let last = lines.last_mut().expect("max_lines is not zero");
+        while !last.is_empty() && last.width() + 1 > width {
+            last.pop();
+        }
+        last.push('…');
+    }
+    lines
+}
+
 fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by_menu: bool) {
     if app.compose_state().is_none() {
         render_inbox(frame, app, theme);
@@ -598,6 +643,28 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
         .compose_state()
         .is_some_and(|state| state.pgp().is_some());
     let header_rows: u16 = if has_pgp_row { 5 } else { 4 };
+
+    // While the backend has the message the whole view is read-only, so nothing
+    // offers focus: no lit button, no cursor.
+    let pending_outgoing = app
+        .pending_outgoing()
+        .map(|(label, elapsed)| format!("{} — please wait", progress_text(label, elapsed)));
+    let busy = pending_outgoing.is_some();
+
+    // The frame lists the keys, so the line under the buttons is left with what
+    // no key can tell the user -- or the question the next key answers, which
+    // has to be readable even while a send is in flight.
+    let question = app.confirmation_prompt().map(|text| text.to_string());
+    let asking = question.is_some();
+    let status_text = question
+        .or(pending_outgoing)
+        .or_else(|| app.compose_status_line().map(|text| text.to_string()))
+        .unwrap_or_else(|| "Drop a file on the terminal to attach it.".to_string());
+    // An error is only useful whole -- the reason comes last -- so the line
+    // grows to take it, at the body's expense.
+    let status_lines = wrap_words(&status_text, inner.width as usize, COMPOSE_STATUS_MAX_LINES);
+    let status_height = status_lines.len().max(1) as u16;
+
     let attachments_height = if attachment_count == 0 {
         0
     } else {
@@ -613,7 +680,7 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
             Constraint::Length(attachments_height),
             Constraint::Min(4),
             Constraint::Length(2),
-            Constraint::Length(1),
+            Constraint::Length(status_height),
         ])
         .split(inner);
 
@@ -654,28 +721,12 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
 
     render_compose_body(frame, layout[2], app, surface);
 
-    // While the backend has the message the whole view is read-only, so nothing
-    // offers focus: no lit button, no cursor.
-    let pending_outgoing = app
-        .pending_outgoing()
-        .map(|(label, elapsed)| format!("{} — please wait", progress_text(label, elapsed)));
-    let busy = pending_outgoing.is_some();
-
     {
         let state = app.compose_state().expect("compose state should exist");
         render_compose_buttons(frame, layout[3], state, busy, surface);
     }
 
-    // The frame lists the keys, so the line under the buttons is left with what
-    // no key can tell the user -- or the question the next key answers, which
-    // has to be readable even while a send is in flight.
-    let question = app.confirmation_prompt().map(|text| text.to_string());
-    let asking = question.is_some();
-    let status_text = question
-        .or(pending_outgoing)
-        .or_else(|| app.compose_status_line().map(|text| text.to_string()))
-        .unwrap_or_else(|| "Drop a file on the terminal to attach it.".to_string());
-    let status = Paragraph::new(status_text)
+    let status = Paragraph::new(status_lines.into_iter().map(Line::from).collect::<Vec<_>>())
         .style(if busy || asking {
             surface.style().patch(surface.warning_style())
         } else {
@@ -1956,7 +2007,39 @@ fn plain_text(content: &crate::model::MessageContent) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LoadPhase, LoadingState, MailboxKind, Surface, Theme, text_field_view};
+    use super::{
+        LoadPhase, LoadingState, MailboxKind, Surface, Theme, text_field_view, wrap_words,
+    };
+
+    #[test]
+    fn a_long_status_wraps_at_spaces_and_keeps_its_end() {
+        let error = "Failed to send: building outgoing message: encrypting the message: \
+                     no usable OpenPGP key for rob@example.com";
+        let lines = wrap_words(error, 40, 4);
+        assert!(
+            lines.iter().all(|line| line.chars().count() <= 40),
+            "{lines:?}"
+        );
+        assert_eq!(lines.join(" "), error);
+        assert!(
+            lines.last().unwrap().ends_with("rob@example.com"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_status_too_long_for_its_lines_ends_in_an_ellipsis() {
+        let lines = wrap_words(&"word ".repeat(40), 20, 2);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].ends_with('…'), "{lines:?}");
+        assert!(lines[1].chars().count() <= 20);
+    }
+
+    #[test]
+    fn a_word_longer_than_the_line_is_split() {
+        assert_eq!(wrap_words("abcdefgh", 3, 4), vec!["abc", "def", "gh"]);
+        assert_eq!(wrap_words("", 10, 4), vec![""]);
+    }
 
     /// What a popup with focus is drawn on for these tests.  Which theme it
     /// comes from does not matter to anything asserted here -- only that every
