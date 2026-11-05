@@ -7,10 +7,10 @@
 use crate::app::{
     ActiveView, App, ComposeButton, ComposeField, ComposeFocus, ComposeState, LoadPhase,
     LoadingState, MessageViewState, ProgressMode, SaveAttachmentDialog, SaveAttachmentFocus,
-    ShortcutMenu, byte_index_for,
+    SecurityToggle, ShortcutMenu, byte_index_for,
 };
 use crate::clock;
-use crate::model::{MailboxKind, MessageAttachment, format_size};
+use crate::model::{MailboxKind, MessageAttachment, SecurityInfo, SecurityLevel, format_size};
 use crate::viewer;
 use ratatui::{
     Frame,
@@ -82,6 +82,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, theme: Theme) {
         if let Some(menu) = app.shortcut_menu() {
             render_shortcut_menu(frame, menu, theme.focused());
         }
+        render_passphrase_prompt(frame, app, theme);
         return;
     }
 
@@ -102,6 +103,78 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, theme: Theme) {
             frame.set_cursor_position((x, y));
         }
     }
+
+    render_passphrase_prompt(frame, app, theme);
+}
+
+/// Ask for the passphrase a worker is waiting on, over whatever is showing.
+///
+/// What is typed is shown as a run of dots, and only up to a point: the length
+/// of a passphrase is a secret of its own.
+fn render_passphrase_prompt(frame: &mut Frame<'_>, app: &App, theme: Theme) {
+    let Some(prompt) = app.passphrase_prompt() else {
+        return;
+    };
+    let surface = theme.focused();
+    let area = frame.area();
+    let width = area.width.saturating_sub(4).min(64);
+    let height: u16 = 6;
+    if width < 20 || area.height < height {
+        return;
+    }
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(surface.style())
+        .border_style(surface.border_style())
+        .border_type(surface.border_type())
+        .title_top(surface.title("OpenPGP passphrase"))
+        .title_bottom(surface.key_hints(&[("Enter", "Unlock"), ("Esc", "Cancel")]));
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    if inner.height < 3 || inner.width == 0 {
+        return;
+    }
+
+    let request = prompt.request();
+    let mut lines = vec![Line::from(Span::styled(
+        request.description.clone(),
+        surface.text_style(),
+    ))];
+    lines.push(if request.retry {
+        Line::from(Span::styled(
+            "That passphrase was wrong; try again.",
+            surface.hot_style(),
+        ))
+    } else {
+        Line::raw("")
+    });
+
+    let label = "Passphrase: ";
+    let room = (inner.width as usize).saturating_sub(label.width() + 1);
+    let mask = "•".repeat(prompt.typed().min(room).min(16));
+    lines.push(Line::from(vec![
+        Span::styled(label, surface.label_style()),
+        Span::styled(
+            mask.clone(),
+            surface.warning_style().add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    let paragraph = Paragraph::new(lines)
+        .style(surface.style())
+        .wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, inner);
+
+    let cursor_x = inner.x + (label.width() + mask.chars().count()) as u16;
+    frame.set_cursor_position((cursor_x.min(inner.x + inner.width - 1), inner.y + 2));
 }
 
 /// Frame of the throbber shown next to a background operation.
@@ -521,6 +594,10 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
         .compose_state()
         .map(|state| state.attachments().len())
         .unwrap_or(0);
+    let has_pgp_row = app
+        .compose_state()
+        .is_some_and(|state| state.pgp().is_some());
+    let header_rows: u16 = if has_pgp_row { 5 } else { 4 };
     let attachments_height = if attachment_count == 0 {
         0
     } else {
@@ -532,7 +609,7 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(header_rows),
             Constraint::Length(attachments_height),
             Constraint::Min(4),
             Constraint::Length(2),
@@ -547,6 +624,7 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(if has_pgp_row { 1 } else { 0 }),
         ])
         .split(layout[0]);
 
@@ -566,6 +644,7 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
                 render_compose_field(frame, area, state, label, field, surface);
             }
         }
+        render_compose_security(frame, field_rows[4], state, surface);
     }
 
     if attachments_height > 0 {
@@ -906,6 +985,47 @@ fn render_compose_field(
     Some((cursor_x, area.y))
 }
 
+/// The OpenPGP switches, lined up with the fields above them.
+fn render_compose_security(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &ComposeState,
+    surface: Surface,
+) {
+    let Some(choice) = state.pgp() else {
+        return;
+    };
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let mut spans = vec![Span::styled("PGP: ", surface.label_style())];
+    for (index, (toggle, label, on)) in [
+        (SecurityToggle::Sign, "Sign", choice.sign),
+        (SecurityToggle::Encrypt, "Encrypt", choice.encrypt),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let mark = if on { "x" } else { " " };
+        let focused = state.focus() == ComposeFocus::Security(toggle);
+        let style = if focused {
+            surface.select_style()
+        } else if on {
+            surface.text_style().add_modifier(Modifier::BOLD)
+        } else {
+            surface.text_style()
+        };
+        spans.push(Span::styled(format!("[{mark}] {label}"), style));
+    }
+
+    let paragraph = Paragraph::new(Line::from(spans)).style(surface.style());
+    frame.render_widget(paragraph, area);
+}
+
 fn render_compose_body(frame: &mut Frame<'_>, area: Rect, app: &mut App, surface: Surface) {
     if area.height == 0 || area.width == 0 {
         if let Some(state) = app.compose_state_mut() {
@@ -1058,7 +1178,7 @@ fn render_message(frame: &mut Frame<'_>, app: &mut App, theme: Theme) {
         theme,
     );
 
-    render_message_body(frame, view, layout[1]);
+    render_message_body(frame, view, layout[1], theme);
 
     let info_text = match (app.confirmation_prompt(), app.pending_message_load()) {
         (Some(question), _) => question.to_string(),
@@ -1636,13 +1756,17 @@ fn render_save_attachment_dialog(
 }
 
 /// Render the message body pane, including metadata and FTML/HTML content.
-fn render_message_body(frame: &mut Frame<'_>, view: &MessageViewState, area: Rect) {
+fn render_message_body(frame: &mut Frame<'_>, view: &MessageViewState, area: Rect, theme: Theme) {
     let width = area.width.max(2) - 2;
     let content_width = width.min(80);
     let mut lines = Vec::new();
 
     let meta_lines = message_metadata_lines(view, content_width);
     lines.extend(meta_lines);
+
+    if let Some(security) = &view.content.security {
+        lines.push(security_line(security, theme));
+    }
 
     if !view.content.attachments.is_empty() {
         lines.push(Line::raw(""));
@@ -1735,6 +1859,28 @@ fn message_action_bar(app: &App, view: &MessageViewState) -> String {
     }
 
     text
+}
+
+/// The verdict on a signed or encrypted message, under its headers.
+///
+/// A mark leads the line so that it reads without colour too: a tick when all
+/// is well, a question mark when the signature is good but proves less than it
+/// seems -- an unknown key, or a key that is not the sender's -- and a cross
+/// when something is wrong.
+fn security_line(security: &SecurityInfo, theme: Theme) -> Line<'static> {
+    let surface = theme.focused();
+    let (mark, style) = match security.level() {
+        SecurityLevel::Good => ("✔", Style::default().add_modifier(Modifier::BOLD)),
+        SecurityLevel::Uncertain => ("?", surface.warning_style().add_modifier(Modifier::BOLD)),
+        SecurityLevel::Bad => ("✘", surface.hot_style()),
+    };
+    Line::from(vec![
+        Span::styled(
+            "OpenPGP: ".to_string(),
+            Style::default().add_modifier(Modifier::ITALIC),
+        ),
+        Span::styled(format!("{mark} {}", security.summary()), style),
+    ])
 }
 
 fn message_metadata_lines(view: &MessageViewState, width: u16) -> Vec<Line<'static>> {

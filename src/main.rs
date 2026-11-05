@@ -2,6 +2,7 @@ mod app;
 mod backend;
 mod clock;
 mod model;
+mod openpgp;
 mod terminal;
 #[cfg(test)]
 mod test_harness;
@@ -76,9 +77,21 @@ fn main() -> Result<()> {
         sign_in_where_missing(config);
     }
 
+    // Workers that find a key locked ask through `asker`; the UI answers
+    // from `prompts`.
+    let prompts =
+        pgp_settings(config.as_ref().and_then(|config| config.pgp.as_ref())).map(|settings| {
+            let (asker, prompts) = openpgp::prompt::channel();
+            openpgp::install(openpgp::Crypto::new(settings, Box::new(asker)));
+            prompts
+        });
+
     let accounts = load_accounts(demo_mode, config)?;
 
     let mut app = App::new(accounts).context("failed to initialize application state")?;
+    if let Some(prompts) = prompts {
+        app.listen_for_passphrases(prompts);
+    }
     run(&mut app, theme).context("failed while running application loop")
 }
 
@@ -576,11 +589,84 @@ fn config_path_display() -> String {
         .unwrap_or_else(|| ".elmarc".to_string())
 }
 
+/// The `[pgp]` table.  Every field is optional: with none of them, GnuPG's
+/// keyring and agent are used if GnuPG's home directory exists.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PgpConfig {
+    /// `false` turns OpenPGP off altogether.
+    enabled: Option<bool>,
+    /// GnuPG's home directory, if not `$GNUPGHOME` or `~/.gnupg`.
+    gnupg_home: Option<String>,
+    /// `false` keeps gpg-agent out of it: only the key files below are used.
+    use_agent: Option<bool>,
+    /// `"elma"` (the default) asks for passphrases inside Elma; `"agent"`
+    /// leaves it to the agent's own pinentry program.
+    pinentry: Option<String>,
+    /// Extra key files, public or secret, armored or binary.
+    keys: Option<Vec<String>>,
+    /// Sign new messages by default.
+    sign: Option<bool>,
+    /// Encrypt new messages by default.
+    encrypt: Option<bool>,
+    /// Fingerprint of the key to sign with, instead of the one matching the
+    /// account's address.
+    signing_key: Option<String>,
+}
+
+/// Work out the OpenPGP settings, or `None` when OpenPGP is off -- explicitly,
+/// or because there is neither a GnuPG home nor a key file to read.
+fn pgp_settings(config: Option<&PgpConfig>) -> Option<openpgp::Settings> {
+    let default = PgpConfig::default();
+    let config = config.unwrap_or(&default);
+    if config.enabled == Some(false) {
+        return None;
+    }
+
+    let mut settings = openpgp::Settings::from_environment();
+    if let Some(home) = &config.gnupg_home {
+        settings.gnupg_home = Some(expand_home(home));
+    }
+    settings.use_agent = config.use_agent.unwrap_or(true);
+    settings.loopback_pinentry = !config
+        .pinentry
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("agent"));
+    settings.key_files = config
+        .keys
+        .iter()
+        .flatten()
+        .map(|path| expand_home(path))
+        .collect();
+    settings.sign_by_default = config.sign.unwrap_or(false);
+    settings.encrypt_by_default = config.encrypt.unwrap_or(false);
+    settings.signing_key = config.signing_key.clone();
+
+    let has_home = settings
+        .gnupg_home
+        .as_deref()
+        .is_some_and(|home| home.is_dir());
+    if config.enabled.is_none() && !has_home && settings.key_files.is_empty() {
+        return None;
+    }
+    Some(settings)
+}
+
+/// `~/` at the start of a configured path means the home directory.
+fn expand_home(path: &str) -> PathBuf {
+    match (path.strip_prefix("~/"), std::env::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => PathBuf::from(path),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct Config {
     /// `dark`, `light`, `mono` for no colour at all, or `auto` to ask the
     /// terminal -- which is the default.
     theme: Option<String>,
+    /// OpenPGP: see [`PgpConfig`].
+    pgp: Option<PgpConfig>,
     #[serde(alias = "accounts")]
     accounts: Option<Vec<AccountConfig>>,
 }
@@ -708,6 +794,47 @@ mod tests {
 
     fn jmap_setup(toml_source: &str) -> Result<JmapSetup> {
         jmap_setup_from_config(&mut account(toml_source), 0)
+    }
+
+    fn pgp(toml_source: &str) -> Option<openpgp::Settings> {
+        let config: Config = toml::from_str(toml_source).expect("configuration should parse");
+        pgp_settings(config.pgp.as_ref())
+    }
+
+    #[test]
+    fn the_pgp_table_is_read_into_settings() {
+        let settings = pgp(r#"
+            [pgp]
+            gnupg_home = "/srv/gnupg"
+            keys = ["/keys/friends.asc"]
+            sign = true
+            pinentry = "agent"
+            signing_key = "ABCD"
+        "#)
+        .expect("explicit settings turn OpenPGP on");
+        assert_eq!(
+            settings.gnupg_home.as_deref(),
+            Some(std::path::Path::new("/srv/gnupg"))
+        );
+        assert_eq!(settings.key_files, vec![PathBuf::from("/keys/friends.asc")]);
+        assert!(settings.sign_by_default);
+        assert!(!settings.encrypt_by_default);
+        assert!(!settings.loopback_pinentry);
+        assert!(settings.use_agent);
+        assert_eq!(settings.signing_key.as_deref(), Some("ABCD"));
+
+        assert!(pgp("[pgp]\nenabled = false\nsign = true\n").is_none());
+        assert!(
+            pgp("[pgp]\nkeys = [\"/k.asc\"]\n")
+                .unwrap()
+                .loopback_pinentry
+        );
+    }
+
+    /// A misspelt switch must not quietly leave mail unencrypted.
+    #[test]
+    fn an_unknown_pgp_setting_is_an_error() {
+        assert!(toml::from_str::<Config>("[pgp]\nencrypt_by_default = true\n").is_err());
     }
 
     #[test]

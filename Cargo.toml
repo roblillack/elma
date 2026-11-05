@@ -78,6 +78,15 @@ base64 = "0.22"
 # built with rather than a second crypto crate.
 ring = "0.17"
 url = "2"
+# OpenPGP: reading signed and encrypted mail, and signing and encrypting what
+# is sent. Pure Rust. The default `bzip2` feature is left out because it links
+# the C libbz2; GnuPG compresses with ZIP/ZLIB unless told otherwise, so the
+# only messages it costs are ones explicitly compressed with BZip2.
+pgp = { version = "0.21", default-features = false }
+# The RNG the pgp crate takes; held at its version so there is one `rand`.
+rand = "0.8"
+# Wipes passphrases from memory once they have been handed to the agent.
+zeroize = "1"
 # Opens the sign-in page in the browser. On Windows it goes through
 # ShellExecute rather than `cmd /C start`, which cuts a URL short at its first
 # `&`.

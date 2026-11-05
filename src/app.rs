@@ -11,8 +11,9 @@ use crate::backend::{
 use crate::clock;
 use crate::model::{
     Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
-    MessageContentPart, MessageId, MessageStatus, format_size, padded_sender,
+    MessageContentPart, MessageId, MessageStatus, SecurityInfo, format_size, padded_sender,
 };
+use crate::openpgp::prompt::{PassphraseQueue, PassphraseRequest, PendingPassphrase};
 use anyhow::{Context, Result, anyhow};
 use crossterm::{
     cursor::Show,
@@ -46,6 +47,7 @@ use tdoc::{
 };
 use tempfile::NamedTempFile;
 use time::{OffsetDateTime, format_description::well_known::Rfc2822};
+use zeroize::Zeroizing;
 
 const PAGE_JUMP: isize = 5;
 const PROGRESS_SEGMENTS: usize = 5;
@@ -504,6 +506,28 @@ pub struct App {
     /// A yes/no question the next key answers, asked before something the
     /// user wrote or asked for would be thrown away.
     confirmation: Option<PendingConfirmation>,
+    /// A worker waiting for the passphrase to an OpenPGP key.
+    passphrase: Option<PassphrasePrompt>,
+    /// Where those workers' questions arrive.
+    passphrase_queue: Option<PassphraseQueue>,
+}
+
+/// The passphrase being typed for a worker that is waiting on it.
+pub(crate) struct PassphrasePrompt {
+    pending: PendingPassphrase,
+    input: Zeroizing<String>,
+}
+
+impl PassphrasePrompt {
+    pub(crate) fn request(&self) -> &PassphraseRequest {
+        &self.pending.request
+    }
+
+    /// How many characters have been typed: the prompt shows a mask, never
+    /// the passphrase.
+    pub(crate) fn typed(&self) -> usize {
+        self.input.chars().count()
+    }
 }
 
 /// What a `y` to the pending question goes ahead with.
@@ -655,9 +679,35 @@ pub(crate) enum ComposeButton {
     Send,
 }
 
+/// The two OpenPGP switches in the compose dialog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SecurityToggle {
+    Sign,
+    Encrypt,
+}
+
+/// Whether the message being composed is to be signed and encrypted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PgpChoice {
+    pub(crate) sign: bool,
+    pub(crate) encrypt: bool,
+}
+
+impl PgpChoice {
+    /// What a new message starts with, or `None` when OpenPGP is off and the
+    /// dialog has no switches to show.
+    fn for_new_message() -> Option<Self> {
+        crate::openpgp::context().map(|crypto| PgpChoice {
+            sign: crypto.settings().sign_by_default,
+            encrypt: crypto.settings().encrypt_by_default,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ComposeFocus {
     Field(ComposeField),
+    Security(SecurityToggle),
     Attachments,
     Body,
     Button(ComposeButton),
@@ -708,6 +758,8 @@ pub(crate) struct ComposeState {
     status: Option<String>,
     body_scroll: usize,
     body_view_height: usize,
+    /// Sign and encrypt, when OpenPGP is available at all.
+    pgp: Option<PgpChoice>,
 }
 
 impl Default for ComposeState {
@@ -728,6 +780,7 @@ impl Default for ComposeState {
             status: None,
             body_scroll: 0,
             body_view_height: 0,
+            pgp: PgpChoice::for_new_message(),
         }
     }
 }
@@ -787,6 +840,10 @@ impl ComposeState {
             ComposeFocus::Field(ComposeField::Bcc),
             ComposeFocus::Field(ComposeField::Subject),
         ];
+        if self.pgp.is_some() {
+            sequence.push(ComposeFocus::Security(SecurityToggle::Sign));
+            sequence.push(ComposeFocus::Security(SecurityToggle::Encrypt));
+        }
         if !self.attachments.is_empty() {
             sequence.push(ComposeFocus::Attachments);
         }
@@ -869,6 +926,60 @@ impl ComposeState {
         self.draft_id
     }
 
+    /// The OpenPGP switches, if the dialog shows them.
+    pub(crate) fn pgp(&self) -> Option<PgpChoice> {
+        self.pgp
+    }
+
+    /// Show the OpenPGP switches, as an installed context would.  The context
+    /// is process-wide, so tests cannot install one without every other test
+    /// seeing it too.
+    #[cfg(test)]
+    pub(crate) fn offer_pgp(&mut self, choice: PgpChoice) {
+        self.pgp = Some(choice);
+    }
+
+    /// Set the OpenPGP switches, where the dialog has them.
+    pub(crate) fn set_pgp(&mut self, choice: PgpChoice) {
+        if self.pgp.is_some() {
+            self.pgp = Some(choice);
+        }
+    }
+
+    fn toggle_security(&mut self, toggle: SecurityToggle) {
+        let Some(choice) = self.pgp.as_mut() else {
+            return;
+        };
+        let (name, on) = match toggle {
+            SecurityToggle::Sign => {
+                choice.sign = !choice.sign;
+                ("Signing", choice.sign)
+            }
+            SecurityToggle::Encrypt => {
+                choice.encrypt = !choice.encrypt;
+                ("Encryption", choice.encrypt)
+            }
+        };
+        let state = if on { "on" } else { "off" };
+        let mut status = format!("{name} {state}.");
+
+        // Better to hear about a missing key now than from a failed send.
+        if toggle == SecurityToggle::Encrypt
+            && on
+            && let Some(crypto) = crate::openpgp::context()
+        {
+            let recipients: Vec<String> = [&self.to, &self.cc, &self.bcc]
+                .iter()
+                .flat_map(|field| split_addresses(&field.value))
+                .collect();
+            let missing = crypto.missing_keys(&recipients);
+            if !missing.is_empty() {
+                status.push_str(&format!(" No key for {}.", missing.join(", ")));
+            }
+        }
+        self.set_status(status);
+    }
+
     pub(crate) fn is_editing_draft(&self) -> bool {
         self.draft_id.is_some()
     }
@@ -935,6 +1046,8 @@ impl ComposeState {
             text_body,
             html_body,
             attachments: self.attachments.clone(),
+            sign: self.pgp.is_some_and(|choice| choice.sign),
+            encrypt: self.pgp.is_some_and(|choice| choice.encrypt),
         })
     }
 
@@ -1652,6 +1765,8 @@ impl App {
             outgoing: None,
             needs_full_redraw: false,
             confirmation: None,
+            passphrase: None,
+            passphrase_queue: None,
         };
 
         for index in 0..app.accounts.len() {
@@ -1716,6 +1831,13 @@ impl App {
             return Ok(());
         }
 
+        // A worker is blocked on this; nothing else gets a key until it has
+        // its answer.
+        if self.passphrase.is_some() {
+            self.handle_passphrase_key(key);
+            return Ok(());
+        }
+
         // A pending question takes the key, whatever view is up: `y` goes
         // ahead, anything else backs out.
         if let Some(pending) = self.confirmation.take() {
@@ -1774,6 +1896,43 @@ impl App {
             ActiveView::Message => self.handle_message_key(key),
             ActiveView::Compose => self.handle_compose_key(key),
         }
+    }
+
+    fn handle_passphrase_key(&mut self, key: KeyEvent) {
+        let Some(prompt) = self.passphrase.as_mut() else {
+            return;
+        };
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Enter => {
+                let PassphrasePrompt { pending, input } =
+                    self.passphrase.take().expect("checked above");
+                pending.answer(Some(input));
+            }
+            KeyCode::Esc => {
+                let prompt = self.passphrase.take().expect("checked above");
+                prompt.pending.answer(None);
+            }
+            KeyCode::Char('c') if control => {
+                let prompt = self.passphrase.take().expect("checked above");
+                prompt.pending.answer(None);
+            }
+            KeyCode::Char('u') if control => prompt.input.clear(),
+            KeyCode::Backspace => {
+                prompt.input.pop();
+            }
+            KeyCode::Char(ch) if !control => prompt.input.push(ch),
+            _ => {}
+        }
+    }
+
+    /// Take the passphrase questions OpenPGP's workers ask.
+    pub fn listen_for_passphrases(&mut self, queue: PassphraseQueue) {
+        self.passphrase_queue = Some(queue);
+    }
+
+    pub(crate) fn passphrase_prompt(&self) -> Option<&PassphrasePrompt> {
+        self.passphrase.as_ref()
     }
 
     fn process_pending_shortcut(&mut self, key: KeyEvent) -> Result<bool> {
@@ -2160,6 +2319,17 @@ impl App {
 
     /// Drain backend event channels and merge them into local state.
     pub fn poll_backend_events(&mut self) {
+        if self.passphrase.is_none()
+            && let Some(pending) = self
+                .passphrase_queue
+                .as_ref()
+                .and_then(PassphraseQueue::next_pending)
+        {
+            self.passphrase = Some(PassphrasePrompt {
+                pending,
+                input: Zeroizing::new(String::new()),
+            });
+        }
         self.check_read_timer();
         self.poll_mailbox_loader();
         self.poll_message_loader();
@@ -2953,6 +3123,12 @@ impl App {
         self.message_view.as_ref()
     }
 
+    /// For tests that need the open message to say something no fixture does.
+    #[cfg(test)]
+    pub(crate) fn message_view_mut(&mut self) -> Option<&mut MessageViewState> {
+        self.message_view.as_mut()
+    }
+
     pub(crate) fn compose_state(&self) -> Option<&ComposeState> {
         self.compose.as_ref()
     }
@@ -3722,6 +3898,7 @@ impl App {
 
         let document =
             cached_document.unwrap_or_else(|| document_from_message_content(&loaded.content));
+        let security = loaded.content.security.clone();
 
         match purpose {
             MessageLoadPurpose::View => unreachable!("handled above"),
@@ -3735,6 +3912,32 @@ impl App {
                 self.show_draft_compose(&message, document, loaded);
             }
         }
+        self.inherit_protection(security.as_ref(), purpose == MessageLoadPurpose::Draft);
+    }
+
+    /// Start a reply, forward or reopened draft protected the way the message
+    /// it comes from was.
+    ///
+    /// Text that arrived encrypted goes back out encrypted -- quoting it in
+    /// the clear would undo what the sender did -- and a signed message is
+    /// answered signed.  A draft is encrypted exactly when it was stored
+    /// encrypted, which is when it was meant to go out that way.
+    fn inherit_protection(&mut self, security: Option<&SecurityInfo>, draft: bool) {
+        let Some(compose) = self.compose.as_mut() else {
+            return;
+        };
+        let Some(mut choice) = compose.pgp() else {
+            return;
+        };
+        let encrypted = security.is_some_and(SecurityInfo::was_encrypted);
+        let signed = security.is_some_and(|info| !info.signatures.is_empty());
+        if draft {
+            choice.encrypt = encrypted;
+        } else {
+            choice.encrypt |= encrypted;
+            choice.sign |= signed;
+        }
+        compose.set_pgp(choice);
     }
 
     /// Start loading the message on screen -- the selected one, outside the
@@ -3934,6 +4137,40 @@ impl App {
                     if compose.field_state_mut(field).insert(ch) {
                         compose.clear_status();
                     }
+                    return Ok(());
+                }
+                _ => {}
+            },
+            ComposeFocus::Security(toggle) => match key.code {
+                KeyCode::Up => {
+                    compose.set_focus(ComposeFocus::Field(ComposeField::Subject));
+                    return Ok(());
+                }
+                KeyCode::Down => {
+                    compose.focus = ComposeFocus::Security(SecurityToggle::Encrypt);
+                    compose.focus_next();
+                    return Ok(());
+                }
+                KeyCode::Left => {
+                    compose.set_focus(ComposeFocus::Security(SecurityToggle::Sign));
+                    return Ok(());
+                }
+                KeyCode::Right => {
+                    compose.set_focus(ComposeFocus::Security(SecurityToggle::Encrypt));
+                    return Ok(());
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    compose.toggle_security(toggle);
+                    return Ok(());
+                }
+                KeyCode::Char('s' | 'S') => {
+                    compose.set_focus(ComposeFocus::Security(SecurityToggle::Sign));
+                    compose.toggle_security(SecurityToggle::Sign);
+                    return Ok(());
+                }
+                KeyCode::Char('e' | 'E') => {
+                    compose.set_focus(ComposeFocus::Security(SecurityToggle::Encrypt));
+                    compose.toggle_security(SecurityToggle::Encrypt);
                     return Ok(());
                 }
                 _ => {}
@@ -4285,6 +4522,13 @@ impl App {
     /// which pasted text reaches any field -- dropping it here means the paste
     /// silently disappears.
     pub(crate) fn handle_paste_text(&mut self, text: &str) -> Result<()> {
+        // A passphrase pasted from a password manager goes to the prompt,
+        // and nowhere else.
+        if let Some(prompt) = self.passphrase.as_mut() {
+            prompt.input.push_str(text.trim_end_matches(['\r', '\n']));
+            return Ok(());
+        }
+
         // Compose is locked while the backend has the message; see handle_compose_key.
         if self.outgoing.is_some() {
             return Ok(());
@@ -6252,6 +6496,8 @@ mod tests {
             outgoing: None,
             needs_full_redraw: false,
             confirmation: None,
+            passphrase: None,
+            passphrase_queue: None,
         }
     }
 
