@@ -343,6 +343,72 @@ files that came with it. Inline images stay behind on a forward as well: the
 quoted body no longer references them, so carrying them over would attach a
 signature logo to every forwarded newsletter.
 
+### OpenPGP
+
+Elma reads and writes OpenPGP mail — PGP/MIME (RFC 3156) and inline PGP —
+using your existing GnuPG setup. There is nothing to export or import: public
+keys come straight from the keyring `gpg` itself reads (`pubring.gpg` if
+there is one, otherwise `pubring.kbx`), and secret keys stay in `gpg-agent`, which Elma asks to decrypt
+and sign the same way `gpg` does. The agent's passphrase cache is shared with
+`gpg`, keys on a smartcard are reached through the agent like any other, and a
+key you `gpg --import` while Elma is running is picked up by the next message
+that needs it. The OpenPGP itself is done by
+[rPGP](https://github.com/rpgp/rpgp); Elma never runs `gpg`.
+
+**Reading.** A signed or encrypted message opens as what it protects, with an
+`OpenPGP:` line under the headers:
+
+- `✔` — a good signature from a key carrying the sender's address, and/or
+  successfully decrypted.
+- `?` — a good signature that proves less than it seems: by a key Elma does not
+  have, or by a key that is not the sender's. Also mail encrypted the way it
+  was before OpenPGP had integrity protection (into the early 2000s): it
+  opens, but it could have been changed on the way without that showing.
+- `✘` — a bad signature, a revoked or expired signing key, or a message that
+  could not be decrypted (its text says why, and the ciphertext is offered as
+  `encrypted.asc` in the _Save attachment_ dialog).
+
+Elma checks that a key's self-signatures, subkey bindings, expiry and
+revocations hold up, but does not consult GnuPG's web of trust: a ✔ means
+"signed by a key that says it belongs to the sender", not "a key you have
+certified". In inline PGP, text outside the signed or encrypted block — a
+mailing list footer, say — is fenced off with `[-- End signed text --]`.
+
+**Writing.** With OpenPGP available, compose has a `PGP:` row under the subject:
+`Tab` to it, then `Space` (or `s` / `e`) switches _Sign_ and _Encrypt_.
+Messages are signed with the key matching the account's address and encrypted
+to every recipient, Bcc included, and to you, so the copy in Sent stays
+readable. A recipient without a key is named as soon as encryption is switched
+on, and sending fails rather than going out unencrypted. Replies and forwards
+of encrypted mail start out encrypted, replies to signed mail start out signed,
+and a draft of an encrypted message is stored encrypted to you alone. The
+subject line is not encrypted.
+
+**Passphrases.** When the agent needs a passphrase, Elma asks for it in a
+prompt of its own (the agent's “loopback” pinentry mode), so it works over SSH
+and never draws a pinentry over the terminal. If the agent is configured to
+refuse loopback, or `pinentry = "agent"` is set, the agent's own pinentry
+program is used instead — which should then be a graphical one.
+
+OpenPGP is on whenever GnuPG's home directory (`$GNUPGHOME`, or `~/.gnupg`)
+exists. Everything else is optional:
+
+```toml
+[pgp]
+# enabled = false            # turn OpenPGP off altogether
+# gnupg_home = "~/.gnupg"    # default: $GNUPGHOME, or ~/.gnupg
+# pinentry = "agent"         # use the agent's pinentry instead of Elma's prompt
+# use_agent = false          # only use the key files below
+# keys = ["~/keys/friends.asc", "~/keys/me.sec.asc"]  # public or secret, armored or binary
+# signing_key = "0123456789ABCDEF0123456789ABCDEF01234567"  # instead of the one for your address
+sign = true                  # sign new messages by default
+# encrypt = true             # encrypt new messages by default
+```
+
+Secret keys in `keys` files are used directly, asking for their passphrase in
+the same prompt every time they are needed; there is no cache outside the
+agent.
+
 ## Development
 
 `cargo test` runs the unit tests and the snapshot tests together.

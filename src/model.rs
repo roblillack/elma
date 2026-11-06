@@ -146,6 +146,140 @@ pub struct MessageContent {
     pub to: Vec<String>,
     pub cc: Vec<String>,
     pub bcc: Vec<String>,
+    /// What OpenPGP had to say about the message, if it was signed or
+    /// encrypted.  `None` for ordinary mail.
+    pub security: Option<SecurityInfo>,
+}
+
+/// The outcome of decrypting and verifying a message, for the message view.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SecurityInfo {
+    pub encryption: Option<EncryptionState>,
+    pub signatures: Vec<SignatureState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EncryptionState {
+    /// Encrypted, and decrypted for display.
+    Decrypted,
+    /// Decrypted, but encrypted the way OpenPGP did before integrity
+    /// protection: it could have been changed on the way without that
+    /// showing.
+    Unprotected,
+    /// Encrypted, and could not be decrypted.
+    Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignatureState {
+    pub verdict: SignatureVerdict,
+    /// The signer's user ID, when the key is known.
+    pub signer: Option<String>,
+    /// Fingerprint of the signing key, or its key ID when that is all the
+    /// signature names.
+    pub key: String,
+    /// Whether the signing certificate carries the address the message claims
+    /// to be from.  A good signature from somebody else's key is worth little.
+    pub matches_sender: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SignatureVerdict {
+    Good,
+    /// The signature does not match the content: tampered with, or broken in
+    /// transit.
+    Bad(String),
+    /// Nobody in the keyring made this signature.
+    UnknownKey,
+    /// The key is known but can no longer vouch for anything.
+    Unusable(String),
+}
+
+/// How a [`SecurityInfo`] should be presented, from reassuring to alarming.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SecurityLevel {
+    Good,
+    Uncertain,
+    Bad,
+}
+
+impl SecurityInfo {
+    pub fn is_empty(&self) -> bool {
+        self.encryption.is_none() && self.signatures.is_empty()
+    }
+
+    pub fn was_encrypted(&self) -> bool {
+        self.encryption.is_some()
+    }
+
+    pub fn level(&self) -> SecurityLevel {
+        let encryption = match &self.encryption {
+            Some(EncryptionState::Failed(_)) => SecurityLevel::Bad,
+            Some(EncryptionState::Unprotected) => SecurityLevel::Uncertain,
+            _ => SecurityLevel::Good,
+        };
+        self.signatures
+            .iter()
+            .map(SignatureState::level)
+            .chain(std::iter::once(encryption))
+            .max()
+            .unwrap_or(SecurityLevel::Good)
+    }
+
+    /// One line for the message header.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        match &self.encryption {
+            Some(EncryptionState::Decrypted) => parts.push("Encrypted".to_string()),
+            Some(EncryptionState::Unprotected) => {
+                parts.push("Encrypted in the old format without integrity protection".to_string())
+            }
+            Some(EncryptionState::Failed(reason)) => {
+                parts.push(format!("Encrypted, cannot decrypt: {reason}"))
+            }
+            None => {}
+        }
+        parts.extend(self.signatures.iter().map(SignatureState::summary));
+        if self.encryption.is_some() && self.signatures.is_empty() {
+            parts.push("not signed".to_string());
+        }
+        parts.join("; ")
+    }
+}
+
+impl SignatureState {
+    pub fn level(&self) -> SecurityLevel {
+        match self.verdict {
+            SignatureVerdict::Good if self.matches_sender => SecurityLevel::Good,
+            SignatureVerdict::Good | SignatureVerdict::UnknownKey => SecurityLevel::Uncertain,
+            SignatureVerdict::Bad(_) | SignatureVerdict::Unusable(_) => SecurityLevel::Bad,
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        let who = self.signer.as_deref().unwrap_or("unknown signer");
+        let key = short_key(&self.key);
+        match &self.verdict {
+            SignatureVerdict::Good if self.matches_sender => {
+                format!("Good signature from {who} ({key})")
+            }
+            SignatureVerdict::Good => {
+                format!("Good signature from {who} ({key}), who is not the sender")
+            }
+            SignatureVerdict::Bad(reason) => format!("BAD signature by {who} ({key}): {reason}"),
+            SignatureVerdict::UnknownKey => format!("Signed by unknown key {key}"),
+            SignatureVerdict::Unusable(reason) => {
+                format!("Signature by {who} ({key}) cannot be trusted: {reason}")
+            }
+        }
+    }
+}
+
+/// The last sixteen hex digits of a fingerprint: the long key ID, which is
+/// what people recognise and what fits in a header line.
+fn short_key(key: &str) -> &str {
+    let start = key.len().saturating_sub(16);
+    key.get(start..).unwrap_or(key)
 }
 
 impl MessageContent {

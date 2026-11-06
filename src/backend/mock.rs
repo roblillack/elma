@@ -526,6 +526,7 @@ impl MockBackend {
             text_body,
             html_body,
             attachments,
+            ..
         } = outgoing;
 
         let mut recipients = Vec::new();
@@ -1119,6 +1120,7 @@ mod tests {
             text_body: "Body.".to_string(),
             html_body: "<p>Body.</p>".to_string(),
             attachments: Vec::new(),
+            ..Default::default()
         }
     }
 

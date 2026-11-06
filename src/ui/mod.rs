@@ -7,10 +7,10 @@
 use crate::app::{
     ActiveView, App, ComposeButton, ComposeField, ComposeFocus, ComposeState, LoadPhase,
     LoadingState, MessageViewState, ProgressMode, SaveAttachmentDialog, SaveAttachmentFocus,
-    ShortcutMenu, byte_index_for,
+    SecurityToggle, ShortcutMenu, byte_index_for,
 };
 use crate::clock;
-use crate::model::{MailboxKind, MessageAttachment, format_size};
+use crate::model::{MailboxKind, MessageAttachment, SecurityInfo, SecurityLevel, format_size};
 use crate::viewer;
 use ratatui::{
     Frame,
@@ -82,6 +82,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, theme: Theme) {
         if let Some(menu) = app.shortcut_menu() {
             render_shortcut_menu(frame, menu, theme.focused());
         }
+        render_passphrase_prompt(frame, app, theme);
         return;
     }
 
@@ -102,6 +103,78 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, theme: Theme) {
             frame.set_cursor_position((x, y));
         }
     }
+
+    render_passphrase_prompt(frame, app, theme);
+}
+
+/// Ask for the passphrase a worker is waiting on, over whatever is showing.
+///
+/// What is typed is shown as a run of dots, and only up to a point: the length
+/// of a passphrase is a secret of its own.
+fn render_passphrase_prompt(frame: &mut Frame<'_>, app: &App, theme: Theme) {
+    let Some(prompt) = app.passphrase_prompt() else {
+        return;
+    };
+    let surface = theme.focused();
+    let area = frame.area();
+    let width = area.width.saturating_sub(4).min(64);
+    let height: u16 = 6;
+    if width < 20 || area.height < height {
+        return;
+    }
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(surface.style())
+        .border_style(surface.border_style())
+        .border_type(surface.border_type())
+        .title_top(surface.title("OpenPGP passphrase"))
+        .title_bottom(surface.key_hints(&[("Enter", "Unlock"), ("Esc", "Cancel")]));
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    if inner.height < 3 || inner.width == 0 {
+        return;
+    }
+
+    let request = prompt.request();
+    let mut lines = vec![Line::from(Span::styled(
+        request.description.clone(),
+        surface.text_style(),
+    ))];
+    lines.push(if request.retry {
+        Line::from(Span::styled(
+            "That passphrase was wrong; try again.",
+            surface.hot_style(),
+        ))
+    } else {
+        Line::raw("")
+    });
+
+    let label = "Passphrase: ";
+    let room = (inner.width as usize).saturating_sub(label.width() + 1);
+    let mask = "•".repeat(prompt.typed().min(room).min(16));
+    lines.push(Line::from(vec![
+        Span::styled(label, surface.label_style()),
+        Span::styled(
+            mask.clone(),
+            surface.warning_style().add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    let paragraph = Paragraph::new(lines)
+        .style(surface.style())
+        .wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, inner);
+
+    let cursor_x = inner.x + (label.width() + mask.chars().count()) as u16;
+    frame.set_cursor_position((cursor_x.min(inner.x + inner.width - 1), inner.y + 2));
 }
 
 /// Frame of the throbber shown next to a background operation.
@@ -455,6 +528,51 @@ fn render_search_popup(frame: &mut Frame<'_>, area: Rect, app: &App, surface: Su
 /// the two prompts compose puts up itself are found here.  Either way the
 /// dialog steps back to the covered surface, so the box taking keys is the one
 /// that stands out.
+/// How tall the line under the compose buttons may grow.
+const COMPOSE_STATUS_MAX_LINES: usize = 4;
+
+/// `text` broken into lines of at most `width` columns at spaces, a word too
+/// long for a line split where it must.  More than `max_lines` and the last
+/// one ends in `…`.
+fn wrap_words(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let needed = if line.is_empty() { 0 } else { line.width() + 1 } + word.width();
+        if needed <= width {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        for ch in word.chars() {
+            if line.width() + ch.width().unwrap_or(0) > width {
+                lines.push(std::mem::take(&mut line));
+            }
+            line.push(ch);
+        }
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        let last = lines.last_mut().expect("max_lines is not zero");
+        while !last.is_empty() && last.width() + 1 > width {
+            last.pop();
+        }
+        last.push('…');
+    }
+    lines
+}
+
 fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by_menu: bool) {
     if app.compose_state().is_none() {
         render_inbox(frame, app, theme);
@@ -521,6 +639,32 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
         .compose_state()
         .map(|state| state.attachments().len())
         .unwrap_or(0);
+    let has_pgp_row = app
+        .compose_state()
+        .is_some_and(|state| state.pgp().is_some());
+    let header_rows: u16 = if has_pgp_row { 5 } else { 4 };
+
+    // While the backend has the message the whole view is read-only, so nothing
+    // offers focus: no lit button, no cursor.
+    let pending_outgoing = app
+        .pending_outgoing()
+        .map(|(label, elapsed)| format!("{} — please wait", progress_text(label, elapsed)));
+    let busy = pending_outgoing.is_some();
+
+    // The frame lists the keys, so the line under the buttons is left with what
+    // no key can tell the user -- or the question the next key answers, which
+    // has to be readable even while a send is in flight.
+    let question = app.confirmation_prompt().map(|text| text.to_string());
+    let asking = question.is_some();
+    let status_text = question
+        .or(pending_outgoing)
+        .or_else(|| app.compose_status_line().map(|text| text.to_string()))
+        .unwrap_or_else(|| "Drop a file on the terminal to attach it.".to_string());
+    // An error is only useful whole -- the reason comes last -- so the line
+    // grows to take it, at the body's expense.
+    let status_lines = wrap_words(&status_text, inner.width as usize, COMPOSE_STATUS_MAX_LINES);
+    let status_height = status_lines.len().max(1) as u16;
+
     let attachments_height = if attachment_count == 0 {
         0
     } else {
@@ -532,11 +676,11 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(header_rows),
             Constraint::Length(attachments_height),
             Constraint::Min(4),
             Constraint::Length(2),
-            Constraint::Length(1),
+            Constraint::Length(status_height),
         ])
         .split(inner);
 
@@ -547,6 +691,7 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(if has_pgp_row { 1 } else { 0 }),
         ])
         .split(layout[0]);
 
@@ -566,6 +711,7 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
                 render_compose_field(frame, area, state, label, field, surface);
             }
         }
+        render_compose_security(frame, field_rows[4], state, surface);
     }
 
     if attachments_height > 0 {
@@ -575,28 +721,12 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
 
     render_compose_body(frame, layout[2], app, surface);
 
-    // While the backend has the message the whole view is read-only, so nothing
-    // offers focus: no lit button, no cursor.
-    let pending_outgoing = app
-        .pending_outgoing()
-        .map(|(label, elapsed)| format!("{} — please wait", progress_text(label, elapsed)));
-    let busy = pending_outgoing.is_some();
-
     {
         let state = app.compose_state().expect("compose state should exist");
         render_compose_buttons(frame, layout[3], state, busy, surface);
     }
 
-    // The frame lists the keys, so the line under the buttons is left with what
-    // no key can tell the user -- or the question the next key answers, which
-    // has to be readable even while a send is in flight.
-    let question = app.confirmation_prompt().map(|text| text.to_string());
-    let asking = question.is_some();
-    let status_text = question
-        .or(pending_outgoing)
-        .or_else(|| app.compose_status_line().map(|text| text.to_string()))
-        .unwrap_or_else(|| "Drop a file on the terminal to attach it.".to_string());
-    let status = Paragraph::new(status_text)
+    let status = Paragraph::new(status_lines.into_iter().map(Line::from).collect::<Vec<_>>())
         .style(if busy || asking {
             surface.style().patch(surface.warning_style())
         } else {
@@ -906,6 +1036,47 @@ fn render_compose_field(
     Some((cursor_x, area.y))
 }
 
+/// The OpenPGP switches, lined up with the fields above them.
+fn render_compose_security(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &ComposeState,
+    surface: Surface,
+) {
+    let Some(choice) = state.pgp() else {
+        return;
+    };
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let mut spans = vec![Span::styled("PGP: ", surface.label_style())];
+    for (index, (toggle, label, on)) in [
+        (SecurityToggle::Sign, "Sign", choice.sign),
+        (SecurityToggle::Encrypt, "Encrypt", choice.encrypt),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let mark = if on { "x" } else { " " };
+        let focused = state.focus() == ComposeFocus::Security(toggle);
+        let style = if focused {
+            surface.select_style()
+        } else if on {
+            surface.text_style().add_modifier(Modifier::BOLD)
+        } else {
+            surface.text_style()
+        };
+        spans.push(Span::styled(format!("[{mark}] {label}"), style));
+    }
+
+    let paragraph = Paragraph::new(Line::from(spans)).style(surface.style());
+    frame.render_widget(paragraph, area);
+}
+
 fn render_compose_body(frame: &mut Frame<'_>, area: Rect, app: &mut App, surface: Surface) {
     if area.height == 0 || area.width == 0 {
         if let Some(state) = app.compose_state_mut() {
@@ -1058,7 +1229,7 @@ fn render_message(frame: &mut Frame<'_>, app: &mut App, theme: Theme) {
         theme,
     );
 
-    render_message_body(frame, view, layout[1]);
+    render_message_body(frame, view, layout[1], theme);
 
     let info_text = match (app.confirmation_prompt(), app.pending_message_load()) {
         (Some(question), _) => question.to_string(),
@@ -1636,13 +1807,17 @@ fn render_save_attachment_dialog(
 }
 
 /// Render the message body pane, including metadata and FTML/HTML content.
-fn render_message_body(frame: &mut Frame<'_>, view: &MessageViewState, area: Rect) {
+fn render_message_body(frame: &mut Frame<'_>, view: &MessageViewState, area: Rect, theme: Theme) {
     let width = area.width.max(2) - 2;
     let content_width = width.min(80);
     let mut lines = Vec::new();
 
     let meta_lines = message_metadata_lines(view, content_width);
     lines.extend(meta_lines);
+
+    if let Some(security) = &view.content.security {
+        lines.push(security_line(security, theme));
+    }
 
     if !view.content.attachments.is_empty() {
         lines.push(Line::raw(""));
@@ -1737,6 +1912,28 @@ fn message_action_bar(app: &App, view: &MessageViewState) -> String {
     text
 }
 
+/// The verdict on a signed or encrypted message, under its headers.
+///
+/// A mark leads the line so that it reads without colour too: a tick when all
+/// is well, a question mark when the signature is good but proves less than it
+/// seems -- an unknown key, or a key that is not the sender's -- and a cross
+/// when something is wrong.
+fn security_line(security: &SecurityInfo, theme: Theme) -> Line<'static> {
+    let surface = theme.focused();
+    let (mark, style) = match security.level() {
+        SecurityLevel::Good => ("✔", Style::default().add_modifier(Modifier::BOLD)),
+        SecurityLevel::Uncertain => ("?", surface.warning_style().add_modifier(Modifier::BOLD)),
+        SecurityLevel::Bad => ("✘", surface.hot_style()),
+    };
+    Line::from(vec![
+        Span::styled(
+            "OpenPGP: ".to_string(),
+            Style::default().add_modifier(Modifier::ITALIC),
+        ),
+        Span::styled(format!("{mark} {}", security.summary()), style),
+    ])
+}
+
 fn message_metadata_lines(view: &MessageViewState, width: u16) -> Vec<Line<'static>> {
     let message = &view.message;
     let date_line = {
@@ -1810,7 +2007,39 @@ fn plain_text(content: &crate::model::MessageContent) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LoadPhase, LoadingState, MailboxKind, Surface, Theme, text_field_view};
+    use super::{
+        LoadPhase, LoadingState, MailboxKind, Surface, Theme, text_field_view, wrap_words,
+    };
+
+    #[test]
+    fn a_long_status_wraps_at_spaces_and_keeps_its_end() {
+        let error = "Failed to send: building outgoing message: encrypting the message: \
+                     no usable OpenPGP key for rob@example.com";
+        let lines = wrap_words(error, 40, 4);
+        assert!(
+            lines.iter().all(|line| line.chars().count() <= 40),
+            "{lines:?}"
+        );
+        assert_eq!(lines.join(" "), error);
+        assert!(
+            lines.last().unwrap().ends_with("rob@example.com"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_status_too_long_for_its_lines_ends_in_an_ellipsis() {
+        let lines = wrap_words(&"word ".repeat(40), 20, 2);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].ends_with('…'), "{lines:?}");
+        assert!(lines[1].chars().count() <= 20);
+    }
+
+    #[test]
+    fn a_word_longer_than_the_line_is_split() {
+        assert_eq!(wrap_words("abcdefgh", 3, 4), vec!["abc", "def", "gh"]);
+        assert_eq!(wrap_words("", 10, 4), vec![""]);
+    }
 
     /// What a popup with focus is drawn on for these tests.  Which theme it
     /// comes from does not matter to anything asserted here -- only that every

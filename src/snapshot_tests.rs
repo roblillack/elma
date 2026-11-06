@@ -678,3 +678,114 @@ fn assert_colourless(app: &mut TestApp, what: &str) {
         }
     }
 }
+
+// -- OpenPGP -----------------------------------------------------------------
+
+/// A verdict on a signed and encrypted message sits under its headers, with
+/// a mark that reads without colour as well as with it.
+#[test]
+fn message_view_signed_and_encrypted() {
+    use crate::model::{EncryptionState, SecurityInfo, SignatureState, SignatureVerdict};
+
+    let mut app = message_view();
+    let view = app.app_mut().message_view_mut().expect("a message is open");
+    view.content.security = Some(SecurityInfo {
+        encryption: Some(EncryptionState::Decrypted),
+        signatures: vec![SignatureState {
+            verdict: SignatureVerdict::Good,
+            signer: Some("Vendor Billing <billing@vendor.example>".to_string()),
+            key: "0123456789ABCDEF0123456789ABCDEF01234567".to_string(),
+            matches_sender: true,
+        }],
+    });
+    app.draw();
+    assert_on_screen(
+        &app,
+        "OpenPGP: ✔ Encrypted; Good signature from Vendor Billing <billing@vendor.example>",
+    );
+    assert_svg("message_view_signed_and_encrypted", &mut app);
+
+    // A signature that does not hold up is the alarming kind.
+    let view = app.app_mut().message_view_mut().expect("a message is open");
+    view.content.security = Some(SecurityInfo {
+        encryption: None,
+        signatures: vec![SignatureState {
+            verdict: SignatureVerdict::Bad("signature: invalid signed hash value".to_string()),
+            signer: Some("Vendor Billing <billing@vendor.example>".to_string()),
+            key: "0123456789ABCDEF0123456789ABCDEF01234567".to_string(),
+            matches_sender: true,
+        }],
+    });
+    app.draw();
+    assert_on_screen(&app, "OpenPGP: ✘ BAD signature by Vendor Billing");
+    assert_svg("message_view_bad_signature", &mut app);
+}
+
+/// With OpenPGP available, compose grows a row of switches under the subject,
+/// reached with Tab and flipped with Space.
+#[test]
+fn compose_with_pgp() {
+    use crate::app::PgpChoice;
+
+    let mut app = inbox();
+    app.char('c');
+    app.app_mut()
+        .compose_state_mut()
+        .expect("compose is open")
+        .offer_pgp(PgpChoice {
+            sign: true,
+            encrypt: false,
+        });
+    app.draw();
+    assert_on_screen(&app, "PGP: [x] Sign  [ ] Encrypt");
+
+    // To, Cc, Bcc, Subject, then the switches.
+    for _ in 0..5 {
+        app.key(KeyCode::Tab);
+    }
+    app.char(' ');
+    assert_on_screen(&app, "PGP: [x] Sign  [x] Encrypt");
+    assert_on_screen(&app, "Encryption on.");
+    assert_svg("compose_with_pgp", &mut app);
+}
+
+/// A worker that needs a passphrase gets it from a prompt over whatever is on
+/// screen, which shows how much has been typed and nothing of what.
+#[test]
+fn passphrase_prompt() {
+    use crate::openpgp::prompt::{PassphraseRequest, PassphraseSource, channel};
+
+    let mut app = message_view();
+    let (mut asker, prompts) = channel();
+    app.app_mut().listen_for_passphrases(prompts);
+    let worker = std::thread::spawn(move || {
+        asker.passphrase(&PassphraseRequest {
+            description: "Unlock your OpenPGP key (held by gpg-agent)".to_string(),
+            retry: true,
+        })
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while app.app_mut().passphrase_prompt().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the prompt never came"
+        );
+        app.settle();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    app.type_text("hunter2");
+    assert_on_screen(&app, "Passphrase: •••••••");
+    assert!(
+        !app.buffer_lines()
+            .iter()
+            .any(|line| line.contains("hunter2")),
+        "the passphrase is never drawn"
+    );
+    assert_svg("passphrase_prompt", &mut app);
+
+    app.key(KeyCode::Enter);
+    let answer = worker.join().expect("the worker finishes");
+    assert_eq!(answer.as_deref().map(String::as_str), Some("hunter2"));
+    assert!(app.app_mut().passphrase_prompt().is_none());
+}
