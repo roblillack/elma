@@ -1842,6 +1842,7 @@ impl JmapInner {
             EmailProperty::Id,
             EmailProperty::From,
             EmailProperty::To,
+            EmailProperty::ReplyTo,
             EmailProperty::Subject,
             EmailProperty::SentAt,
             EmailProperty::ReceivedAt,
@@ -2336,6 +2337,7 @@ struct FetchedEmail {
     jmap_id: String,
     from: Vec<String>,
     to: Vec<String>,
+    reply_to: Vec<String>,
     subject: String,
     received_at: Option<i64>,
     sent_at: Option<i64>,
@@ -2356,6 +2358,12 @@ impl FetchedEmail {
             .collect();
         let to = email
             .to()
+            .unwrap_or_default()
+            .iter()
+            .map(format_address)
+            .collect();
+        let reply_to = email
+            .reply_to()
             .unwrap_or_default()
             .iter()
             .map(format_address)
@@ -2389,6 +2397,7 @@ impl FetchedEmail {
             jmap_id,
             from,
             to,
+            reply_to,
             subject,
             received_at,
             sent_at,
@@ -2475,6 +2484,7 @@ fn build_message(
         sent,
         sender,
         recipients: data.to.clone(),
+        reply_to: data.reply_to.clone(),
         subject: data.subject.clone(),
         size: data.size,
         starred,
@@ -3496,6 +3506,7 @@ mod tests {
             jmap_id: "M1".to_string(),
             from: vec!["someone@example.com".to_string()],
             to: vec!["me@example.com".to_string()],
+            reply_to: Vec::new(),
             subject: "Hello".to_string(),
             received_at: Some(0),
             sent_at: Some(0),
@@ -3565,6 +3576,26 @@ mod tests {
         .expect("parsing the canned email");
 
         FetchedEmail::from_email(email).expect("an email with an id builds")
+    }
+
+    #[test]
+    fn the_reply_to_reaches_the_message() {
+        let email: JmapEmail = serde_json::from_value(serde_json::json!({
+            "id": "M1",
+            "mailboxIds": {"mb-inbox": true},
+            "from": [{"name": "Ada", "email": "ada@example.com"}],
+            "replyTo": [{"name": "Dev list", "email": "dev@lists.example.org"}],
+            "subject": "Hello",
+            "size": 42,
+        }))
+        .expect("parsing the canned email");
+        let data = FetchedEmail::from_email(email).expect("an email with an id builds");
+
+        let message = build_message(1, 1, 1, &data, &standard_cache(), MailboxKind::Inbox)
+            .expect("message builds");
+
+        assert_eq!(message.sender, "Ada <ada@example.com>");
+        assert_eq!(message.reply_to, vec!["Dev list <dev@lists.example.org>"]);
     }
 
     /// `jmap-client` holds `mailboxIds` in an `AHashMap` and hands them over in

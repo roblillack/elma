@@ -83,6 +83,7 @@ fn placeholder_message(seq: u32) -> Message {
         sent: OffsetDateTime::UNIX_EPOCH,
         sender: String::new(),
         recipients: Vec::new(),
+        reply_to: Vec::new(),
         subject: String::new(),
         size: 0,
         starred: false,
@@ -1413,6 +1414,29 @@ fn prefix_subject(subject: &str, prefix: &str) -> String {
 
 fn text_paragraph(content: impl Into<String>) -> Paragraph {
     Paragraph::new_text().with_content(vec![Span::new_text(content.into())])
+}
+
+/// Who a reply goes to: the message's Reply-To when it has one, otherwise its
+/// sender.  A reply-all puts these in To and everyone else in the Cc -- so a
+/// Reply-To also replaces the sender there, the same as in Mutt and Gmail.
+/// With no sender either, it falls back to the first recipient.
+fn reply_recipients(message: &Message) -> Vec<String> {
+    let reply_to: Vec<String> = message
+        .reply_to
+        .iter()
+        .map(|address| address.trim().to_string())
+        .filter(|address| !address.is_empty())
+        .collect();
+    if !reply_to.is_empty() {
+        return reply_to;
+    }
+
+    [message.sender.trim()]
+        .into_iter()
+        .chain(message.recipients.first().map(|first| first.trim()))
+        .find(|address| !address.is_empty())
+        .map(|address| vec![address.to_string()])
+        .unwrap_or_default()
 }
 
 fn build_reply_document(original: &Document, sender: &str, sent: OffsetDateTime) -> Document {
@@ -3978,25 +4002,22 @@ impl App {
         compose.set_body(reply_body);
         compose.set_focus(ComposeFocus::Body);
 
-        let mut primary_recipient = message.sender.trim().to_string();
-        if primary_recipient.is_empty()
-            && let Some(first) = message.recipients.first()
-        {
-            primary_recipient = first.trim().to_string();
-        }
-
-        if !primary_recipient.is_empty() {
-            compose.set_field_text(ComposeField::To, primary_recipient.clone());
+        let primary_recipients = reply_recipients(message);
+        if !primary_recipients.is_empty() {
+            compose.set_field_text(ComposeField::To, primary_recipients.join(", "));
         }
 
         if reply_all {
-            let primary_lower = primary_recipient.to_ascii_lowercase();
+            let primary_lower: Vec<String> = primary_recipients
+                .iter()
+                .map(|recipient| recipient.to_ascii_lowercase())
+                .collect();
             let cc_list: Vec<String> = message
                 .recipients
                 .iter()
                 .map(|recipient| recipient.trim().to_string())
                 .filter(|recipient| !recipient.is_empty())
-                .filter(|recipient| recipient.to_ascii_lowercase() != primary_lower)
+                .filter(|recipient| !primary_lower.contains(&recipient.to_ascii_lowercase()))
                 .collect();
             if !cc_list.is_empty() {
                 compose.set_field_text(ComposeField::Cc, cc_list.join(", "));
@@ -6355,6 +6376,7 @@ mod tests {
             sent: OffsetDateTime::UNIX_EPOCH,
             sender: format!("sender-{id}"),
             recipients: vec![],
+            reply_to: vec![],
             subject: format!("Subject {id}"),
             size: 100,
             starred: false,
@@ -9290,6 +9312,72 @@ mod tests {
 
         let compose = app.compose.as_ref().expect("the reply opens compose");
         assert_eq!(compose.field_data(ComposeField::To).0, "sender-1");
+    }
+
+    /// A message whose author asked for replies to go to a list.
+    fn message_with_reply_to(id: MessageId) -> Message {
+        Message {
+            sender: "Ada <ada@example.com>".to_string(),
+            recipients: vec![
+                "dev@lists.example.org".to_string(),
+                "bob@example.com".to_string(),
+            ],
+            reply_to: vec!["dev@lists.example.org".to_string()],
+            ..make_message(id, MessageStatus::Read)
+        }
+    }
+
+    fn reply_fields(key: char, message: Message) -> (String, String) {
+        let mut app = test_app(vec![message]);
+        app.show_loaded_message(1, MessageContent::default());
+        app.mailbox.selected = Some(0);
+
+        app.handle_key(KeyEvent::from(KeyCode::Char(key))).unwrap();
+
+        let compose = app.compose.as_ref().expect("the reply opens compose");
+        (
+            compose.field_data(ComposeField::To).0.to_string(),
+            compose.field_data(ComposeField::Cc).0.to_string(),
+        )
+    }
+
+    #[test]
+    fn a_reply_goes_to_the_reply_to_address_rather_than_the_sender() {
+        let (to, cc) = reply_fields('r', message_with_reply_to(1));
+        assert_eq!(to, "dev@lists.example.org");
+        assert_eq!(cc, "");
+    }
+
+    #[test]
+    fn a_reply_all_puts_reply_to_in_to_and_leaves_it_out_of_the_cc() {
+        let (to, cc) = reply_fields('a', message_with_reply_to(1));
+        assert_eq!(to, "dev@lists.example.org");
+        assert_eq!(cc, "bob@example.com");
+    }
+
+    #[test]
+    fn a_reply_without_reply_to_goes_to_the_sender() {
+        let message = Message {
+            reply_to: vec![],
+            ..message_with_reply_to(1)
+        };
+        let (to, cc) = reply_fields('a', message);
+        assert_eq!(to, "Ada <ada@example.com>");
+        assert_eq!(cc, "dev@lists.example.org, bob@example.com");
+    }
+
+    #[test]
+    fn a_reply_to_with_several_addresses_puts_them_all_in_to() {
+        let message = Message {
+            reply_to: vec![
+                "Ada <ada@example.com>".to_string(),
+                "bob@example.com".to_string(),
+            ],
+            ..message_with_reply_to(1)
+        };
+        let (to, cc) = reply_fields('a', message);
+        assert_eq!(to, "Ada <ada@example.com>, bob@example.com");
+        assert_eq!(cc, "dev@lists.example.org");
     }
 
     #[test]

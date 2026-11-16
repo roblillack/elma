@@ -58,6 +58,10 @@ pub struct Message {
     pub sent: OffsetDateTime,
     pub sender: String,
     pub recipients: Vec<String>,
+    /// Where the author asked replies to go, in the same `Name <user@host>`
+    /// form as `sender`.  Empty when the message carries no Reply-To, in which
+    /// case replies go to `sender`.
+    pub reply_to: Vec<String>,
     pub subject: String,
     pub size: usize,
     pub starred: bool,
