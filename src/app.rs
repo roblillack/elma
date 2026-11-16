@@ -3990,7 +3990,7 @@ impl App {
                     None => match attachment.blob_id.as_deref() {
                         Some(blob_id) => backend
                             .fetch_attachment_blob(blob_id)
-                            .map_err(|err| format!("Failed to download attachment: {err}"))?,
+                            .map_err(|err| format!("Failed to download attachment: {err:#}"))?,
                         None => {
                             return Err("Attachment content is not available.".to_string());
                         }
@@ -5229,10 +5229,10 @@ impl App {
                     {
                         status = match op.kind {
                             OutgoingKind::Send => {
-                                format!("Message sent but failed to remove draft: {err}")
+                                format!("Message sent but failed to remove draft: {err:#}")
                             }
                             OutgoingKind::Draft => {
-                                format!("Draft saved but failed to remove previous copy: {err}")
+                                format!("Draft saved but failed to remove previous copy: {err:#}")
                             }
                         };
                     }
@@ -8855,7 +8855,9 @@ mod tests {
 
         fn result(&self) -> anyhow::Result<()> {
             if self.fail {
-                anyhow::bail!("backend refused");
+                // Shaped like a real failure: the server's reason, wrapped in
+                // what the backend was doing at the time.
+                return Err(anyhow!("Invalid arguments").context("fetching message body"));
             }
             Ok(())
         }
@@ -9129,8 +9131,9 @@ mod tests {
             app.mailbox
                 .status_line
                 .as_deref()
-                .is_some_and(|status| status.starts_with("Failed to load message:")),
-            "got {:?}",
+                .is_some_and(|status| status
+                    == "Failed to load message: fetching message body: Invalid arguments"),
+            "the server's reason has to come through, got {:?}",
             app.mailbox.status_line
         );
         assert!(app.message_view.is_none());

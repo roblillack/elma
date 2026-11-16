@@ -938,7 +938,7 @@ impl MailBackend for GmailBackend {
                 let result = Arc::clone(&inner)
                     .process_action(action.clone())
                     .await
-                    .map_err(|err| err.to_string());
+                    .map_err(|err| format!("{err:#}"));
                 if tx.send(ActionStatus { action, result }).is_err() {
                     break;
                 }

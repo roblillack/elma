@@ -679,7 +679,7 @@ impl MailBackend for JmapBackend {
                 if tx
                     .send(ActionStatus {
                         action,
-                        result: result.map_err(|err| err.to_string()),
+                        result: result.map_err(|err| format!("{err:#}")),
                     })
                     .is_err()
                 {
