@@ -189,6 +189,24 @@ pub(crate) fn compose_address(name: Option<&str>, email: &str) -> String {
     LettreMailbox::new(name, address).to_string()
 }
 
+/// The posting address in a `List-Post` header (RFC 2369), the first `mailto:`
+/// URL in it.
+///
+/// A list that takes no posts says `NO`, and a URL other than `mailto:` names
+/// a web form; neither is something to reply to, so both give `None`.
+pub(crate) fn list_post_address(header: &str) -> Option<String> {
+    header.split('<').skip(1).find_map(|rest| {
+        let url = rest.split('>').next()?.trim();
+        let (scheme, target) = url.split_once(':')?;
+        if !scheme.eq_ignore_ascii_case("mailto") {
+            return None;
+        }
+        let address = target.split('?').next()?.trim();
+        address.parse::<LettreAddress>().ok()?;
+        Some(address.to_string())
+    })
+}
+
 pub(crate) use mime::build_compose_body;
 
 /// The MIME headers of a leaf body part that decide how to treat it.
@@ -354,6 +372,14 @@ pub trait MailBackend: Send + Sync {
     /// [`MessageAttachment::data`](crate::model::MessageAttachment::data) directly
     /// and can leave this method unimplemented.  Backends that only return a
     /// pointer (for example JMAP) must override this to issue the blob download.
+    /// The addresses this account sends as, so a reply can recognise the
+    /// account's own mail and leave it out of the recipients.
+    ///
+    /// Called on the UI thread when a reply opens: answer from what is already
+    /// known, without blocking or touching the network.
+    fn own_addresses(&self) -> Vec<String> {
+        Vec::new()
+    }
     fn fetch_attachment_blob(&self, _blob_id: &str) -> Result<Vec<u8>> {
         Err(anyhow::anyhow!(
             "this backend does not support on-demand attachment download"
@@ -364,8 +390,31 @@ pub trait MailBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        Duration, LeafPart, LettreMailbox, PartRole, compose_address, mailer_header, retry_backoff,
+        Duration, LeafPart, LettreMailbox, PartRole, compose_address, list_post_address,
+        mailer_header, retry_backoff,
     };
+
+    #[test]
+    fn list_post_names_the_first_mailto_address() {
+        assert_eq!(
+            list_post_address(" <mailto:dev@lists.example.org>").as_deref(),
+            Some("dev@lists.example.org")
+        );
+        assert_eq!(
+            list_post_address(
+                "<https://example.org/post>, <MAILTO:dev@lists.example.org?subject=x>"
+            )
+            .as_deref(),
+            Some("dev@lists.example.org")
+        );
+    }
+
+    #[test]
+    fn a_list_that_takes_no_posts_has_no_list_post_address() {
+        assert_eq!(list_post_address("NO (posting not allowed)"), None);
+        assert_eq!(list_post_address("<https://example.org/post>"), None);
+        assert_eq!(list_post_address("<mailto:>"), None);
+    }
 
     /// What a reopened draft puts in its compose fields has to be what goes out
     /// again when it is sent: the same name, the same address, one recipient.

@@ -656,6 +656,11 @@ impl FixtureBackend {
 }
 
 impl MailBackend for FixtureBackend {
+    /// The fixture inbox is addressed to rob@example.com.
+    fn own_addresses(&self) -> Vec<String> {
+        vec!["rob@example.com".to_string()]
+    }
+
     fn load_mailbox(
         &self,
         mailbox: MailboxKind,
@@ -718,7 +723,6 @@ struct Fixture {
     sent: OffsetDateTime,
     sender: &'static str,
     recipients: &'static [&'static str],
-    reply_to: &'static [&'static str],
     subject: &'static str,
     size: usize,
     status: MessageStatus,
@@ -744,7 +748,6 @@ impl Fixture {
             sent,
             sender,
             recipients: &["rob@example.com"],
-            reply_to: &[],
             subject,
             size,
             status,
@@ -763,7 +766,6 @@ impl Fixture {
             sent: self.sent,
             sender: self.sender.to_string(),
             recipients: self.recipients.iter().map(|to| to.to_string()).collect(),
-            reply_to: self.reply_to.iter().map(|to| to.to_string()).collect(),
             subject: self.subject.to_string(),
             size: self.size,
             starred: self.starred,

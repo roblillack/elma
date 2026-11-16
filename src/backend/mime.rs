@@ -7,7 +7,7 @@
 //! verdict goes into [`MessageContent::security`].  Writing produces PGP/MIME.
 
 use crate::{
-    backend::{LeafPart, OutgoingAttachment, PartRole, compose_address},
+    backend::{LeafPart, OutgoingAttachment, PartRole, compose_address, list_post_address},
     model::{
         EncryptionState, MessageAttachment, MessageContent, MessageContentPart, SecurityInfo,
         SignatureVerdict,
@@ -58,6 +58,13 @@ pub(crate) fn build_message_content_with(
         to: header_addresses(mail, "To"),
         cc: header_addresses(mail, "Cc"),
         bcc: header_addresses(mail, "Bcc"),
+        from: header_addresses(mail, "From"),
+        reply_to: header_addresses(mail, "Reply-To"),
+        mail_followup_to: header_addresses(mail, "Mail-Followup-To"),
+        list_post: mail
+            .headers
+            .get_first_value("List-Post")
+            .and_then(|value| list_post_address(&value)),
         security: (!collector.security.is_empty()).then_some(collector.security),
     })
 }

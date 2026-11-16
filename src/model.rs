@@ -58,10 +58,6 @@ pub struct Message {
     pub sent: OffsetDateTime,
     pub sender: String,
     pub recipients: Vec<String>,
-    /// Where the author asked replies to go, in the same `Name <user@host>`
-    /// form as `sender`.  Empty when the message carries no Reply-To, in which
-    /// case replies go to `sender`.
-    pub reply_to: Vec<String>,
     pub subject: String,
     pub size: usize,
     pub starred: bool,
@@ -150,6 +146,17 @@ pub struct MessageContent {
     pub to: Vec<String>,
     pub cc: Vec<String>,
     pub bcc: Vec<String>,
+    /// The headers a reply is addressed from, written like `to` above.
+    ///
+    /// `from` is here as well because [`Message::sender`] is for display, too.
+    /// Each is empty when the message does not carry the header.
+    pub from: Vec<String>,
+    pub reply_to: Vec<String>,
+    /// Where a list member asked follow-ups to go (`Mail-Followup-To`).  A
+    /// reply-all goes to exactly these.
+    pub mail_followup_to: Vec<String>,
+    /// The list's posting address, from `List-Post: <mailto:...>`.
+    pub list_post: Option<String>,
     /// What OpenPGP had to say about the message, if it was signed or
     /// encrypted.  `None` for ordinary mail.
     pub security: Option<SecurityInfo>,

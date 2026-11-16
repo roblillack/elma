@@ -810,6 +810,10 @@ impl GmailBackend {
 }
 
 impl MailBackend for GmailBackend {
+    fn own_addresses(&self) -> Vec<String> {
+        vec![self.inner.email.clone()]
+    }
+
     /// Fetch `mailbox` and subscribe to Gmail's IDLE notifications for it.
     fn load_mailbox(
         &self,
@@ -2770,7 +2774,6 @@ fn build_message_from_attrs(
 
     let sender = extract_sender(envelope);
     let recipients = extract_recipients(envelope);
-    let reply_to = extract_reply_to(envelope);
     let subject = decode_header(envelope.subject.as_ref(), "Subject");
 
     let (status, starred, answered, forwarded, important) = match flags_raw {
@@ -2787,7 +2790,6 @@ fn build_message_from_attrs(
         sent,
         sender,
         recipients,
-        reply_to,
         subject,
         size: size as usize,
         starred,
@@ -3059,22 +3061,6 @@ fn extract_recipients(envelope: &imap_proto::Envelope<'_>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The envelope's Reply-To.  Servers fill it in with From when the message has
-/// none (RFC 3501, section 7.4.2), so this is rarely empty -- which is fine, as
-/// a reply then goes to the same place it would have gone to anyway.
-fn extract_reply_to(envelope: &imap_proto::Envelope<'_>) -> Vec<String> {
-    envelope
-        .reply_to
-        .as_ref()
-        .map(|addresses| {
-            addresses
-                .iter()
-                .filter_map(|address| decode_envelope_address(address, "Reply-To"))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// One envelope address as `Name <user@host>`, or just the address when it
 /// carries no name -- the form the JMAP backend uses as well.
 ///
@@ -3217,7 +3203,6 @@ mod tests {
             sent: OffsetDateTime::UNIX_EPOCH,
             sender: format!("sender{id}"),
             recipients: Vec::new(),
-            reply_to: Vec::new(),
             subject: format!("subject{id}"),
             size: 0,
             starred: false,
@@ -3244,7 +3229,6 @@ mod tests {
             sent: OffsetDateTime::UNIX_EPOCH,
             sender: format!("sender{id}"),
             recipients: Vec::new(),
-            reply_to: Vec::new(),
             subject: format!("subject{id}"),
             size: 0,
             starred: false,
@@ -3501,6 +3485,30 @@ mod tests {
         );
         assert_eq!(content.cc, ["ann@example.com", "Bob <bob@example.com>"]);
         assert_eq!(content.bcc, ["boss@example.com"]);
+    }
+
+    #[test]
+    fn a_loaded_message_carries_the_headers_a_reply_is_addressed_from() {
+        let raw = concat!(
+            "From: \"Lovelace, Ada\" <ada@example.com>\r\n",
+            "Reply-To: Dev list <dev@lists.example.org>\r\n",
+            "Mail-Followup-To: dev@lists.example.org, Bob <bob@example.com>\r\n",
+            "List-Post: <mailto:dev@lists.example.org>\r\n",
+            "To: dev@lists.example.org\r\n",
+            "Subject: Hello\r\n",
+            "\r\n",
+            "Hi.\r\n",
+        );
+        let parsed = mailparse::parse_mail(raw.as_bytes()).expect("parsing the fixture");
+        let content = build_message_content(&parsed).expect("building content");
+
+        assert_eq!(content.from, ["\"Lovelace, Ada\" <ada@example.com>"]);
+        assert_eq!(content.reply_to, ["Dev list <dev@lists.example.org>"]);
+        assert_eq!(
+            content.mail_followup_to,
+            ["dev@lists.example.org", "Bob <bob@example.com>"]
+        );
+        assert_eq!(content.list_post.as_deref(), Some("dev@lists.example.org"));
     }
 
     fn outgoing_with_bcc() -> OutgoingMessage {
@@ -4313,23 +4321,6 @@ mod tests {
 
         assert_eq!(stored.message.sender, "ada@example.com");
         assert_eq!(stored.message.recipients, vec!["bob@example.org"]);
-    }
-
-    #[test]
-    fn the_envelope_reply_to_is_kept() {
-        // ENVELOPE is date, subject, from, sender, reply-to, to, ...
-        let line = b"* 3 FETCH (UID 9 ENVELOPE (NIL \"Hi\" ((\"Ada\" NIL \"ada\" \"example.com\")) NIL ((\"Dev list\" NIL \"dev\" \"lists.example.org\")) ((NIL NIL \"bob\" \"example.org\")) NIL NIL NIL NIL))\r\n";
-        let (seq, attrs) = fetch_line(line);
-
-        let stored = build_message_from_attrs(MailboxKind::Inbox, seq, &attrs)
-            .expect("building the message")
-            .expect("a FETCH with UID and ENVELOPE is a message");
-
-        assert_eq!(stored.message.sender, "Ada <ada@example.com>");
-        assert_eq!(
-            stored.message.reply_to,
-            vec!["Dev list <dev@lists.example.org>"]
-        );
     }
 
     #[test]

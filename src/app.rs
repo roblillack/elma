@@ -83,7 +83,6 @@ fn placeholder_message(seq: u32) -> Message {
         sent: OffsetDateTime::UNIX_EPOCH,
         sender: String::new(),
         recipients: Vec::new(),
-        reply_to: Vec::new(),
         subject: String::new(),
         size: 0,
         starred: false,
@@ -1416,27 +1415,132 @@ fn text_paragraph(content: impl Into<String>) -> Paragraph {
     Paragraph::new_text().with_content(vec![Span::new_text(content.into())])
 }
 
-/// Who a reply goes to: the message's Reply-To when it has one, otherwise its
-/// sender.  A reply-all puts these in To and everyone else in the Cc -- so a
-/// Reply-To also replaces the sender there, the same as in Mutt and Gmail.
-/// With no sender either, it falls back to the first recipient.
-fn reply_recipients(message: &Message) -> Vec<String> {
-    let reply_to: Vec<String> = message
-        .reply_to
-        .iter()
-        .map(|address| address.trim().to_string())
-        .filter(|address| !address.is_empty())
-        .collect();
-    if !reply_to.is_empty() {
-        return reply_to;
+/// The recipients of a reply, worked out from the message being answered.
+#[derive(Debug, Default, PartialEq)]
+struct ReplyAddressing {
+    to: Vec<String>,
+    cc: Vec<String>,
+    /// The list a plain reply to a list message leaves out, so the status line
+    /// can say the reply goes to the author alone.
+    private_to_list: Option<String>,
+}
+
+/// Address a reply the way Mutt and Gmail do.
+///
+/// - A reply goes to Reply-To when the message has one, otherwise to From.
+/// - A reply-all puts the same in To, and everyone else the message went to in
+///   the Cc -- unless the message names a Mail-Followup-To, which is where its
+///   author asked every follow-up to go, and which a reply-all then goes to
+///   alone.
+/// - Answering one's own mail follows up to whom it was sent, not to oneself.
+/// - The account's own addresses never land in the Cc.
+///
+/// `content` is the loaded message; when it carries no addresses at all -- a
+/// backend that does not fill them in -- the list entry stands in for it.
+fn reply_addressing(
+    message: &Message,
+    content: &MessageContent,
+    own_addresses: &[String],
+    reply_all: bool,
+) -> ReplyAddressing {
+    let own: Vec<String> = own_addresses.iter().map(|own| address_key(own)).collect();
+    let is_own = |recipient: &String| own.contains(&address_key(recipient));
+
+    let from = if content.from.is_empty() {
+        cleaned(std::slice::from_ref(&message.sender))
+    } else {
+        cleaned(&content.from)
+    };
+    let (original_to, original_cc) = if content.to.is_empty() && content.cc.is_empty() {
+        (cleaned(&message.recipients), Vec::new())
+    } else {
+        (cleaned(&content.to), cleaned(&content.cc))
+    };
+    let sent_by_me = !from.is_empty() && from.iter().all(is_own);
+
+    if reply_all {
+        let followup: Vec<String> = cleaned(&content.mail_followup_to)
+            .into_iter()
+            .filter(|recipient| !is_own(recipient))
+            .collect();
+        if !followup.is_empty() {
+            return ReplyAddressing {
+                to: deduplicated(followup, &[]),
+                ..ReplyAddressing::default()
+            };
+        }
     }
 
-    [message.sender.trim()]
+    let reply_to = cleaned(&content.reply_to);
+    let mut to = if sent_by_me {
+        original_to.clone()
+    } else if !reply_to.is_empty() {
+        reply_to
+    } else {
+        from
+    };
+    if to.is_empty() {
+        to.extend(original_to.first().cloned());
+    }
+    let to = deduplicated(to, &[]);
+
+    let cc = if reply_all {
+        let others = if sent_by_me {
+            original_cc
+        } else {
+            original_to.into_iter().chain(original_cc).collect()
+        };
+        let others = others.into_iter().filter(|recipient| !is_own(recipient));
+        deduplicated(others.collect(), &to)
+    } else {
+        Vec::new()
+    };
+
+    let private_to_list = content.list_post.clone().filter(|list| {
+        let list = address_key(list);
+        !reply_all && !to.iter().any(|recipient| address_key(recipient) == list)
+    });
+
+    ReplyAddressing {
+        to,
+        cc,
+        private_to_list,
+    }
+}
+
+/// `recipients` trimmed, without the empty ones.
+fn cleaned(recipients: &[String]) -> Vec<String> {
+    recipients
+        .iter()
+        .map(|recipient| recipient.trim())
+        .filter(|recipient| !recipient.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// `recipients` with each mailbox kept once, and none that is in `already`.
+fn deduplicated(recipients: Vec<String>, already: &[String]) -> Vec<String> {
+    let mut seen: Vec<String> = already.iter().map(|r| address_key(r)).collect();
+    recipients
         .into_iter()
-        .chain(message.recipients.first().map(|first| first.trim()))
-        .find(|address| !address.is_empty())
-        .map(|address| vec![address.to_string()])
-        .unwrap_or_default()
+        .filter(|recipient| {
+            let key = address_key(recipient);
+            let new = !seen.contains(&key);
+            seen.push(key);
+            new
+        })
+        .collect()
+}
+
+/// The `user@host` of a recipient, lowercased, so `Ada <ADA@example.com>` and
+/// `ada@example.com` are recognised as the same mailbox.
+fn address_key(recipient: &str) -> String {
+    let recipient = recipient.trim();
+    let bare = match (recipient.rfind('<'), recipient.rfind('>')) {
+        (Some(open), Some(close)) if open < close => &recipient[open + 1..close],
+        _ => recipient,
+    };
+    bare.trim().to_lowercase()
 }
 
 fn build_reply_document(original: &Document, sender: &str, sent: OffsetDateTime) -> Document {
@@ -3927,7 +4031,7 @@ impl App {
         match purpose {
             MessageLoadPurpose::View => unreachable!("handled above"),
             MessageLoadPurpose::Reply { reply_all } => {
-                self.show_reply_compose(&message, document, reply_all);
+                self.show_reply_compose(&message, &loaded.content, document, reply_all);
             }
             MessageLoadPurpose::Forward => {
                 self.show_forward_compose(&message, document, loaded);
@@ -3993,7 +4097,13 @@ impl App {
         Ok(())
     }
 
-    fn show_reply_compose(&mut self, message: &Message, document: Document, reply_all: bool) {
+    fn show_reply_compose(
+        &mut self,
+        message: &Message,
+        content: &MessageContent,
+        document: Document,
+        reply_all: bool,
+    ) {
         let mut compose = ComposeState::new();
         let subject = prefix_subject(&message.subject, "Re:");
         compose.set_field_text(ComposeField::Subject, subject);
@@ -4002,34 +4112,24 @@ impl App {
         compose.set_body(reply_body);
         compose.set_focus(ComposeFocus::Body);
 
-        let primary_recipients = reply_recipients(message);
-        if !primary_recipients.is_empty() {
-            compose.set_field_text(ComposeField::To, primary_recipients.join(", "));
+        let addressing =
+            reply_addressing(message, content, &self.backend.own_addresses(), reply_all);
+        if !addressing.to.is_empty() {
+            compose.set_field_text(ComposeField::To, addressing.to.join(", "));
         }
-
-        if reply_all {
-            let primary_lower: Vec<String> = primary_recipients
-                .iter()
-                .map(|recipient| recipient.to_ascii_lowercase())
-                .collect();
-            let cc_list: Vec<String> = message
-                .recipients
-                .iter()
-                .map(|recipient| recipient.trim().to_string())
-                .filter(|recipient| !recipient.is_empty())
-                .filter(|recipient| !primary_lower.contains(&recipient.to_ascii_lowercase()))
-                .collect();
-            if !cc_list.is_empty() {
-                compose.set_field_text(ComposeField::Cc, cc_list.join(", "));
-            }
+        if !addressing.cc.is_empty() {
+            compose.set_field_text(ComposeField::Cc, addressing.cc.join(", "));
         }
 
         self.compose = Some(compose);
         self.message_view = None;
-        let status = if reply_all {
-            format!("Reply all to '{}'.", message.subject)
-        } else {
-            format!("Replying to '{}'.", message.subject)
+        let status = match (reply_all, addressing.private_to_list) {
+            (true, _) => format!("Reply all to '{}'.", message.subject),
+            (false, Some(list)) => format!(
+                "Replying to '{}' -- to the author only, not to {list}.",
+                message.subject
+            ),
+            (false, None) => format!("Replying to '{}'.", message.subject),
         };
         self.mailbox.status_line = Some(status);
     }
@@ -6368,7 +6468,14 @@ mod tests {
         fn save_draft(&self, _message: OutgoingMessage) -> anyhow::Result<()> {
             Ok(())
         }
+
+        fn own_addresses(&self) -> Vec<String> {
+            vec![ME.to_string()]
+        }
     }
+
+    /// The address [`NoopBackend`] sends as.
+    const ME: &str = "Rob <me@example.com>";
 
     fn make_message(id: MessageId, status: MessageStatus) -> Message {
         Message {
@@ -6376,7 +6483,6 @@ mod tests {
             sent: OffsetDateTime::UNIX_EPOCH,
             sender: format!("sender-{id}"),
             recipients: vec![],
-            reply_to: vec![],
             subject: format!("Subject {id}"),
             size: 100,
             starred: false,
@@ -9314,70 +9420,177 @@ mod tests {
         assert_eq!(compose.field_data(ComposeField::To).0, "sender-1");
     }
 
-    /// A message whose author asked for replies to go to a list.
-    fn message_with_reply_to(id: MessageId) -> Message {
-        Message {
-            sender: "Ada <ada@example.com>".to_string(),
-            recipients: vec![
-                "dev@lists.example.org".to_string(),
-                "bob@example.com".to_string(),
-            ],
-            reply_to: vec!["dev@lists.example.org".to_string()],
-            ..make_message(id, MessageStatus::Read)
-        }
+    /// A message Ada sent to a list, Bob and the account.
+    fn list_message() -> (Message, MessageContent) {
+        let message = Message {
+            sender: "Ada".to_string(),
+            recipients: vec!["Dev list".to_string()],
+            ..make_message(1, MessageStatus::Read)
+        };
+        let content = MessageContent {
+            from: vec!["Ada <ada@example.com>".to_string()],
+            to: vec!["Dev list <dev@lists.example.org>".to_string()],
+            cc: vec!["\"Doe, Bob\" <bob@example.com>".to_string(), ME.to_string()],
+            ..MessageContent::default()
+        };
+        (message, content)
     }
 
-    fn reply_fields(key: char, message: Message) -> (String, String) {
+    fn addressing(content: &MessageContent, reply_all: bool) -> (Vec<String>, Vec<String>) {
+        let (message, _) = list_message();
+        let addressing = reply_addressing(&message, content, &[ME.to_string()], reply_all);
+        (addressing.to, addressing.cc)
+    }
+
+    #[test]
+    fn a_reply_goes_to_the_sender_by_its_address() {
+        let (_, content) = list_message();
+        let (to, cc) = addressing(&content, false);
+        assert_eq!(to, ["Ada <ada@example.com>"]);
+        assert!(cc.is_empty());
+    }
+
+    #[test]
+    fn a_reply_all_copies_to_and_cc_but_not_the_account_itself() {
+        let (_, content) = list_message();
+        let (to, cc) = addressing(&content, true);
+        assert_eq!(to, ["Ada <ada@example.com>"]);
+        assert_eq!(
+            cc,
+            [
+                "Dev list <dev@lists.example.org>",
+                "\"Doe, Bob\" <bob@example.com>"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_account_is_recognised_whatever_name_and_case_it_comes_with() {
+        let (_, mut content) = list_message();
+        content.cc = vec!["ME@Example.com".to_string()];
+        let (_, cc) = addressing(&content, true);
+        assert_eq!(cc, ["Dev list <dev@lists.example.org>"]);
+    }
+
+    #[test]
+    fn a_reply_goes_to_reply_to_rather_than_the_sender() {
+        let (_, mut content) = list_message();
+        content.reply_to = vec!["Dev list <dev@lists.example.org>".to_string()];
+        let (to, cc) = addressing(&content, false);
+        assert_eq!(to, ["Dev list <dev@lists.example.org>"]);
+        assert!(cc.is_empty());
+    }
+
+    #[test]
+    fn a_reply_all_puts_reply_to_in_place_of_the_sender_and_out_of_the_cc() {
+        let (_, mut content) = list_message();
+        content.reply_to = vec!["dev@lists.example.org".to_string()];
+        let (to, cc) = addressing(&content, true);
+        assert_eq!(to, ["dev@lists.example.org"]);
+        assert_eq!(cc, ["\"Doe, Bob\" <bob@example.com>"]);
+    }
+
+    #[test]
+    fn a_reply_all_goes_to_mail_followup_to_alone() {
+        let (_, mut content) = list_message();
+        content.reply_to = vec!["ada@example.com".to_string()];
+        content.mail_followup_to = vec!["dev@lists.example.org".to_string(), ME.to_string()];
+        let (to, cc) = addressing(&content, true);
+        assert_eq!(to, ["dev@lists.example.org"]);
+        assert!(cc.is_empty());
+    }
+
+    #[test]
+    fn a_plain_reply_ignores_mail_followup_to() {
+        let (_, mut content) = list_message();
+        content.mail_followup_to = vec!["dev@lists.example.org".to_string()];
+        let (to, _) = addressing(&content, false);
+        assert_eq!(to, ["Ada <ada@example.com>"]);
+    }
+
+    #[test]
+    fn answering_ones_own_mail_follows_up_to_its_recipients() {
+        let content = MessageContent {
+            from: vec![ME.to_string()],
+            to: vec!["ada@example.com".to_string()],
+            cc: vec!["bob@example.com".to_string()],
+            ..MessageContent::default()
+        };
+        assert_eq!(
+            addressing(&content, false),
+            (vec!["ada@example.com".to_string()], vec![])
+        );
+        assert_eq!(
+            addressing(&content, true),
+            (
+                vec!["ada@example.com".to_string()],
+                vec!["bob@example.com".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn without_addresses_in_the_content_the_list_entry_stands_in() {
+        let (message, _) = list_message();
+        let addressing = reply_addressing(&message, &MessageContent::default(), &[], true);
+        assert_eq!(addressing.to, ["Ada"]);
+        assert_eq!(addressing.cc, ["Dev list"]);
+    }
+
+    #[test]
+    fn a_plain_reply_to_a_list_message_says_it_leaves_the_list_out() {
+        let (message, mut content) = list_message();
+        content.list_post = Some("dev@lists.example.org".to_string());
+
+        let private = reply_addressing(&message, &content, &[], false);
+        assert_eq!(
+            private.private_to_list.as_deref(),
+            Some("dev@lists.example.org")
+        );
+
+        content.reply_to = vec!["Dev list <DEV@lists.example.org>".to_string()];
+        let to_the_list = reply_addressing(&message, &content, &[], false);
+        assert_eq!(to_the_list.private_to_list, None);
+
+        let reply_all = reply_addressing(&message, &content, &[], true);
+        assert_eq!(reply_all.private_to_list, None);
+    }
+
+    #[test]
+    fn reply_all_from_the_app_leaves_the_backends_own_address_out() {
+        let (message, mut content) = list_message();
+        content.list_post = Some("dev@lists.example.org".to_string());
         let mut app = test_app(vec![message]);
-        app.show_loaded_message(1, MessageContent::default());
+        app.show_loaded_message(1, content);
         app.mailbox.selected = Some(0);
 
-        app.handle_key(KeyEvent::from(KeyCode::Char(key))).unwrap();
+        app.handle_key(KeyEvent::from(KeyCode::Char('a'))).unwrap();
 
         let compose = app.compose.as_ref().expect("the reply opens compose");
-        (
-            compose.field_data(ComposeField::To).0.to_string(),
-            compose.field_data(ComposeField::Cc).0.to_string(),
-        )
+        assert_eq!(
+            compose.field_data(ComposeField::To).0,
+            "Ada <ada@example.com>"
+        );
+        assert_eq!(
+            compose.field_data(ComposeField::Cc).0,
+            "Dev list <dev@lists.example.org>, \"Doe, Bob\" <bob@example.com>"
+        );
     }
 
     #[test]
-    fn a_reply_goes_to_the_reply_to_address_rather_than_the_sender() {
-        let (to, cc) = reply_fields('r', message_with_reply_to(1));
-        assert_eq!(to, "dev@lists.example.org");
-        assert_eq!(cc, "");
-    }
+    fn a_plain_reply_from_the_app_says_when_it_leaves_the_list_out() {
+        let (message, mut content) = list_message();
+        content.list_post = Some("dev@lists.example.org".to_string());
+        let mut app = test_app(vec![message]);
+        app.show_loaded_message(1, content);
+        app.mailbox.selected = Some(0);
 
-    #[test]
-    fn a_reply_all_puts_reply_to_in_to_and_leaves_it_out_of_the_cc() {
-        let (to, cc) = reply_fields('a', message_with_reply_to(1));
-        assert_eq!(to, "dev@lists.example.org");
-        assert_eq!(cc, "bob@example.com");
-    }
+        app.handle_key(KeyEvent::from(KeyCode::Char('r'))).unwrap();
 
-    #[test]
-    fn a_reply_without_reply_to_goes_to_the_sender() {
-        let message = Message {
-            reply_to: vec![],
-            ..message_with_reply_to(1)
-        };
-        let (to, cc) = reply_fields('a', message);
-        assert_eq!(to, "Ada <ada@example.com>");
-        assert_eq!(cc, "dev@lists.example.org, bob@example.com");
-    }
-
-    #[test]
-    fn a_reply_to_with_several_addresses_puts_them_all_in_to() {
-        let message = Message {
-            reply_to: vec![
-                "Ada <ada@example.com>".to_string(),
-                "bob@example.com".to_string(),
-            ],
-            ..message_with_reply_to(1)
-        };
-        let (to, cc) = reply_fields('a', message);
-        assert_eq!(to, "Ada <ada@example.com>, bob@example.com");
-        assert_eq!(cc, "dev@lists.example.org");
+        assert_eq!(
+            app.mailbox.status_line.as_deref(),
+            Some("Replying to 'Subject 1' -- to the author only, not to dev@lists.example.org.")
+        );
     }
 
     #[test]

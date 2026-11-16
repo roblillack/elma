@@ -280,12 +280,13 @@ fn compose_reply() {
     assert_svg("compose_reply", &mut app);
 }
 
-/// Reply-to-all keeps everyone the message went to, in the Cc.
+/// Reply-to-all keeps everyone else the message went to, in the Cc -- but not
+/// the account's own address.
 #[test]
 fn compose_reply_all() {
     let mut app = inbox();
     app.char('a');
-    assert_on_screen(&app, "Cc: rob@example.com, accounts@example.com");
+    assert_on_screen(&app, "Cc: accounts@example.com ");
     assert_svg("compose_reply_all", &mut app);
 }
 

@@ -543,7 +543,6 @@ impl MockBackend {
             sent,
             sender: DEFAULT_SENDER.to_string(),
             recipients,
-            reply_to: Vec::new(),
             subject,
             size,
             starred: false,
@@ -606,6 +605,10 @@ impl MockBackend {
 }
 
 impl MailBackend for MockBackend {
+    fn own_addresses(&self) -> Vec<String> {
+        vec![DEFAULT_SENDER.to_string()]
+    }
+
     /// Return the current mailbox snapshot and subscribe to future events.
     fn load_mailbox(
         &self,
@@ -831,7 +834,6 @@ fn new_random_message(
         sent,
         sender,
         recipients,
-        reply_to: Vec::new(),
         subject,
         size,
         starred: false,
@@ -1132,7 +1134,6 @@ mod tests {
             sent: OffsetDateTime::now_utc(),
             sender: "someone@example.com".to_string(),
             recipients: vec![DEFAULT_SENDER.to_string()],
-            reply_to: Vec::new(),
             subject: "A message".to_string(),
             size: 128,
             starred: false,
