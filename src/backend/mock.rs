@@ -535,7 +535,10 @@ impl MockBackend {
         recipients.extend(bcc.iter().cloned());
 
         let attachments_total: usize = attachments.iter().map(|att| att.size()).sum();
-        let size = text_body.len() + html_body.len() + subject.len() + attachments_total;
+        let size = text_body.len()
+            + html_body.as_ref().map_or(0, String::len)
+            + subject.len()
+            + attachments_total;
         let has_attachments = !attachments.is_empty();
 
         let mut message = Message {
@@ -571,10 +574,12 @@ impl MockBackend {
             content_type: "text/plain".to_string(),
             content: text_body.into_bytes(),
         });
-        content_state.parts.push(MessageContentPart {
-            content_type: "text/html".to_string(),
-            content: html_body.into_bytes(),
-        });
+        if let Some(html_body) = html_body {
+            content_state.parts.push(MessageContentPart {
+                content_type: "text/html".to_string(),
+                content: html_body.into_bytes(),
+            });
+        }
         for attachment in &attachments {
             content_state.attachments.push(MessageAttachment {
                 filename: Some(attachment.filename.clone()),
@@ -1122,7 +1127,7 @@ mod tests {
             bcc: Vec::new(),
             subject: subject.to_string(),
             text_body: "Body.".to_string(),
-            html_body: "<p>Body.</p>".to_string(),
+            html_body: Some("<p>Body.</p>".to_string()),
             attachments: Vec::new(),
             ..Default::default()
         }

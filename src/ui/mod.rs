@@ -617,15 +617,20 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
         dialog_height,
     );
 
+    let keys = if covered {
+        Vec::new()
+    } else {
+        app.compose_keys()
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .style(surface.style())
         .border_style(surface.border_style())
         .border_type(surface.border_type())
-        .title_top(surface.title(app.compose_title()))
+        .title_top(surface.title(&app.compose_title()))
         // Whatever covers the dialog has the keys, so the dialog stops
         // offering its own -- the same rule that empties them mid-send.
-        .title_bottom(surface.key_hints(if covered { &[] } else { app.compose_keys() }));
+        .title_bottom(surface.key_hints(&keys));
     let inner = block.inner(modal_area);
 
     frame.render_widget(Clear, modal_area);
@@ -659,6 +664,7 @@ fn render_compose(frame: &mut Frame<'_>, app: &mut App, theme: Theme, covered_by
     let status_text = question
         .or(pending_outgoing)
         .or_else(|| app.compose_status_line().map(|text| text.to_string()))
+        .or_else(|| app.compose_format_note())
         .unwrap_or_else(|| "Drop a file on the terminal to attach it.".to_string());
     // An error is only useful whole -- the reason comes last -- so the line
     // grows to take it, at the body's expense.
@@ -1096,6 +1102,16 @@ fn render_compose_body(frame: &mut Frame<'_>, area: Rect, app: &mut App, surface
             let placeholder =
                 Line::styled("Press [Edit message] to compose.", surface.muted_style());
             (focused, vec![placeholder])
+        } else if state.is_plain_text() {
+            // Shown as it goes out: what the formatting comes to without HTML
+            // is exactly what is worth seeing before sending.
+            let lines = state
+                .body_plain()
+                .unwrap_or_default()
+                .lines()
+                .map(|line| Line::raw(line.to_string()))
+                .collect::<Vec<_>>();
+            (focused, lines)
         } else {
             match viewer::render_document(state.body(), area.width) {
                 Ok(lines) if lines.is_empty() => (focused, vec![Line::raw(String::new())]),

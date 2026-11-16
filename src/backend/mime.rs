@@ -16,7 +16,8 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow};
 use lettre::message::{
-    Attachment as LettreAttachment, MultiPart, SinglePart,
+    Attachment as LettreAttachment, Message, MessageBuilder, MultiPart, MultiPartBuilder,
+    SinglePart,
     header::{ContentDisposition, ContentTransferEncoding, ContentType},
 };
 use mailparse::{DispositionType, MailAddr, MailHeaderMap, ParsedMail};
@@ -459,17 +460,49 @@ impl Protection {
     }
 }
 
+/// The MIME body of an outgoing message, ready to finish a message with.
+pub(crate) enum ComposeBody {
+    /// The plain text alone, with nothing to go alongside it.
+    Plain(SinglePart),
+    Multi(MultiPart),
+}
+
+impl ComposeBody {
+    /// Complete `builder` with this body.
+    pub(crate) fn finish(self, builder: MessageBuilder) -> Result<Message> {
+        Ok(match self {
+            Self::Plain(part) => builder.singlepart(part)?,
+            Self::Multi(parts) => builder.multipart(parts)?,
+        })
+    }
+
+    pub(crate) fn formatted(&self) -> Vec<u8> {
+        match self {
+            Self::Plain(part) => part.formatted(),
+            Self::Multi(parts) => parts.formatted(),
+        }
+    }
+
+    /// `parent` with this body as its next part.
+    fn nest_in(self, parent: MultiPartBuilder) -> MultiPart {
+        match self {
+            Self::Plain(part) => parent.singlepart(part),
+            Self::Multi(parts) => parent.multipart(parts),
+        }
+    }
+}
+
 /// Assemble the MIME body of an outgoing message.
 ///
-/// The two bodies always go into a `multipart/alternative`; attachments wrap
-/// that in a `multipart/mixed`.  With `protection`, the result is signed
-/// and/or encrypted as PGP/MIME.
+/// With an HTML body the two go into a `multipart/alternative`; without one the
+/// plain text stands alone.  Attachments wrap either in a `multipart/mixed`.
+/// With `protection`, the result is signed and/or encrypted as PGP/MIME.
 pub(crate) fn build_compose_body(
     text_body: String,
-    html_body: String,
+    html_body: Option<String>,
     attachments: Vec<OutgoingAttachment>,
     protection: &Protection,
-) -> Result<MultiPart> {
+) -> Result<ComposeBody> {
     let crypto = openpgp::context();
     build_compose_body_with(
         text_body,
@@ -482,20 +515,26 @@ pub(crate) fn build_compose_body(
 
 pub(crate) fn build_compose_body_with(
     text_body: String,
-    html_body: String,
+    html_body: Option<String>,
     attachments: Vec<OutgoingAttachment>,
     protection: &Protection,
     crypto: Option<&Crypto>,
-) -> Result<MultiPart> {
+) -> Result<ComposeBody> {
     let protected = protection.is_needed();
-    let alternative = MultiPart::alternative()
-        .singlepart(text_part(ContentType::TEXT_PLAIN, text_body, protected))
-        .singlepart(text_part(ContentType::TEXT_HTML, html_body, protected));
+    let plain = text_part(ContentType::TEXT_PLAIN, text_body, protected);
+    let text = match html_body {
+        None => ComposeBody::Plain(plain),
+        Some(html) => ComposeBody::Multi(
+            MultiPart::alternative()
+                .singlepart(plain)
+                .singlepart(text_part(ContentType::TEXT_HTML, html, protected)),
+        ),
+    };
 
     let body = if attachments.is_empty() {
-        alternative
+        text
     } else {
-        let mut mixed = MultiPart::mixed().multipart(alternative);
+        let mut mixed = text.nest_in(MultiPart::mixed());
         for attachment in attachments {
             let content_type: ContentType = attachment
                 .mime_type
@@ -505,14 +544,14 @@ pub(crate) fn build_compose_body_with(
                 LettreAttachment::new(attachment.filename).body(attachment.data, content_type);
             mixed = mixed.singlepart(part);
         }
-        mixed
+        ComposeBody::Multi(mixed)
     };
 
     if !protected {
         return Ok(body);
     }
     let crypto = crypto.ok_or_else(|| anyhow!("OpenPGP support is disabled"))?;
-    protect(body, protection, crypto)
+    protect(body, protection, crypto).map(ComposeBody::Multi)
 }
 
 /// A text part, made 7-bit safe when it is going to be signed or encrypted.
@@ -532,7 +571,7 @@ fn text_part(content_type: ContentType, body: String, protected: bool) -> Single
 }
 
 /// Wrap `body` in PGP/MIME.
-fn protect(body: MultiPart, protection: &Protection, crypto: &Crypto) -> Result<MultiPart> {
+fn protect(body: ComposeBody, protection: &Protection, crypto: &Crypto) -> Result<MultiPart> {
     if protection.draft {
         let entity = body.formatted();
         let armored = crypto.encrypt_to_self(&entity, &protection.from)?;
@@ -563,12 +602,11 @@ fn protect(body: MultiPart, protection: &Protection, crypto: &Crypto) -> Result<
     let signature = crypto
         .sign_detached(&entity, &protection.from)
         .context("signing the message")?;
-    Ok(MultiPart::signed(
+    let signed = MultiPart::signed(
         "application/pgp-signature".to_string(),
         openpgp::MICALG.to_string(),
-    )
-    .multipart(body)
-    .singlepart(
+    );
+    Ok(body.nest_in(signed).singlepart(
         SinglePart::builder()
             .header(
                 ContentType::parse("application/pgp-signature; name=\"signature.asc\"")

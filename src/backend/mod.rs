@@ -106,7 +106,10 @@ pub struct OutgoingMessage {
     pub bcc: Vec<String>,
     pub subject: String,
     pub text_body: String,
-    pub html_body: String,
+    /// The same body as HTML, sent as the alternative to `text_body`.  `None`
+    /// sends the plain text alone, for a recipient that wants no HTML -- a
+    /// mailing list, most of all.
+    pub html_body: Option<String>,
     pub attachments: Vec<OutgoingAttachment>,
     /// Sign with the sender's OpenPGP key.
     pub sign: bool,
@@ -390,9 +393,58 @@ pub trait MailBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        Duration, LeafPart, LettreMailbox, PartRole, compose_address, list_post_address,
-        mailer_header, retry_backoff,
+        Duration, LeafPart, LettreMailbox, OutgoingAttachment, PartRole, build_compose_body,
+        compose_address, list_post_address, mailer_header, mime::Protection, retry_backoff,
     };
+    use lettre::Message as LettreEmail;
+
+    /// The message `build_compose_body` makes of these bodies, as it goes out.
+    fn composed(html: Option<&str>, attachments: Vec<OutgoingAttachment>) -> String {
+        let builder = LettreEmail::builder()
+            .from("me@example.com".parse().unwrap())
+            .to("dev@lists.example.org".parse().unwrap())
+            .subject("Patch");
+        let body = build_compose_body(
+            "Looks good.".to_string(),
+            html.map(str::to_string),
+            attachments,
+            &Protection::default(),
+        )
+        .expect("the body builds");
+        let message = body.finish(builder).expect("the message builds");
+        String::from_utf8(message.formatted()).expect("the message is text")
+    }
+
+    #[test]
+    fn plain_text_alone_goes_out_as_a_single_text_part() {
+        let message = composed(None, Vec::new());
+        assert!(message.contains("Content-Type: text/plain"), "{message}");
+        assert!(!message.contains("multipart/"), "{message}");
+        assert!(!message.contains("text/html"), "{message}");
+        assert!(message.contains("Looks good."), "{message}");
+    }
+
+    #[test]
+    fn plain_text_with_an_attachment_has_no_html_alternative() {
+        let attachment = OutgoingAttachment {
+            filename: "fix.patch".to_string(),
+            mime_type: "text/x-diff".to_string(),
+            data: b"--- a\n+++ b\n".to_vec(),
+        };
+        let message = composed(None, vec![attachment]);
+        assert!(message.contains("multipart/mixed"), "{message}");
+        assert!(!message.contains("multipart/alternative"), "{message}");
+        assert!(!message.contains("text/html"), "{message}");
+        assert!(message.contains("fix.patch"), "{message}");
+    }
+
+    #[test]
+    fn an_html_body_goes_out_as_the_alternative_to_the_plain_text() {
+        let message = composed(Some("<p>Looks good.</p>"), Vec::new());
+        assert!(message.contains("multipart/alternative"), "{message}");
+        assert!(message.contains("Content-Type: text/plain"), "{message}");
+        assert!(message.contains("Content-Type: text/html"), "{message}");
+    }
 
     #[test]
     fn list_post_names_the_first_mailto_address() {

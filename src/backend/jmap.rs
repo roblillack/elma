@@ -2061,7 +2061,7 @@ impl JmapInner {
 
         let body = build_compose_body(text_body, html_body, attachments, &protection)?;
 
-        builder.multipart(body).context("building MIME message")
+        body.finish(builder).context("building MIME message")
     }
 }
 

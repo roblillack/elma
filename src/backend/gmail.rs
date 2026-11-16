@@ -1713,8 +1713,7 @@ impl GmailInner {
 
         let body = build_compose_body(text_body, html_body, attachments, &protection)?;
 
-        builder
-            .multipart(body)
+        body.finish(builder)
             .context("serialising compose body for SMTP")
     }
 
@@ -3518,7 +3517,7 @@ mod tests {
             bcc: vec!["boss@example.com".to_string()],
             subject: "Lunch".to_string(),
             text_body: "Thursday?".to_string(),
-            html_body: "<p>Thursday?</p>".to_string(),
+            html_body: Some("<p>Thursday?</p>".to_string()),
             attachments: Vec::new(),
             ..Default::default()
         }
