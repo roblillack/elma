@@ -9,7 +9,9 @@ use crate::{
     backend::{
         ActionStatus, BackendEvent, FAILURES_BEFORE_REPORT, LeafPart, MailBackend, MailboxSnapshot,
         OutgoingMessage, PartRole, build_compose_body, compose_address, mailer_header,
-        oauth::OAuthCredential, retry_backoff,
+        mime::{build_message_content as build_raw_message_content, looks_protected},
+        oauth::OAuthCredential,
+        retry_backoff,
     },
     model::{
         Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
@@ -983,6 +985,7 @@ impl JmapInner {
         get.ids([jmap_id.as_str()]);
         get.properties([
             EmailProperty::Id,
+            EmailProperty::BlobId,
             EmailProperty::BodyStructure,
             EmailProperty::BodyValues,
             EmailProperty::TextBody,
@@ -1015,6 +1018,22 @@ impl JmapInner {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow!("message body not returned by server"))?;
+
+        // The server takes signed and encrypted mail apart like any other,
+        // which loses what OpenPGP needs: the exact bytes a signature covers,
+        // and the ciphertext as a whole.  Those are read from the raw message.
+        if is_protected(&email)
+            && let Some(blob_id) = email.blob_id()
+        {
+            let trace = debug_logging::request("Blob/download", format_args!("blobId={blob_id}"));
+            let raw = trace
+                .response(client.download(blob_id).await, |blob| {
+                    format!("bytes={}", blob.len())
+                })
+                .with_context(|| format!("downloading the raw message {blob_id}"))?;
+            let parsed = mailparse::parse_mail(&raw).context("parsing the raw message")?;
+            return build_raw_message_content(&parsed);
+        }
 
         build_message_content(&email)
     }
@@ -1947,6 +1966,7 @@ impl JmapInner {
         outgoing: OutgoingMessage,
         keep_bcc: bool,
     ) -> Result<LettreEmail> {
+        let protection = outgoing.protection(&self.identity.email, keep_bcc);
         let OutgoingMessage {
             to,
             cc,
@@ -1955,6 +1975,7 @@ impl JmapInner {
             text_body,
             html_body,
             attachments,
+            ..
         } = outgoing;
 
         if to.is_empty() && cc.is_empty() && bcc.is_empty() {
@@ -2000,7 +2021,7 @@ impl JmapInner {
 
         builder = builder.subject(subject);
 
-        let body = build_compose_body(text_body, html_body, attachments)?;
+        let body = build_compose_body(text_body, html_body, attachments, &protection)?;
 
         builder.multipart(body).context("building MIME message")
     }
@@ -2580,6 +2601,35 @@ fn split_submission_responses(
     Ok((submission, update))
 }
 
+/// Whether `email` is signed or encrypted with OpenPGP, by its structure or
+/// by armor in its text.
+fn is_protected(email: &JmapEmail) -> bool {
+    fn types<'a>(part: &'a EmailBodyPart, out: &mut Vec<&'a str>, depth: usize) {
+        if depth > 16 {
+            return;
+        }
+        if let Some(ty) = part.content_type() {
+            out.push(ty);
+        }
+        for sub in part.sub_parts().unwrap_or_default() {
+            types(sub, out, depth + 1);
+        }
+    }
+    let mut content_types = Vec::new();
+    if let Some(structure) = email.body_structure() {
+        types(structure, &mut content_types, 0);
+    }
+    let texts: Vec<&str> = email
+        .text_body()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|part| part.part_id())
+        .filter_map(|id| email.body_value(id))
+        .map(|value| value.value())
+        .collect();
+    looks_protected(&content_types, &texts)
+}
+
 fn build_message_content(email: &JmapEmail) -> Result<MessageContent> {
     let mailer = email
         .header(&email::Header::as_text("X-Mailer", false))
@@ -2634,6 +2684,7 @@ fn build_message_content(email: &JmapEmail) -> Result<MessageContent> {
         to: compose_addresses(email.to()),
         cc: compose_addresses(email.cc()),
         bcc: compose_addresses(email.bcc()),
+        security: None,
     })
 }
 

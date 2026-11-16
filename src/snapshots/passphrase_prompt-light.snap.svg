@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="640" viewBox="0 0 1000 640" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="16px">
+<rect width="100%" height="100%" fill="#eeeeec"/>
+<rect x="0" y="0" width="1000" height="20" fill="#d3d3d3"/>
+<text x="0" y="15" fill="#696969" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">q:Close s:Star S:SaveAttachment +/=:Important -:NotImportant r:Reply f:Forward y:Archive d:Delete Up</text>
+<text x="0" y="35" fill="#2e3436" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-style="italic">Date:    2026-03-14 08:15:00 +0000                                              </text>
+<text x="0" y="55" fill="#2e3436" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-style="italic">From:    billing@vendor.example                                                 </text>
+<text x="0" y="75" fill="#2e3436" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-style="italic">Subject: Invoice 2026-0342 for February                                         </text>
+<text x="0" y="95" fill="#2e3436" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-style="italic">Mailer:  VendorBilling/2.1                                                      </text>
+<text x="0" y="115" fill="#2e3436" textLength="800" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-style="italic">Labels:  Work, Invoices                                                         </text>
+<text x="0" y="155" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Attachments:                                                                                        </text>
+<text x="0" y="175" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">- invoice-2026-0342.pdf (application/pdf, 14K)                                                      </text>
+<text x="0" y="195" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">- terms.txt (text/plain, 1.1K)                                                                      </text>
+<text x="0" y="215" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">- logo.png (image/png, 2.4K, inline)                                                                </text>
+<rect x="180" y="260" width="10" height="20" fill="#2e3436"/>
+<text x="180" y="275" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌</text>
+<rect x="190" y="260" width="200" height="20" fill="#2e3436"/>
+<text x="190" y="275" fill="#729fcf" textLength="200" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> OpenPGP passphrase </text>
+<rect x="390" y="260" width="430" height="20" fill="#2e3436"/>
+<text x="390" y="275" fill="#d3d3d3" textLength="430" lengthAdjust="spacingAndGlyphs" xml:space="preserve">──────────────────────────────────────────┐</text>
+<rect x="180" y="280" width="10" height="20" fill="#2e3436"/>
+<text x="180" y="295" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="190" y="280" width="620" height="20" fill="#2e3436"/>
+<text x="190" y="295" fill="#eeeeec" textLength="620" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Unlock your OpenPGP key (held by gpg-agent)                   </text>
+<rect x="810" y="280" width="10" height="20" fill="#2e3436"/>
+<text x="810" y="295" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="180" y="300" width="10" height="20" fill="#2e3436"/>
+<text x="180" y="315" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="190" y="300" width="370" height="20" fill="#2e3436"/>
+<text x="190" y="315" fill="#ef2929" textLength="370" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">That passphrase was wrong; try again.</text>
+<rect x="560" y="300" width="250" height="20" fill="#2e3436"/>
+<rect x="810" y="300" width="10" height="20" fill="#2e3436"/>
+<text x="810" y="315" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="180" y="320" width="10" height="20" fill="#2e3436"/>
+<text x="180" y="335" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="190" y="320" width="120" height="20" fill="#2e3436"/>
+<text x="190" y="335" fill="#06989a" textLength="120" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Passphrase: </text>
+<rect x="310" y="320" width="70" height="20" fill="#2e3436"/>
+<text x="310" y="335" fill="#c4a000" textLength="70" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">•••••••</text>
+<rect x="380" y="320" width="430" height="20" fill="#2e3436"/>
+<rect x="810" y="320" width="10" height="20" fill="#2e3436"/>
+<text x="810" y="335" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="180" y="340" width="10" height="20" fill="#2e3436"/>
+<text x="180" y="355" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="190" y="340" width="620" height="20" fill="#2e3436"/>
+<rect x="810" y="340" width="10" height="20" fill="#2e3436"/>
+<text x="810" y="355" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="180" y="360" width="10" height="20" fill="#2e3436"/>
+<text x="180" y="375" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└</text>
+<rect x="190" y="360" width="50" height="20" fill="#2e3436"/>
+<text x="190" y="375" fill="#ef2929" textLength="50" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Enter</text>
+<rect x="240" y="360" width="10" height="20" fill="#2e3436"/>
+<text x="240" y="375" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
+<rect x="250" y="360" width="60" height="20" fill="#2e3436"/>
+<text x="250" y="375" fill="#eeeeec" textLength="60" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Unlock</text>
+<rect x="310" y="360" width="20" height="20" fill="#2e3436"/>
+<rect x="330" y="360" width="30" height="20" fill="#2e3436"/>
+<text x="330" y="375" fill="#ef2929" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Esc</text>
+<rect x="360" y="360" width="10" height="20" fill="#2e3436"/>
+<text x="360" y="375" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
+<rect x="370" y="360" width="60" height="20" fill="#2e3436"/>
+<text x="370" y="375" fill="#eeeeec" textLength="60" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Cancel</text>
+<rect x="430" y="360" width="390" height="20" fill="#2e3436"/>
+<text x="430" y="375" fill="#d3d3d3" textLength="390" lengthAdjust="spacingAndGlyphs" xml:space="preserve">──────────────────────────────────────┘</text>
+<text x="0" y="395" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Dear customer,                                                                                      </text>
+<text x="0" y="435" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">your invoice for February 2026 is attached as a PDF. The total is 1,248.00 EUR,                     </text>
+<text x="0" y="455" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">payable within 14 days.                                                                             </text>
+<text x="0" y="495" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> • Hosting, February 2026 — 899.00 EUR                                                              </text>
+<text x="0" y="535" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> • Support plan — 349.00 EUR                                                                        </text>
+<text x="0" y="575" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Kind regards,                                                                                       </text>
+<text x="0" y="595" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Vendor Billing                                                                                      </text>
+<rect x="0" y="620" width="1000" height="20" fill="#d3d3d3"/>
+<rect x="380" y="320" width="10" height="20" fill="#2e3436" fill-opacity="0.4"/>
+</svg>

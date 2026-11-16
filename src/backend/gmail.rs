@@ -7,13 +7,10 @@
 use crate::{
     backend::{
         ActionStatus, BackendEvent, FAILURES_BEFORE_REPORT, LeafPart, MailBackend, MailboxSnapshot,
-        OutgoingMessage, PartRole, build_compose_body, compose_address, mailer_header,
+        OutgoingMessage, build_compose_body, mailer_header, mime::build_message_content,
         retry_backoff,
     },
-    model::{
-        Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
-        MessageContentPart, MessageId, MessageStatus,
-    },
+    model::{Action, ActionType, MailboxKind, Message, MessageContent, MessageId, MessageStatus},
 };
 use anyhow::{Context, Result, anyhow};
 use async_imap::{
@@ -30,7 +27,7 @@ use lettre::{
     Message as LettreEmail, SmtpTransport, Transport, message::Mailbox as LettreMailbox,
     transport::smtp::authentication::Credentials,
 };
-use mailparse::{self, DispositionType, MailAddr, MailHeaderMap, ParsedMail};
+use mailparse;
 use rustls_platform_verifier::ConfigVerifierExt;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -631,7 +628,6 @@ const DEFAULT_SPAM_LABEL: &str = "[Gmail]/Spam";
 const DEFAULT_SENT_LABEL: &str = "[Gmail]/Sent Mail";
 const DEFAULT_DRAFTS_LABEL: &str = "[Gmail]/Drafts";
 const DEFAULT_TRASH_LABEL: &str = "[Gmail]/Trash";
-const MAX_PART_DEPTH: usize = 5;
 const INITIAL_FETCH_LIMIT: u32 = 100;
 const BACKFILL_BATCH_SIZE: u32 = 100;
 const FETCH_MESSAGE_QUERY: &str = "(FLAGS INTERNALDATE RFC822.SIZE ENVELOPE UID BODYSTRUCTURE)";
@@ -1659,6 +1655,7 @@ impl GmailInner {
         outgoing: OutgoingMessage,
         keep_bcc: bool,
     ) -> Result<LettreEmail> {
+        let protection = outgoing.protection(&self.email, keep_bcc);
         let OutgoingMessage {
             to,
             cc,
@@ -1667,6 +1664,7 @@ impl GmailInner {
             text_body,
             html_body,
             attachments,
+            ..
         } = outgoing;
 
         if to.is_empty() && cc.is_empty() && bcc.is_empty() {
@@ -1709,7 +1707,7 @@ impl GmailInner {
 
         builder = builder.subject(subject);
 
-        let body = build_compose_body(text_body, html_body, attachments)?;
+        let body = build_compose_body(text_body, html_body, attachments, &protection)?;
 
         builder
             .multipart(body)
@@ -2807,11 +2805,23 @@ fn build_message_from_attrs(
 /// Whether the message described by this BODYSTRUCTURE carries an attachment.
 ///
 /// This is what the message list marker is built from, long before the body
-/// itself is fetched; [`collect_parts`] has to reach the same verdict from the
+/// itself is fetched; [`build_message_content`] has to reach the same verdict from the
 /// parsed message, which is why both go through [`LeafPart::is_attachment`].
 fn body_contains_attachment(structure: &BodyStructure<'_>) -> bool {
     match structure {
-        BodyStructure::Multipart { bodies, .. } => bodies.iter().any(body_contains_attachment),
+        BodyStructure::Multipart { common, bodies, .. } => {
+            let subtype = common.ty.subtype.as_ref();
+            if subtype.eq_ignore_ascii_case("signed") {
+                // The second part is the signature: not something the sender
+                // attached.
+                bodies.first().is_some_and(body_contains_attachment)
+            } else if subtype.eq_ignore_ascii_case("encrypted") {
+                // Whatever is attached is inside; opening the message tells.
+                false
+            } else {
+                bodies.iter().any(body_contains_attachment)
+            }
+        }
         BodyStructure::Message {
             common,
             other,
@@ -2856,124 +2866,6 @@ fn body_params_contains(params: &BodyParams<'_>, name: &str) -> bool {
         })
         .map(|(_, value)| !value.as_ref().is_empty())
         .unwrap_or(false)
-}
-
-fn build_message_content(mail: &ParsedMail<'_>) -> Result<MessageContent> {
-    let mailer = mail.headers.get_first_value("X-Mailer").unwrap_or_default();
-
-    let mut parts = Vec::new();
-    let mut attachments = Vec::new();
-    collect_parts(mail, 0, &mut parts, &mut attachments)?;
-
-    Ok(MessageContent {
-        mailer,
-        parts,
-        attachments,
-        to: header_addresses(mail, "To"),
-        cc: header_addresses(mail, "Cc"),
-        bcc: header_addresses(mail, "Bcc"),
-    })
-}
-
-/// The addresses in a message's `field` headers, written for the compose
-/// fields.
-///
-/// The envelope the message list is built from names people rather than
-/// addresses, so a reopened draft cannot be addressed from it.  Groups are
-/// opened up into their members; a header that will not parse is kept as
-/// written, for the user to correct rather than to lose.
-fn header_addresses(mail: &ParsedMail<'_>, field: &str) -> Vec<String> {
-    let mut addresses = Vec::new();
-    for header in mail.headers.get_all_headers(field) {
-        let Ok(list) = mailparse::addrparse_header(header) else {
-            let raw = header.get_value();
-            if !raw.trim().is_empty() {
-                addresses.push(raw.trim().to_string());
-            }
-            continue;
-        };
-        for addr in list.iter() {
-            let members = match addr {
-                MailAddr::Single(single) => std::slice::from_ref(single),
-                MailAddr::Group(group) => &group.addrs[..],
-            };
-            addresses.extend(
-                members
-                    .iter()
-                    .map(|member| compose_address(member.display_name.as_deref(), &member.addr)),
-            );
-        }
-    }
-    addresses
-}
-
-fn collect_parts(
-    mail: &ParsedMail<'_>,
-    depth: usize,
-    parts: &mut Vec<MessageContentPart>,
-    attachments: &mut Vec<MessageAttachment>,
-) -> Result<()> {
-    if depth >= MAX_PART_DEPTH {
-        return Ok(());
-    }
-
-    if mail.subparts.is_empty() {
-        let content_type = mail.ctype.mimetype.clone();
-        let data = if mail.ctype.mimetype.starts_with("text/") {
-            match mail.get_body() {
-                Ok(text) => text.into_bytes(),
-                Err(_) => mail
-                    .get_body_raw()
-                    .context("reading message body segment")?,
-            }
-        } else {
-            mail.get_body_raw()
-                .context("reading message body segment")?
-        };
-        let disposition = mail.get_content_disposition();
-        let filename = disposition
-            .params
-            .get("filename")
-            .cloned()
-            .or_else(|| disposition.params.get("name").cloned())
-            .or_else(|| mail.ctype.params.get("name").cloned())
-            .filter(|name| !name.trim().is_empty());
-        let disposition_name = match disposition.disposition {
-            DispositionType::Attachment => Some("attachment"),
-            DispositionType::Inline => Some("inline"),
-            _ => None,
-        };
-        let content_id = mail.headers.get_first_value("Content-ID");
-        let role = LeafPart {
-            major_type: mail.ctype.mimetype.split('/').next().unwrap_or_default(),
-            has_filename: filename.is_some(),
-            disposition: disposition_name,
-            has_content_id: content_id.is_some_and(|id| !id.trim().is_empty()),
-        }
-        .role();
-        // Inline parts are listed too: they earn no marker in the message list,
-        // but an embedded photo is still a file the reader may want to keep.
-        if role != PartRole::Body {
-            attachments.push(MessageAttachment {
-                filename,
-                mime_type: content_type.clone(),
-                size: data.len(),
-                data: Some(data.clone()),
-                blob_id: None,
-                inline: role == PartRole::Inline,
-            });
-        }
-        parts.push(MessageContentPart {
-            content_type,
-            content: data,
-        });
-    } else {
-        for sub in &mail.subparts {
-            collect_parts(sub, depth + 1, parts, attachments)?;
-        }
-    }
-
-    Ok(())
 }
 
 fn parse_envelope_date(envelope: &imap_proto::Envelope<'_>) -> Option<OffsetDateTime> {
@@ -3286,6 +3178,7 @@ where
 mod tests {
     use super::*;
     use imap_proto::{ContentDisposition, ContentEncoding, ContentType};
+    use mailparse::MailHeaderMap;
     use std::borrow::Cow;
 
     /// Nothing else in the suite opens a TLS connection, so a dependency that
@@ -3599,6 +3492,7 @@ mod tests {
             text_body: "Thursday?".to_string(),
             html_body: "<p>Thursday?</p>".to_string(),
             attachments: Vec::new(),
+            ..Default::default()
         }
     }
 

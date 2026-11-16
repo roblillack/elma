@@ -11,8 +11,7 @@ use anyhow::Result;
 use lettre::{
     Address as LettreAddress,
     message::{
-        Attachment as LettreAttachment, Mailbox as LettreMailbox, MultiPart, SinglePart,
-        header::ContentType as LettreContentType, header::HeaderName as LettreHeaderName,
+        Mailbox as LettreMailbox, header::HeaderName as LettreHeaderName,
         header::HeaderValue as LettreHeaderValue,
     },
 };
@@ -22,6 +21,7 @@ use std::{sync::mpsc::Receiver, time::Duration};
 mod debug_log;
 pub mod gmail;
 pub mod jmap;
+pub(crate) mod mime;
 pub mod mock;
 pub mod oauth;
 
@@ -108,6 +108,34 @@ pub struct OutgoingMessage {
     pub text_body: String,
     pub html_body: String,
     pub attachments: Vec<OutgoingAttachment>,
+    /// Sign with the sender's OpenPGP key.
+    pub sign: bool,
+    /// Encrypt to every recipient's OpenPGP key (and the sender's).
+    pub encrypt: bool,
+}
+
+impl OutgoingMessage {
+    /// How to protect this message on its way out from `from`, or into the
+    /// Drafts folder with `draft`.
+    pub(crate) fn protection(&self, from: &str, draft: bool) -> mime::Protection {
+        mime::Protection {
+            sign: self.sign,
+            encrypt: self.encrypt,
+            from: from.to_string(),
+            recipients: self
+                .to
+                .iter()
+                .chain(&self.cc)
+                .chain(&self.bcc)
+                .map(|addr| {
+                    addr.parse::<LettreMailbox>()
+                        .map(|mailbox| mailbox.email.to_string())
+                        .unwrap_or_else(|_| addr.trim().to_string())
+                })
+                .collect(),
+            draft,
+        }
+    }
 }
 
 /// A file attached to an outgoing message.
@@ -161,35 +189,7 @@ pub(crate) fn compose_address(name: Option<&str>, email: &str) -> String {
     LettreMailbox::new(name, address).to_string()
 }
 
-/// Assemble the MIME body of an outgoing message.
-///
-/// The two bodies always go into a `multipart/alternative`; attachments wrap
-/// that in a `multipart/mixed`.  Every SMTP-based backend builds the same
-/// structure, so the code lives here rather than being copied per backend.
-pub(crate) fn build_compose_body(
-    text_body: String,
-    html_body: String,
-    attachments: Vec<OutgoingAttachment>,
-) -> Result<MultiPart> {
-    let alternative = MultiPart::alternative()
-        .singlepart(SinglePart::plain(text_body))
-        .singlepart(SinglePart::html(html_body));
-
-    if attachments.is_empty() {
-        return Ok(alternative);
-    }
-
-    let mut mixed = MultiPart::mixed().multipart(alternative);
-    for attachment in attachments {
-        let content_type: LettreContentType = attachment
-            .mime_type
-            .parse()
-            .unwrap_or_else(|_| LettreContentType::parse("application/octet-stream").unwrap());
-        let part = LettreAttachment::new(attachment.filename).body(attachment.data, content_type);
-        mixed = mixed.singlepart(part);
-    }
-    Ok(mixed)
-}
+pub(crate) use mime::build_compose_body;
 
 /// The MIME headers of a leaf body part that decide how to treat it.
 ///

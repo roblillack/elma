@@ -29,6 +29,8 @@ mod backend;
 mod clock;
 #[path = "../../src/model.rs"]
 mod model;
+#[path = "../../src/openpgp/mod.rs"]
+mod openpgp;
 #[path = "../../src/test_harness.rs"]
 mod test_harness;
 #[path = "../../src/ui/mod.rs"]
