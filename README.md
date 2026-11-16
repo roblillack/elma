@@ -415,7 +415,8 @@ A message goes out as plain text with an HTML version alongside it. `Ctrl+T` in
 the compose view sends the plain text alone instead — and `Ctrl+T` again brings
 the HTML back. While a message is plain text only, the dialog's title says
 `(Plain Text)` and the body is shown as it will be sent, so you can see what
-your formatting comes to without HTML.
+your formatting comes to without HTML. It is wrapped at 72 columns, as mailing
+lists ask, rather than the 80 of the text that accompanies HTML.
 
 Mailing lists that turn HTML away, or that you would rather not send it to, can
 be made plain text by default in `~/.elmarc`:

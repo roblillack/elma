@@ -113,7 +113,7 @@
 <rect x="100" y="340" width="10" height="20" fill="#2e3436"/>
 <text x="100" y="355" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="110" y="340" width="780" height="20" fill="#555753"/>
-<text x="110" y="355" fill="#c4a000" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">&gt;                               Invoice 2026-0342                             </text>
+<text x="110" y="355" fill="#c4a000" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">&gt;                           Invoice 2026-0342                                 </text>
 <rect x="890" y="340" width="10" height="20" fill="#2e3436"/>
 <text x="890" y="355" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="100" y="360" width="10" height="20" fill="#2e3436"/>
@@ -149,7 +149,7 @@
 <rect x="100" y="460" width="10" height="20" fill="#2e3436"/>
 <text x="100" y="475" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="110" y="460" width="780" height="20" fill="#555753"/>
-<text x="110" y="475" fill="#c4a000" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">&gt; your invoice for February 2026 is attached as a PDF. The total is 1,248.00  </text>
+<text x="110" y="475" fill="#c4a000" textLength="780" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">&gt; your invoice for February 2026 is attached as a PDF. The total is           </text>
 <rect x="890" y="460" width="10" height="20" fill="#2e3436"/>
 <text x="890" y="475" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <rect x="100" y="480" width="10" height="20" fill="#2e3436"/>

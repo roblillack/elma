@@ -770,13 +770,17 @@ pub(crate) struct ComposeState {
     attachment_prompt: Option<TextFieldState>,
     attach: AttachBatch,
     body: Document,
-    /// [`Self::body`] as the plain text that goes out, rendered whenever the
-    /// body changes; `None` if it could not be.
+    /// [`Self::body`] as the plain text that goes alongside the HTML, rendered
+    /// whenever the body changes; `None` if it could not be.
     ///
     /// Serializing renders the whole document, and the compose dialog redraws
-    /// on every tick, so neither this nor the size can be worked out where it
-    /// is displayed.
+    /// on every tick, so neither the text nor the size can be worked out where
+    /// it is displayed.
     body_plain: Option<String>,
+    /// The same, wrapped for sending as plain text alone.  Kept next to the
+    /// other because which of the two goes out can change with every
+    /// recipient typed in.
+    body_plain_only: Option<String>,
     /// Serialized size of [`Self::body`] as HTML, measured with `body_plain`.
     body_html_bytes: usize,
     /// Whether to send the plain text alone, as the user -- or the draft being
@@ -909,6 +913,7 @@ impl Default for ComposeState {
             attach: AttachBatch::default(),
             body: Document::new(),
             body_plain: Some(String::new()),
+            body_plain_only: Some(String::new()),
             body_html_bytes: 0,
             plain_text: None,
             plain_text_lists: PlainTextLists::default(),
@@ -1209,8 +1214,17 @@ impl ComposeState {
         String::from_utf8(buffer).context("Markdown serialization produced invalid UTF-8")
     }
 
+    /// The plain text that goes out with the message as it stands.
     fn serialize_body_plain(&self) -> Result<String> {
-        document_to_plain_text(&self.body)
+        document_to_plain_text(&self.body, self.plain_text_width())
+    }
+
+    fn plain_text_width(&self) -> usize {
+        if self.is_plain_text() {
+            PLAIN_TEXT_ONLY_WIDTH
+        } else {
+            PLAIN_TEXT_WIDTH
+        }
     }
 
     fn serialize_body_html(&self) -> Result<String> {
@@ -1288,7 +1302,11 @@ impl ComposeState {
 
     /// The body as it goes out in plain text, for the preview.
     pub(crate) fn body_plain(&self) -> Option<&str> {
-        self.body_plain.as_deref()
+        if self.is_plain_text() {
+            self.body_plain_only.as_deref()
+        } else {
+            self.body_plain.as_deref()
+        }
     }
 
     /// Rough size of the message as it will go on the wire.
@@ -1304,7 +1322,7 @@ impl ComposeState {
             .iter()
             .map(|attachment| base64_size(attachment.size()))
             .sum();
-        let plain = self.body_plain.as_ref().map_or(0, String::len);
+        let plain = self.body_plain().map_or(0, str::len);
         let html = if self.is_plain_text() {
             0
         } else {
@@ -1440,14 +1458,15 @@ impl ComposeState {
 
     /// Replace the body, keeping its measured size in step.
     ///
-    /// The one place the document is assigned, so [`Self::body_plain`] and
+    /// The one place the document is assigned, so the plain texts and
     /// [`Self::body_html_bytes`] cannot drift away from what they describe.  A
     /// body that fails to serialize counts as nothing rather than aborting the
-    /// edit -- both are display aids, and [`Self::to_outgoing`] reports the
-    /// real failure when the message is actually sent.
+    /// edit -- all three are display aids, and [`Self::to_outgoing`] reports
+    /// the real failure when the message is actually sent.
     fn assign_body(&mut self, document: Document) {
         self.body = document;
-        self.body_plain = self.serialize_body_plain().ok();
+        self.body_plain = document_to_plain_text(&self.body, PLAIN_TEXT_WIDTH).ok();
+        self.body_plain_only = document_to_plain_text(&self.body, PLAIN_TEXT_ONLY_WIDTH).ok();
         self.body_html_bytes = self.serialize_body_html().map_or(0, |text| text.len());
     }
 
@@ -1610,11 +1629,18 @@ fn document_from_message_content(content: &MessageContent) -> Document {
     Document::new()
 }
 
-fn document_to_plain_text(document: &Document) -> Result<String> {
+/// Where the plain text that goes alongside HTML is wrapped.
+const PLAIN_TEXT_WIDTH: usize = 80;
+
+/// Where plain text sent alone is wrapped: narrower, the way mailing lists
+/// ask for it, so a line still fits once it has been quoted a few times.
+const PLAIN_TEXT_ONLY_WIDTH: usize = 72;
+
+fn document_to_plain_text(document: &Document, width: usize) -> Result<String> {
     let mut buffer = Vec::new();
     {
         let mut formatter = Formatter::new_ascii(&mut buffer);
-        formatter.style = plain_text_style();
+        formatter.style = plain_text_style(width);
         formatter
             .write_document(document)
             .context("failed to render FTML document as plain text")?;
@@ -1622,12 +1648,12 @@ fn document_to_plain_text(document: &Document) -> Result<String> {
     String::from_utf8(buffer).context("plain text serialization produced invalid UTF-8")
 }
 
-fn plain_text_style() -> FormattingStyle {
+fn plain_text_style(width: usize) -> FormattingStyle {
     let mut style = FormattingStyle::ascii();
     // Quoted the way mail is: what a list reader expects, and what Markdown
     // reads back as a quote when a draft sent as plain text alone is reopened.
     style.quote_prefix = "> ".to_string();
-    style.wrap_width = 80;
+    style.wrap_width = width;
     style.enable_osc8_hyperlinks = false;
     style
 }
@@ -10099,6 +10125,47 @@ mod tests {
     }
 
     #[test]
+    fn plain_text_alone_is_wrapped_at_72_columns() {
+        let longest_line = |app: &App| {
+            app.compose
+                .as_ref()
+                .unwrap()
+                .to_outgoing()
+                .unwrap()
+                .text_body
+                .lines()
+                .map(|line| line.chars().count())
+                .max()
+                .unwrap_or(0)
+        };
+        let mut paragraph = Paragraph::new_text();
+        paragraph.content_mut().push(Span::new_text(
+            "The patch looks good to me, but the second hunk changes the \
+             locking order, and I would like to see a test that takes both \
+             locks at once before this goes in."
+                .repeat(3),
+        ));
+        let (_, content) = list_message();
+        let mut app = replying(content, 'r');
+        app.compose
+            .as_mut()
+            .unwrap()
+            .set_body(Document::new().with_paragraphs(vec![paragraph]));
+
+        let with_html = longest_line(&app);
+        assert!(with_html > 72 && with_html <= 80, "{with_html}");
+
+        switch_format(&mut app);
+        let alone = longest_line(&app);
+        assert!(alone > 60 && alone <= 72, "{alone}");
+        let compose = app.compose.as_ref().unwrap();
+        assert_eq!(
+            compose.body_plain(),
+            Some(compose.to_outgoing().unwrap().text_body.as_str())
+        );
+    }
+
+    #[test]
     fn mail_to_a_configured_list_is_plain_text_unless_switched_back() {
         let (message, mut content) = list_message();
         content.list_post = Some("dev@lists.example.org".to_string());
@@ -10179,14 +10246,14 @@ mod tests {
             .push(Span::new_text("Shall we meet on Thursday?"));
         let original = Document::new().with_paragraphs(vec![quoted]);
         let reply = build_reply_document(&original, &message.sender, message.sent);
-        let text = document_to_plain_text(&reply).unwrap();
+        let text = document_to_plain_text(&reply, PLAIN_TEXT_ONLY_WIDTH).unwrap();
         assert!(text.contains("> Shall we meet on Thursday?"), "{text}");
 
         // Markdown has no blank paragraph, so the empty line left to write in
         // above the quote is all that does not come back.
         let reread = markdown::parse(Cursor::new(text.as_str())).unwrap();
         assert_eq!(
-            document_to_plain_text(&reread).unwrap(),
+            document_to_plain_text(&reread, PLAIN_TEXT_ONLY_WIDTH).unwrap(),
             text.trim_start_matches('\n')
         );
     }
