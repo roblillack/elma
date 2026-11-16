@@ -409,6 +409,29 @@ Secret keys in `keys` files are used directly, asking for their passphrase in
 the same prompt every time they are needed; there is no cache outside the
 agent.
 
+### Plain text
+
+A message goes out as plain text with an HTML version alongside it. `Ctrl+T` in
+the compose view sends the plain text alone instead — and `Ctrl+T` again brings
+the HTML back. While a message is plain text only, the dialog's title says
+`(Plain Text)` and the body is shown as it will be sent, so you can see what
+your formatting comes to without HTML. It is wrapped at 72 columns, as mailing
+lists ask, rather than the 80 of the text that accompanies HTML.
+
+Mailing lists that turn HTML away, or that you would rather not send it to, can
+be made plain text by default in `~/.elmarc`:
+
+```toml
+# An address is matched as a whole, "@domain" matches every address there.
+plain_text_lists = ["dev@lists.example.org", "@vger.kernel.org"]
+```
+
+Any message with one of them among its recipients — To, Cc or Bcc, whether a
+reply filled them in or you typed them — leaves the HTML out, and the line under
+the buttons names the list that decided it. `Ctrl+T` still overrides it for the
+message at hand, and that choice then holds whoever the message ends up
+addressed to. A draft reopens in the format it was saved in.
+
 ## Development
 
 `cargo test` runs the unit tests and the snapshot tests together.

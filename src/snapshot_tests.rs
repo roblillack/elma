@@ -13,7 +13,7 @@ use std::io::Write as _;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{FixtureBackend, TerminalTheme, TestApp, account};
-use crate::app::LoadPhase;
+use crate::app::{LoadPhase, PlainTextLists};
 use crate::model::MailboxKind;
 use crate::ui;
 
@@ -288,6 +288,21 @@ fn compose_reply_all() {
     app.char('a');
     assert_on_screen(&app, "Cc: accounts@example.com ");
     assert_svg("compose_reply_all", &mut app);
+}
+
+/// Reply-to-all to a message that copied a list configured for plain text: the
+/// title says so, the body is shown as it will go out, and the line under the
+/// buttons names the list that decided it.
+#[test]
+fn compose_reply_all_in_plain_text() {
+    let mut app = inbox();
+    app.app_mut().set_plain_text_lists(
+        PlainTextLists::parse(&["accounts@example.com"]).expect("the entry parses"),
+    );
+    app.char('a');
+    assert_on_screen(&app, "Reply All (Plain Text)");
+    assert_on_screen(&app, "Plain text only, for accounts@example.com.");
+    assert_svg("compose_reply_all_in_plain_text", &mut app);
 }
 
 /// A forward carries the attachments over and leaves the recipient to fill in.

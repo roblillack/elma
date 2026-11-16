@@ -136,16 +136,18 @@ fn compose(
     };
     let body = build_compose_body_with(
         text.to_string(),
-        format!("<p>{text}</p>"),
+        Some(format!("<p>{text}</p>")),
         attachments,
         &protection,
         Some(crypto),
     )?;
-    let message = lettre::Message::builder()
-        .from(from.parse().unwrap())
-        .to(to.parse().unwrap())
-        .subject("Plans")
-        .multipart(body)
+    let message = body
+        .finish(
+            lettre::Message::builder()
+                .from(from.parse().unwrap())
+                .to(to.parse().unwrap())
+                .subject("Plans"),
+        )
         .expect("a valid message");
     Ok(message.formatted())
 }
@@ -275,17 +277,19 @@ fn a_good_signature_from_someone_other_than_the_sender_is_not_good_enough() {
     };
     let body = build_compose_body_with(
         "Trust me".into(),
-        "<p>Trust me</p>".into(),
+        Some("<p>Trust me</p>".into()),
         vec![],
         &protection,
         Some(&alice_crypto),
     )
     .unwrap();
-    let raw = lettre::Message::builder()
-        .from("mallory@example.com".parse().unwrap())
-        .to(bob.address.parse().unwrap())
-        .subject("Hi")
-        .multipart(body)
+    let raw = body
+        .finish(
+            lettre::Message::builder()
+                .from("mallory@example.com".parse().unwrap())
+                .to(bob.address.parse().unwrap())
+                .subject("Hi"),
+        )
         .unwrap()
         .formatted();
 
@@ -367,6 +371,49 @@ fn an_encrypted_and_signed_message_opens_for_the_recipient_and_the_sender() {
         content.attachments[0].filename.as_deref(),
         Some("encrypted.asc")
     );
+}
+
+#[test]
+fn plain_text_alone_can_be_signed_and_encrypted() {
+    let alice = person("Alice", "alice@example.com", None);
+    let bob = person("Bob", "bob@example.com", None);
+    let (_a, alice_crypto) = context_for(&alice, &[&bob], Answers::default());
+    let (_b, bob_crypto) = context_for(&bob, &[&alice], Answers::default());
+
+    for encrypt in [false, true] {
+        let protection = Protection {
+            sign: true,
+            encrypt,
+            from: alice.address.to_string(),
+            recipients: vec![bob.address.to_string()],
+            draft: false,
+        };
+        let body = build_compose_body_with(
+            "For the list.".into(),
+            None,
+            vec![],
+            &protection,
+            Some(&alice_crypto),
+        )
+        .expect("protecting works");
+        let raw = body
+            .finish(
+                lettre::Message::builder()
+                    .from(alice.address.parse().unwrap())
+                    .to(bob.address.parse().unwrap())
+                    .subject("Patch"),
+            )
+            .expect("a valid message")
+            .formatted();
+
+        let content = read(&bob_crypto, &raw);
+        assert_eq!(plain_text(&content).trim_end(), "For the list.");
+        assert!(content.part("text/html").is_none(), "no HTML went out");
+        let security = content.security.as_ref().expect("a verdict");
+        assert_eq!(security.was_encrypted(), encrypt, "{security:?}");
+        assert_eq!(security.signatures.len(), 1, "{security:?}");
+        assert_eq!(security.signatures[0].verdict, SignatureVerdict::Good);
+    }
 }
 
 #[test]
@@ -497,17 +544,19 @@ fn an_encrypted_draft_is_for_the_sender_alone() {
     };
     let body = build_compose_body_with(
         "Draft".into(),
-        "<p>Draft</p>".into(),
+        Some("<p>Draft</p>".into()),
         vec![],
         &protection,
         Some(&alice_crypto),
     )
     .unwrap();
-    let raw = lettre::Message::builder()
-        .from(alice.address.parse().unwrap())
-        .to(bob.address.parse().unwrap())
-        .subject("Draft")
-        .multipart(body)
+    let raw = body
+        .finish(
+            lettre::Message::builder()
+                .from(alice.address.parse().unwrap())
+                .to(bob.address.parse().unwrap())
+                .subject("Draft"),
+        )
         .unwrap()
         .formatted();
 
@@ -534,7 +583,7 @@ fn a_signed_draft_that_is_not_encrypted_is_stored_as_written() {
     };
     let body = build_compose_body_with(
         "Draft".into(),
-        "<p>Draft</p>".into(),
+        Some("<p>Draft</p>".into()),
         vec![],
         &protection,
         Some(&alice_crypto),

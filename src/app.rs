@@ -530,6 +530,8 @@ pub struct App {
     passphrase: Option<PassphrasePrompt>,
     /// Where those workers' questions arrive.
     passphrase_queue: Option<PassphraseQueue>,
+    /// Where mail goes as plain text alone unless the user says otherwise.
+    plain_text_lists: PlainTextLists,
 }
 
 /// The passphrase being typed for a worker that is waiting on it.
@@ -768,11 +770,23 @@ pub(crate) struct ComposeState {
     attachment_prompt: Option<TextFieldState>,
     attach: AttachBatch,
     body: Document,
-    /// Serialized size of [`Self::body`], measured whenever it changes.
+    /// [`Self::body`] as the plain text that goes alongside the HTML, rendered
+    /// whenever the body changes; `None` if it could not be.
     ///
     /// Serializing renders the whole document, and the compose dialog redraws
-    /// on every tick, so the size cannot be computed where it is displayed.
-    body_bytes: usize,
+    /// on every tick, so neither the text nor the size can be worked out where
+    /// it is displayed.
+    body_plain: Option<String>,
+    /// The same, wrapped for sending as plain text alone.  Kept next to the
+    /// other because which of the two goes out can change with every
+    /// recipient typed in.
+    body_plain_only: Option<String>,
+    /// Serialized size of [`Self::body`] as HTML, measured with `body_plain`.
+    body_html_bytes: usize,
+    /// Whether to send the plain text alone, as the user -- or the draft being
+    /// edited -- chose.  `None` leaves it to [`Self::plain_text_lists`].
+    plain_text: Option<bool>,
+    plain_text_lists: PlainTextLists,
     draft_id: Option<MessageId>,
     /// Set while composing a reply, so it can be readdressed.
     reply: Option<ReplyContext>,
@@ -782,6 +796,55 @@ pub(crate) struct ComposeState {
     body_view_height: usize,
     /// Sign and encrypt, when OpenPGP is available at all.
     pgp: Option<PgpChoice>,
+}
+
+/// The recipients mail goes to as plain text alone unless the user says
+/// otherwise: mailing lists that turn HTML away, or archive it as noise.
+///
+/// Each entry is an address, matched as a whole, or `@domain` for every address
+/// at that domain -- the way a host such as `lists.debian.org` or
+/// `vger.kernel.org` keeps all its lists.  Case does not matter.
+#[derive(Clone, Debug, Default)]
+pub struct PlainTextLists(Arc<[String]>);
+
+impl PlainTextLists {
+    /// Read the entries of the configuration file, saying which one is not an
+    /// address or `@domain`.
+    pub fn parse<S: AsRef<str>>(entries: &[S]) -> Result<Self> {
+        let patterns = entries
+            .iter()
+            .map(|entry| {
+                let entry = entry.as_ref().trim();
+                let pattern = entry.strip_prefix('*').unwrap_or(entry).to_lowercase();
+                match pattern.split_once('@') {
+                    Some((_, domain)) if !domain.is_empty() && !domain.contains('@') => Ok(pattern),
+                    _ => Err(anyhow!("{entry:?} is neither an address nor `@domain`")),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self(patterns.into()))
+    }
+
+    /// The first of `recipients` that is one of the lists, as its bare address.
+    fn first_match<'a>(&self, recipients: impl IntoIterator<Item = &'a str>) -> Option<String> {
+        if self.0.is_empty() {
+            return None;
+        }
+        recipients
+            .into_iter()
+            .map(address_key)
+            .find(|address| self.matches(address))
+    }
+
+    fn matches(&self, address: &str) -> bool {
+        self.0.iter().any(|pattern| {
+            if pattern.starts_with('@') {
+                address.ends_with(pattern.as_str())
+            } else {
+                address == pattern
+            }
+        })
+    }
 }
 
 /// What a reply was made from, kept so compose can switch who it goes to.
@@ -849,7 +912,11 @@ impl Default for ComposeState {
             attachment_prompt: None,
             attach: AttachBatch::default(),
             body: Document::new(),
-            body_bytes: 0,
+            body_plain: Some(String::new()),
+            body_plain_only: Some(String::new()),
+            body_html_bytes: 0,
+            plain_text: None,
+            plain_text_lists: PlainTextLists::default(),
             draft_id: None,
             reply: None,
             focus: ComposeFocus::Field(ComposeField::To),
@@ -870,10 +937,6 @@ const COMPOSE_BUTTON_SEQUENCE: [ComposeButton; 5] = [
 ];
 
 impl ComposeState {
-    fn new() -> Self {
-        Self::default()
-    }
-
     fn from_draft(
         draft_id: MessageId,
         to: String,
@@ -1151,8 +1214,17 @@ impl ComposeState {
         String::from_utf8(buffer).context("Markdown serialization produced invalid UTF-8")
     }
 
+    /// The plain text that goes out with the message as it stands.
     fn serialize_body_plain(&self) -> Result<String> {
-        document_to_plain_text(&self.body)
+        document_to_plain_text(&self.body, self.plain_text_width())
+    }
+
+    fn plain_text_width(&self) -> usize {
+        if self.is_plain_text() {
+            PLAIN_TEXT_ONLY_WIDTH
+        } else {
+            PLAIN_TEXT_WIDTH
+        }
     }
 
     fn serialize_body_html(&self) -> Result<String> {
@@ -1163,7 +1235,11 @@ impl ComposeState {
 
     pub(crate) fn to_outgoing(&self) -> Result<OutgoingMessage> {
         let text_body = self.serialize_body_plain()?;
-        let html_body = self.serialize_body_html()?;
+        let html_body = if self.is_plain_text() {
+            None
+        } else {
+            Some(self.serialize_body_html()?)
+        };
         Ok(OutgoingMessage {
             to: split_addresses(&self.to.value),
             cc: split_addresses(&self.cc.value),
@@ -1181,6 +1257,58 @@ impl ComposeState {
         &self.attachments
     }
 
+    /// Whether the message goes out as plain text alone, without the HTML
+    /// alternative.
+    pub(crate) fn is_plain_text(&self) -> bool {
+        self.plain_text
+            .unwrap_or_else(|| self.plain_text_list().is_some())
+    }
+
+    /// The configured list among the recipients that, left to itself, makes
+    /// this message plain text.
+    fn plain_text_list(&self) -> Option<String> {
+        let to = split_addresses(&self.to.value);
+        let cc = split_addresses(&self.cc.value);
+        let bcc = split_addresses(&self.bcc.value);
+        self.plain_text_lists
+            .first_match(to.iter().chain(&cc).chain(&bcc).map(String::as_str))
+    }
+
+    /// The list that decides the format, when the user has not: what the
+    /// dialog says about why HTML is left out.
+    pub(crate) fn plain_text_reason(&self) -> Option<String> {
+        if self.plain_text.is_some() {
+            return None;
+        }
+        self.plain_text_list()
+    }
+
+    /// Switch between plain text alone and plain text with HTML, returning
+    /// whether the message is now plain text.  The choice holds whoever the
+    /// message is addressed to afterwards.
+    fn toggle_plain_text(&mut self) -> bool {
+        let plain = !self.is_plain_text();
+        self.plain_text = Some(plain);
+        plain
+    }
+
+    /// Keep the format a draft was saved in, where the recipients alone would
+    /// pick the other one.
+    fn keep_draft_format(&mut self, had_html: bool) {
+        if self.plain_text_list().is_some() == had_html {
+            self.plain_text = Some(!had_html);
+        }
+    }
+
+    /// The body as it goes out in plain text, for the preview.
+    pub(crate) fn body_plain(&self) -> Option<&str> {
+        if self.is_plain_text() {
+            self.body_plain_only.as_deref()
+        } else {
+            self.body_plain.as_deref()
+        }
+    }
+
     /// Rough size of the message as it will go on the wire.
     ///
     /// Attachments are base64-encoded when the MIME body is built, and the
@@ -1194,7 +1322,13 @@ impl ComposeState {
             .iter()
             .map(|attachment| base64_size(attachment.size()))
             .sum();
-        self.body_bytes + attachments
+        let plain = self.body_plain().map_or(0, str::len);
+        let html = if self.is_plain_text() {
+            0
+        } else {
+            self.body_html_bytes
+        };
+        plain + html + attachments
     }
 
     /// The oversized file waiting for an answer: its name, its size on disk,
@@ -1324,16 +1458,16 @@ impl ComposeState {
 
     /// Replace the body, keeping its measured size in step.
     ///
-    /// The one place the document is assigned, so [`Self::body_bytes`] cannot
-    /// drift away from what it describes.  A body that fails to serialize
-    /// counts as nothing rather than aborting the edit -- the number is a
-    /// display aid, and [`Self::to_outgoing`] reports the real failure when the
-    /// message is actually sent.
+    /// The one place the document is assigned, so the plain texts and
+    /// [`Self::body_html_bytes`] cannot drift away from what they describe.  A
+    /// body that fails to serialize counts as nothing rather than aborting the
+    /// edit -- all three are display aids, and [`Self::to_outgoing`] reports
+    /// the real failure when the message is actually sent.
     fn assign_body(&mut self, document: Document) {
         self.body = document;
-        let plain = self.serialize_body_plain().map_or(0, |text| text.len());
-        let html = self.serialize_body_html().map_or(0, |text| text.len());
-        self.body_bytes = plain + html;
+        self.body_plain = document_to_plain_text(&self.body, PLAIN_TEXT_WIDTH).ok();
+        self.body_plain_only = document_to_plain_text(&self.body, PLAIN_TEXT_ONLY_WIDTH).ok();
+        self.body_html_bytes = self.serialize_body_html().map_or(0, |text| text.len());
     }
 
     pub(crate) fn set_field_text<S: Into<String>>(&mut self, field: ComposeField, value: S) {
@@ -1495,11 +1629,18 @@ fn document_from_message_content(content: &MessageContent) -> Document {
     Document::new()
 }
 
-fn document_to_plain_text(document: &Document) -> Result<String> {
+/// Where the plain text that goes alongside HTML is wrapped.
+const PLAIN_TEXT_WIDTH: usize = 80;
+
+/// Where plain text sent alone is wrapped: narrower, the way mailing lists
+/// ask for it, so a line still fits once it has been quoted a few times.
+const PLAIN_TEXT_ONLY_WIDTH: usize = 72;
+
+fn document_to_plain_text(document: &Document, width: usize) -> Result<String> {
     let mut buffer = Vec::new();
     {
         let mut formatter = Formatter::new_ascii(&mut buffer);
-        formatter.style = plain_text_style();
+        formatter.style = plain_text_style(width);
         formatter
             .write_document(document)
             .context("failed to render FTML document as plain text")?;
@@ -1507,9 +1648,12 @@ fn document_to_plain_text(document: &Document) -> Result<String> {
     String::from_utf8(buffer).context("plain text serialization produced invalid UTF-8")
 }
 
-fn plain_text_style() -> FormattingStyle {
+fn plain_text_style(width: usize) -> FormattingStyle {
     let mut style = FormattingStyle::ascii();
-    style.wrap_width = 80;
+    // Quoted the way mail is: what a list reader expects, and what Markdown
+    // reads back as a quote when a draft sent as plain text alone is reopened.
+    style.quote_prefix = "> ".to_string();
+    style.wrap_width = width;
     style.enable_osc8_hyperlinks = false;
     style
 }
@@ -2042,6 +2186,7 @@ impl App {
             confirmation: None,
             passphrase: None,
             passphrase_queue: None,
+            plain_text_lists: PlainTextLists::default(),
         };
 
         for index in 0..app.accounts.len() {
@@ -2049,6 +2194,20 @@ impl App {
         }
 
         Ok(app)
+    }
+
+    /// Send mail to these lists as plain text alone, unless the user switches
+    /// a message back.
+    pub fn set_plain_text_lists(&mut self, lists: PlainTextLists) {
+        self.plain_text_lists = lists;
+    }
+
+    /// An empty message, which knows which recipients want plain text.
+    fn new_compose(&self) -> ComposeState {
+        ComposeState {
+            plain_text_lists: self.plain_text_lists.clone(),
+            ..ComposeState::default()
+        }
     }
 
     /// Whether the screen has to be repainted from scratch, clearing the request.
@@ -3412,17 +3571,21 @@ impl App {
         self.compose.as_mut()
     }
 
-    /// What the compose dialog is called, for the top of its frame.
-    pub(crate) fn compose_title(&self) -> &'static str {
+    /// What the compose dialog is called, for the top of its frame: what is
+    /// being written, and whether it goes out as plain text alone.
+    pub(crate) fn compose_title(&self) -> String {
         let Some(compose) = self.compose.as_ref() else {
-            return "Compose";
+            return "Compose".to_string();
         };
-        if let Some(kind) = compose.reply_kind() {
-            return kind.title();
-        }
-        match compose.draft_id() {
-            Some(_) => "Edit Draft",
-            None => "Compose",
+        let title = match (compose.reply_kind(), compose.draft_id()) {
+            (Some(kind), _) => kind.title(),
+            (None, Some(_)) => "Edit Draft",
+            (None, None) => "Compose",
+        };
+        if compose.is_plain_text() {
+            format!("{title} (Plain Text)")
+        } else {
+            title.to_string()
         }
     }
 
@@ -3430,33 +3593,45 @@ impl App {
     ///
     /// Empty while the backend has the message: every key is locked out until
     /// the send comes back, and the wait is what the status line is saying.
-    pub(crate) fn compose_keys(&self) -> &'static [(&'static str, &'static str)] {
+    ///
+    /// `^T` is named after what it switches to, since the title already says
+    /// what the message is now.
+    pub(crate) fn compose_keys(&self) -> Vec<(&'static str, &'static str)> {
+        let Some(compose) = self.compose.as_ref() else {
+            return Vec::new();
+        };
         if self.pending_outgoing().is_some() {
-            return &[];
+            return Vec::new();
         }
-        if self
-            .compose
-            .as_ref()
-            .is_some_and(|compose| compose.reply_kind().is_some())
-        {
-            return &[
-                ("Tab", "Next"),
-                ("Shift+Tab", "Prev"),
-                ("Esc", "Cancel"),
-                ("Enter", "Activate"),
-                ("^R", "Reply type"),
-            ];
-        }
-        &[
+        let mut keys = vec![
             ("Tab", "Next"),
             ("Shift+Tab", "Prev"),
             ("Esc", "Cancel"),
             ("Enter", "Activate"),
-        ]
+        ];
+        if compose.reply_kind().is_some() {
+            keys.push(("^R", "Reply type"));
+        }
+        keys.push((
+            "^T",
+            if compose.is_plain_text() {
+                "HTML"
+            } else {
+                "Plain"
+            },
+        ));
+        keys
     }
 
     pub(crate) fn compose_status_line(&self) -> Option<&str> {
         self.compose.as_ref().and_then(|state| state.status())
+    }
+
+    /// Why the message leaves its HTML behind, for the line under the buttons
+    /// when nothing more pressing is on it.
+    pub(crate) fn compose_format_note(&self) -> Option<String> {
+        let list = self.compose.as_ref()?.plain_text_reason()?;
+        Some(format!("Plain text only, for {list}. ^T adds HTML."))
     }
 
     /// The load the user is waiting on, while there is nothing else to look at.
@@ -3796,7 +3971,7 @@ impl App {
         // A reply/forward/draft body still on its way would replace this blank
         // message -- and anything typed into it -- the moment it lands.
         self.cancel_compose_bound_load();
-        self.compose = Some(ComposeState::new());
+        self.compose = Some(self.new_compose());
         self.message_view = None;
         self.mailbox.status_line = Some("Compose mode active.".to_string());
     }
@@ -4270,7 +4445,7 @@ impl App {
         document: Document,
         kind: ReplyKind,
     ) {
-        let mut compose = ComposeState::new();
+        let mut compose = self.new_compose();
         let subject = prefix_subject(&message.subject, "Re:");
         compose.set_field_text(ComposeField::Subject, subject);
 
@@ -4313,7 +4488,7 @@ impl App {
         document: Document,
         loaded: LoadedMessage,
     ) {
-        let mut compose = ComposeState::new();
+        let mut compose = self.new_compose();
         let subject = prefix_subject(&message.subject, "Fwd:");
         compose.set_field_text(ComposeField::Subject, subject);
         compose.set_body(build_forward_document(&document, message));
@@ -4361,6 +4536,15 @@ impl App {
             }
             KeyCode::Char('r' | 'R') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.switch_reply_kind();
+                return Ok(());
+            }
+            KeyCode::Char('t' | 'T') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let plain = compose.toggle_plain_text();
+                compose.set_status(if plain {
+                    "Sending plain text only."
+                } else {
+                    "Sending HTML along with the plain text."
+                });
                 return Ok(());
             }
             KeyCode::Tab => {
@@ -5297,6 +5481,13 @@ impl App {
             content.bcc.join(", "),
             message.subject.clone(),
             body,
+        );
+        compose.plain_text_lists = self.plain_text_lists.clone();
+        compose.keep_draft_format(
+            content
+                .parts
+                .iter()
+                .any(|part| mime_type_matches(part, "text/html")),
         );
 
         // Without this the attachments are dropped on the floor and re-saving
@@ -6803,6 +6994,7 @@ mod tests {
             confirmation: None,
             passphrase: None,
             passphrase_queue: None,
+            plain_text_lists: PlainTextLists::default(),
         }
     }
 
@@ -7794,7 +7986,7 @@ mod tests {
 
     #[test]
     fn focus_sequence_skips_the_attachment_list_when_there_is_none() {
-        let mut compose = ComposeState::new();
+        let mut compose = ComposeState::default();
         assert_eq!(
             compose.focus_sequence(),
             vec![
@@ -7824,7 +8016,7 @@ mod tests {
 
     #[test]
     fn focus_sequence_includes_the_attachment_list_once_a_file_is_attached() {
-        let mut compose = ComposeState::new();
+        let mut compose = ComposeState::default();
         compose.add_attachment(outgoing_attachment("invoice.pdf"));
 
         assert_eq!(
@@ -8923,7 +9115,7 @@ mod tests {
     }
 
     fn compose_with_recipient(app: &mut App) {
-        let mut compose = ComposeState::new();
+        let mut compose = ComposeState::default();
         compose.set_field_text(ComposeField::To, "someone@example.com");
         compose.set_field_text(ComposeField::Subject, "Hello");
         app.compose = Some(compose);
@@ -9865,6 +10057,205 @@ mod tests {
         assert_eq!(app.compose_title(), "Reply");
         switch_reply_type(&mut app);
         assert_eq!(app.compose_title(), "Reply All");
+    }
+
+    #[test]
+    fn plain_text_lists_name_addresses_and_whole_domains() {
+        let lists = PlainTextLists::parse(&[
+            "Dev@Lists.Example.org",
+            "@vger.kernel.org",
+            "*@lists.debian.org",
+        ])
+        .expect("the entries parse");
+        let matching = |recipient: &str| lists.first_match([recipient]);
+
+        assert_eq!(
+            matching("Dev list <dev@lists.example.org>").as_deref(),
+            Some("dev@lists.example.org")
+        );
+        assert_eq!(
+            matching("linux-kernel@VGER.kernel.org").as_deref(),
+            Some("linux-kernel@vger.kernel.org")
+        );
+        assert!(matching("debian-devel@lists.debian.org").is_some());
+        assert!(matching("ops@lists.example.org").is_none());
+        // A domain is matched whole, not as the end of a longer one.
+        assert!(matching("someone@notvger.kernel.org").is_none());
+
+        for entry in ["dev", "dev@", "@", "a@b@c"] {
+            assert!(
+                PlainTextLists::parse(&[entry]).is_err(),
+                "{entry:?} should be refused"
+            );
+        }
+    }
+
+    fn switch_format(app: &mut App) {
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+            .unwrap();
+    }
+
+    fn sends_html(app: &App) -> bool {
+        app.compose
+            .as_ref()
+            .expect("compose is open")
+            .to_outgoing()
+            .expect("the message serialises")
+            .html_body
+            .is_some()
+    }
+
+    #[test]
+    fn ctrl_t_sends_the_plain_text_alone() {
+        let (_, content) = list_message();
+        let mut app = replying(content, 'r');
+        assert!(sends_html(&app));
+        assert_eq!(app.compose_title(), "Reply");
+
+        switch_format(&mut app);
+        assert!(!sends_html(&app));
+        assert_eq!(app.compose_title(), "Reply (Plain Text)");
+        assert_eq!(app.compose_status_line(), Some("Sending plain text only."));
+        assert!(app.compose_keys().contains(&("^T", "HTML")));
+
+        switch_format(&mut app);
+        assert!(sends_html(&app));
+        assert_eq!(app.compose_title(), "Reply");
+        assert!(app.compose_keys().contains(&("^T", "Plain")));
+    }
+
+    #[test]
+    fn plain_text_alone_is_wrapped_at_72_columns() {
+        let longest_line = |app: &App| {
+            app.compose
+                .as_ref()
+                .unwrap()
+                .to_outgoing()
+                .unwrap()
+                .text_body
+                .lines()
+                .map(|line| line.chars().count())
+                .max()
+                .unwrap_or(0)
+        };
+        let mut paragraph = Paragraph::new_text();
+        paragraph.content_mut().push(Span::new_text(
+            "The patch looks good to me, but the second hunk changes the \
+             locking order, and I would like to see a test that takes both \
+             locks at once before this goes in."
+                .repeat(3),
+        ));
+        let (_, content) = list_message();
+        let mut app = replying(content, 'r');
+        app.compose
+            .as_mut()
+            .unwrap()
+            .set_body(Document::new().with_paragraphs(vec![paragraph]));
+
+        let with_html = longest_line(&app);
+        assert!(with_html > 72 && with_html <= 80, "{with_html}");
+
+        switch_format(&mut app);
+        let alone = longest_line(&app);
+        assert!(alone > 60 && alone <= 72, "{alone}");
+        let compose = app.compose.as_ref().unwrap();
+        assert_eq!(
+            compose.body_plain(),
+            Some(compose.to_outgoing().unwrap().text_body.as_str())
+        );
+    }
+
+    #[test]
+    fn mail_to_a_configured_list_is_plain_text_unless_switched_back() {
+        let (message, mut content) = list_message();
+        content.list_post = Some("dev@lists.example.org".to_string());
+        let mut app = test_app(vec![message]);
+        app.set_plain_text_lists(PlainTextLists::parse(&["dev@lists.example.org"]).unwrap());
+        app.show_loaded_message(1, content);
+        app.mailbox.selected = Some(0);
+        app.handle_key(KeyEvent::from(KeyCode::Char('r'))).unwrap();
+
+        // To the author alone, the list's preference does not come into it.
+        assert!(sends_html(&app));
+        assert_eq!(app.compose_format_note(), None);
+
+        // Reply-all copies the list, and with it goes the HTML.
+        switch_reply_type(&mut app);
+        assert!(!sends_html(&app));
+        assert_eq!(app.compose_title(), "Reply All (Plain Text)");
+        assert_eq!(
+            app.compose_format_note().as_deref(),
+            Some("Plain text only, for dev@lists.example.org. ^T adds HTML.")
+        );
+
+        // The user's say holds, wherever the reply goes next.
+        switch_format(&mut app);
+        assert!(sends_html(&app));
+        assert_eq!(app.compose_format_note(), None);
+        switch_reply_type(&mut app);
+        assert_eq!(app.compose_title(), "Reply to List");
+        assert!(sends_html(&app));
+    }
+
+    #[test]
+    fn a_new_message_turns_plain_text_once_a_list_is_typed_in() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        app.set_plain_text_lists(PlainTextLists::parse(&["@lists.example.org"]).unwrap());
+        app.handle_key(KeyEvent::from(KeyCode::Char('c'))).unwrap();
+        assert!(sends_html(&app));
+
+        let compose = app.compose.as_mut().unwrap();
+        compose.set_field_text(ComposeField::Bcc, "dev@lists.example.org");
+        assert!(!sends_html(&app));
+    }
+
+    #[test]
+    fn a_reopened_draft_keeps_the_format_it_was_saved_in() {
+        let lists = PlainTextLists::parse(&["dev@lists.example.org"]).unwrap();
+        let draft = |to: &str, had_html: bool| {
+            let mut compose = ComposeState {
+                plain_text_lists: lists.clone(),
+                ..ComposeState::default()
+            };
+            compose.set_field_text(ComposeField::To, to);
+            compose.keep_draft_format(had_html);
+            compose
+        };
+
+        assert!(!draft("ada@example.com", true).is_plain_text());
+        assert!(draft("ada@example.com", false).is_plain_text());
+        assert!(draft("dev@lists.example.org", false).is_plain_text());
+        // Switched to HTML for the list before it was saved.
+        assert!(!draft("dev@lists.example.org", true).is_plain_text());
+
+        // A draft that followed the list still does: dropping the list brings
+        // the HTML back.
+        let mut followed = draft("dev@lists.example.org", false);
+        followed.set_field_text(ComposeField::To, "ada@example.com");
+        assert!(!followed.is_plain_text());
+    }
+
+    /// A draft saved as plain text alone comes back from its text: the quote
+    /// in a reply has to still be a quote, and not grow a level, each time.
+    #[test]
+    fn a_plain_text_reply_reads_back_as_the_same_text() {
+        let (message, _) = list_message();
+        let mut quoted = Paragraph::new_text();
+        quoted
+            .content_mut()
+            .push(Span::new_text("Shall we meet on Thursday?"));
+        let original = Document::new().with_paragraphs(vec![quoted]);
+        let reply = build_reply_document(&original, &message.sender, message.sent);
+        let text = document_to_plain_text(&reply, PLAIN_TEXT_ONLY_WIDTH).unwrap();
+        assert!(text.contains("> Shall we meet on Thursday?"), "{text}");
+
+        // Markdown has no blank paragraph, so the empty line left to write in
+        // above the quote is all that does not come back.
+        let reread = markdown::parse(Cursor::new(text.as_str())).unwrap();
+        assert_eq!(
+            document_to_plain_text(&reread, PLAIN_TEXT_ONLY_WIDTH).unwrap(),
+            text.trim_start_matches('\n')
+        );
     }
 
     #[test]

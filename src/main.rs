@@ -9,7 +9,7 @@ mod test_harness;
 mod ui;
 mod viewer;
 
-use crate::app::{AccountDescriptor, App};
+use crate::app::{AccountDescriptor, App, PlainTextLists};
 use crate::backend::{
     MailBackend,
     gmail::GmailBackend,
@@ -77,6 +77,14 @@ fn main() -> Result<()> {
         sign_in_where_missing(config);
     }
 
+    let plain_text_lists = PlainTextLists::parse(
+        config
+            .as_ref()
+            .and_then(|config| config.plain_text_lists.as_deref())
+            .unwrap_or_default(),
+    )
+    .with_context(|| format!("invalid plain_text_lists in {}", config_path_display()))?;
+
     // Workers that find a key locked ask through `asker`; the UI answers
     // from `prompts`.
     let prompts =
@@ -92,6 +100,7 @@ fn main() -> Result<()> {
     if let Some(prompts) = prompts {
         app.listen_for_passphrases(prompts);
     }
+    app.set_plain_text_lists(plain_text_lists);
     run(&mut app, theme).context("failed while running application loop")
 }
 
@@ -667,6 +676,9 @@ struct Config {
     theme: Option<String>,
     /// OpenPGP: see [`PgpConfig`].
     pgp: Option<PgpConfig>,
+    /// Mailing lists -- addresses, or `@domain` for every list at a host --
+    /// that mail goes to as plain text alone, without the HTML alternative.
+    plain_text_lists: Option<Vec<String>>,
     #[serde(alias = "accounts")]
     accounts: Option<Vec<AccountConfig>>,
 }

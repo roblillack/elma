@@ -199,8 +199,15 @@
 <text x="540" y="555" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
 <rect x="550" y="540" width="80" height="20" fill="#d3d3d3"/>
 <text x="550" y="555" fill="#2e3436" textLength="80" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Activate</text>
-<rect x="630" y="540" width="270" height="20" fill="#d3d3d3"/>
-<text x="630" y="555" fill="#696969" textLength="270" lengthAdjust="spacingAndGlyphs" xml:space="preserve">──────────────────────────┘</text>
+<rect x="630" y="540" width="20" height="20" fill="#d3d3d3"/>
+<rect x="650" y="540" width="20" height="20" fill="#d3d3d3"/>
+<text x="650" y="555" fill="#a40000" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">^T</text>
+<rect x="670" y="540" width="10" height="20" fill="#d3d3d3"/>
+<text x="670" y="555" fill="#696969" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
+<rect x="680" y="540" width="50" height="20" fill="#d3d3d3"/>
+<text x="680" y="555" fill="#2e3436" textLength="50" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Plain</text>
+<rect x="730" y="540" width="170" height="20" fill="#d3d3d3"/>
+<text x="730" y="555" fill="#696969" textLength="170" lengthAdjust="spacingAndGlyphs" xml:space="preserve">────────────────┘</text>
 <rect x="0" y="620" width="1000" height="20" fill="#d3d3d3"/>
 <text x="0" y="635" fill="#696969" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Personal • Inbox — message 11/11, 0 scheduled actions, got 0 events — Compose mode active.          </text>
 </svg>
