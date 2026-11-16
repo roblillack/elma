@@ -516,6 +516,7 @@ pub struct App {
     should_quit: bool,
     pending_shortcut: Option<ShortcutMenuState>,
     pending_navigation: Option<PendingNavigation>,
+    folder_picker: Option<FolderPicker>,
     save_attachment: Option<SaveAttachmentDialog>,
     /// Send or draft-save running on a worker thread.
     outgoing: Option<OutgoingOperation>,
@@ -2032,6 +2033,8 @@ struct ShortcutItem {
 enum ShortcutAction {
     SwitchMailbox(MailboxKind),
     SwitchAccount(usize),
+    /// Open the [`FolderPicker`], for a mailbox that has no key of its own.
+    PickFolder,
 }
 
 pub(crate) struct ShortcutEntry<'a> {
@@ -2050,6 +2053,11 @@ impl ShortcutMenuState {
             ShortcutItem::mailbox('a', "Archive", MailboxKind::Archive),
             ShortcutItem::mailbox('S', "Spam", MailboxKind::Spam),
             ShortcutItem::mailbox('T', "Trash", MailboxKind::Trash),
+            ShortcutItem {
+                key: 'f',
+                description: "Folder...".to_string(),
+                action: ShortcutAction::PickFolder,
+            },
         ];
 
         Self {
@@ -2124,6 +2132,167 @@ impl ShortcutItem {
         }
     }
 }
+
+/// Every folder of the account in one list, narrowed down as the user types
+/// until the one they want is highlighted.
+///
+/// Opened from the `g` menu, for the folders and labels that have no key
+/// of their own there.  The list comes from the backend on a worker thread,
+/// so the dialog is up -- and taking keys -- before the answer is in.
+pub(crate) struct FolderPicker {
+    query: TextFieldState,
+    /// The account's folders in the order they are listed, once known.
+    folders: Option<Vec<MailboxKind>>,
+    loader: Option<Receiver<Result<Vec<MailboxKind>, String>>>,
+    error: Option<String>,
+    /// Indices into `folders` of the ones `query` matches.
+    matches: Vec<usize>,
+    /// Position in `matches` of the highlighted folder.
+    selected: usize,
+    /// The folder already open, marked as such in the list.
+    current: MailboxKind,
+    started: Instant,
+}
+
+/// How the [`FolderPicker`]'s list is getting on, for the renderer.
+pub(crate) enum FolderListState<'a> {
+    Loading(std::time::Duration),
+    Failed(&'a str),
+    Ready,
+}
+
+impl FolderPicker {
+    fn new(current: MailboxKind, loader: Receiver<Result<Vec<MailboxKind>, String>>) -> Self {
+        Self {
+            query: TextFieldState::default(),
+            folders: None,
+            loader: Some(loader),
+            error: None,
+            matches: Vec::new(),
+            selected: 0,
+            current,
+            started: Instant::now(),
+        }
+    }
+
+    /// Take the list once the backend has sent it.
+    fn poll(&mut self) {
+        let Some(receiver) = self.loader.as_ref() else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("the folder list never arrived".to_string()),
+        };
+        self.loader = None;
+        match result {
+            Ok(folders) => {
+                self.folders = Some(sorted_folders(folders));
+                self.refilter();
+            }
+            Err(err) => self.error = Some(err),
+        }
+    }
+
+    /// Match the list against the query again, keeping the highlight on the
+    /// folder it was on if that one still matches.
+    fn refilter(&mut self) {
+        let Some(folders) = self.folders.as_ref() else {
+            return;
+        };
+        let highlighted = self.matches.get(self.selected).copied();
+        let terms: Vec<String> = self
+            .query
+            .value
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
+        self.matches = folders
+            .iter()
+            .enumerate()
+            .filter(|(_, folder)| {
+                let title = folder.title().to_lowercase();
+                terms.iter().all(|term| title.contains(term.as_str()))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        self.selected = highlighted
+            .and_then(|index| self.matches.iter().position(|found| *found == index))
+            .unwrap_or(0);
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let last = self.matches.len() - 1;
+        self.selected = self.selected.saturating_add_signed(delta).min(last);
+    }
+
+    /// The highlighted folder, if anything matches.
+    fn chosen(&self) -> Option<MailboxKind> {
+        let folders = self.folders.as_ref()?;
+        let index = *self.matches.get(self.selected)?;
+        folders.get(index).copied()
+    }
+
+    /// The query and the cursor in it, shaped like
+    /// [`SaveAttachmentDialog::folder_data`] for the same field renderer.
+    pub(crate) fn query(&self) -> (&str, usize) {
+        (&self.query.value, self.query.cursor)
+    }
+
+    pub(crate) fn state(&self) -> FolderListState<'_> {
+        if let Some(error) = self.error.as_deref() {
+            FolderListState::Failed(error)
+        } else if self.folders.is_none() {
+            FolderListState::Loading(clock::elapsed(self.started))
+        } else {
+            FolderListState::Ready
+        }
+    }
+
+    /// How many folders the account has, matching or not: the dialog is
+    /// sized by this, so it holds still while the list narrows.
+    pub(crate) fn folder_count(&self) -> usize {
+        self.folders.as_ref().map_or(0, Vec::len)
+    }
+
+    /// The matching folders' names, each with whether it is the one open.
+    pub(crate) fn matches(&self) -> impl Iterator<Item = (&str, bool)> + '_ {
+        let folders = self.folders.as_deref().unwrap_or_default();
+        self.matches.iter().filter_map(move |index| {
+            let folder = folders.get(*index)?;
+            Some((folder.title(), *folder == self.current))
+        })
+    }
+
+    pub(crate) fn selected(&self) -> usize {
+        self.selected
+    }
+}
+
+/// `folders` in the order the picker lists them: the mailboxes the `g` menu
+/// has keys for first, as it lists them, then the account's own folders by
+/// name.
+fn sorted_folders(mut folders: Vec<MailboxKind>) -> Vec<MailboxKind> {
+    let rank = |kind: &MailboxKind| {
+        MailboxKind::ALL
+            .iter()
+            .position(|known| known == kind)
+            .unwrap_or(MailboxKind::ALL.len())
+    };
+    folders.sort_by(|a, b| {
+        rank(a)
+            .cmp(&rank(b))
+            .then_with(|| a.title().to_lowercase().cmp(&b.title().to_lowercase()))
+            .then_with(|| a.title().cmp(b.title()))
+    });
+    folders.dedup();
+    folders
+}
+
 impl App {
     /// Build the application state around the configured accounts.
     /// Build the application state and start loading every account.
@@ -2180,6 +2349,7 @@ impl App {
             should_quit: false,
             pending_shortcut: None,
             pending_navigation: None,
+            folder_picker: None,
             save_attachment: None,
             outgoing: None,
             needs_full_redraw: false,
@@ -2288,6 +2458,10 @@ impl App {
             return Ok(());
         }
 
+        if self.folder_picker.is_some() {
+            return self.handle_folder_picker_key(key);
+        }
+
         if self.save_attachment.is_some() {
             return self.handle_save_attachment_key(key);
         }
@@ -2391,6 +2565,7 @@ impl App {
                     Some(ShortcutAction::SwitchAccount(index)) => {
                         self.begin_navigation(NavigationTarget::Account(index))?;
                     }
+                    Some(ShortcutAction::PickFolder) => self.open_folder_picker(),
                     None => {
                         self.current_account_mut().mailbox.status_line =
                             Some(format!("Unknown go to target: {ch}"));
@@ -2409,6 +2584,83 @@ impl App {
         self.pending_shortcut = Some(ShortcutMenuState::mailbox_menu());
         self.current_account_mut().mailbox.status_line =
             Some("Go to: press the highlighted key.".to_string());
+    }
+
+    /// Put up the [`FolderPicker`] and ask the backend for the folders to go
+    /// in it.
+    fn open_folder_picker(&mut self) {
+        let backend = Arc::clone(&self.backend);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(backend.list_folders().map_err(|err| format!("{err:#}")));
+        });
+        self.folder_picker = Some(FolderPicker::new(self.current_mailbox, receiver));
+        self.mailbox.status_line = Some("Go to folder: type part of its name.".to_string());
+    }
+
+    fn handle_folder_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(picker) = self.folder_picker.as_mut() else {
+            return Ok(());
+        };
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        match key.code {
+            KeyCode::Char('q') if control => self.request_quit(),
+            KeyCode::Esc => {
+                self.folder_picker = None;
+                self.mailbox.status_line = Some("Folder selection cancelled.".to_string());
+            }
+            KeyCode::Enter => match picker.chosen() {
+                Some(target) => {
+                    self.folder_picker = None;
+                    self.begin_navigation(NavigationTarget::Mailbox(target))?;
+                }
+                None if picker.folders.is_some() => {
+                    self.mailbox.status_line = Some("No folder matches.".to_string());
+                }
+                None => {}
+            },
+            KeyCode::Up => picker.move_selection(-1),
+            KeyCode::Down => picker.move_selection(1),
+            KeyCode::Char('p') if control => picker.move_selection(-1),
+            KeyCode::Char('n') if control => picker.move_selection(1),
+            KeyCode::PageUp => picker.move_selection(-PAGE_JUMP),
+            KeyCode::PageDown => picker.move_selection(PAGE_JUMP),
+            KeyCode::Left => {
+                picker.query.move_left();
+            }
+            KeyCode::Right => {
+                picker.query.move_right();
+            }
+            KeyCode::Home => {
+                picker.query.move_home();
+            }
+            KeyCode::End => {
+                picker.query.move_end();
+            }
+            KeyCode::Backspace => {
+                picker.query.backspace();
+                picker.refilter();
+            }
+            KeyCode::Delete => {
+                picker.query.delete();
+                picker.refilter();
+            }
+            KeyCode::Char('u') if control => {
+                picker.query = TextFieldState::default();
+                picker.refilter();
+            }
+            KeyCode::Char(ch) if !control => {
+                picker.query.insert(ch);
+                picker.refilter();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn folder_picker(&self) -> Option<&FolderPicker> {
+        self.folder_picker.as_ref()
     }
 
     fn open_account_menu(&mut self) {
@@ -2765,6 +3017,9 @@ impl App {
             });
         }
         self.check_read_timer();
+        if let Some(picker) = self.folder_picker.as_mut() {
+            picker.poll();
+        }
         self.poll_mailbox_loader();
         self.poll_message_loader();
         // Every account's batches, not just the visible one's: a commit made
@@ -5028,6 +5283,13 @@ impl App {
             return self.attach_paths(paths);
         }
 
+        if let Some(picker) = self.folder_picker.as_mut() {
+            if picker.query.insert_str(text) {
+                picker.refilter();
+            }
+            return Ok(());
+        }
+
         if let Some(dialog) = self.save_attachment.as_mut() {
             if !dialog.is_busy()
                 && matches!(dialog.focus, SaveAttachmentFocus::Folder)
@@ -6743,6 +7005,10 @@ impl App {
                 || !account.commit_batches.is_empty()
         }) || self.outgoing.is_some()
             || self
+                .folder_picker
+                .as_ref()
+                .is_some_and(|picker| picker.loader.is_some())
+            || self
                 .save_attachment
                 .as_ref()
                 .is_some_and(|dialog| dialog.is_busy())
@@ -6988,6 +7254,7 @@ mod tests {
 
             pending_shortcut: None,
             pending_navigation: None,
+            folder_picker: None,
             save_attachment: None,
             outgoing: None,
             needs_full_redraw: false,
@@ -10331,5 +10598,170 @@ mod tests {
         app.show_loaded_message(1, MessageContent::default());
 
         assert_eq!(app.mailbox.selected, Some(0));
+    }
+
+    // -- Picking a folder by name --------------------------------------------
+
+    fn folder(name: &str) -> MailboxKind {
+        MailboxKind::Folder(crate::model::Folder::intern(name, name))
+    }
+
+    /// A picker that already has `folders`, as the backend would hand them over.
+    fn picker_with(folders: Vec<MailboxKind>) -> FolderPicker {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Ok(folders)).unwrap();
+        let mut picker = FolderPicker::new(MailboxKind::Inbox, receiver);
+        picker.poll();
+        picker
+    }
+
+    fn listed(picker: &FolderPicker) -> Vec<&str> {
+        picker.matches().map(|(name, _)| name).collect()
+    }
+
+    fn type_into(picker: &mut FolderPicker, text: &str) {
+        for ch in text.chars() {
+            picker.query.insert(ch);
+        }
+        picker.refilter();
+    }
+
+    #[test]
+    fn the_picker_lists_the_known_mailboxes_first_then_the_rest_by_name() {
+        let picker = picker_with(vec![
+            folder("receipts"),
+            MailboxKind::Trash,
+            folder("Projects"),
+            MailboxKind::Inbox,
+            MailboxKind::Trash,
+        ]);
+
+        assert_eq!(listed(&picker), ["Inbox", "Trash", "Projects", "receipts"]);
+    }
+
+    #[test]
+    fn typing_narrows_the_list_to_names_holding_every_word() {
+        let mut picker = picker_with(vec![
+            folder("Projects/Elma"),
+            folder("Projects/Website"),
+            folder("Receipts"),
+            MailboxKind::Sent,
+        ]);
+
+        type_into(&mut picker, "PROJ web");
+
+        assert_eq!(listed(&picker), ["Projects/Website"]);
+        assert_eq!(picker.chosen(), Some(folder("Projects/Website")));
+    }
+
+    #[test]
+    fn the_highlight_stays_on_its_folder_while_the_list_narrows() {
+        let mut picker = picker_with(vec![
+            folder("Projects/Elma"),
+            folder("Projects/Website"),
+            folder("Receipts"),
+        ]);
+        picker.move_selection(1);
+        assert_eq!(picker.chosen(), Some(folder("Projects/Website")));
+
+        type_into(&mut picker, "s");
+
+        assert_eq!(picker.chosen(), Some(folder("Projects/Website")));
+    }
+
+    #[test]
+    fn the_highlight_stops_at_either_end_of_the_list() {
+        let mut picker = picker_with(vec![MailboxKind::Inbox, MailboxKind::Sent]);
+
+        picker.move_selection(-1);
+        assert_eq!(picker.chosen(), Some(MailboxKind::Inbox));
+        picker.move_selection(PAGE_JUMP);
+        assert_eq!(picker.chosen(), Some(MailboxKind::Sent));
+    }
+
+    #[test]
+    fn a_folder_list_that_fails_says_why() {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Err("server said no".to_string())).unwrap();
+        let mut picker = FolderPicker::new(MailboxKind::Inbox, receiver);
+        picker.poll();
+
+        assert!(matches!(
+            picker.state(),
+            FolderListState::Failed("server said no")
+        ));
+        assert_eq!(picker.chosen(), None);
+    }
+
+    #[test]
+    fn esc_closes_the_picker_without_going_anywhere() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('f'));
+        assert!(app.folder_picker().is_some());
+
+        press(&mut app, KeyCode::Esc);
+
+        assert!(app.folder_picker().is_none());
+        assert_eq!(app.current_mailbox, MailboxKind::Inbox);
+    }
+
+    #[test]
+    fn enter_opens_the_highlighted_folder() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('f'));
+        pump_until(&mut app, "the folder list", |app| {
+            app.folder_picker()
+                .is_some_and(|picker| picker.folders.is_some())
+        });
+        for ch in "tra".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+
+        press(&mut app, KeyCode::Enter);
+
+        assert!(app.folder_picker().is_none());
+        assert_eq!(app.current_mailbox, MailboxKind::Trash);
+    }
+
+    #[test]
+    fn enter_on_a_query_matching_nothing_keeps_the_picker_open() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('f'));
+        pump_until(&mut app, "the folder list", |app| {
+            app.folder_picker()
+                .is_some_and(|picker| picker.folders.is_some())
+        });
+        for ch in "nothing like it".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+
+        press(&mut app, KeyCode::Enter);
+
+        assert!(app.folder_picker().is_some());
+        assert_eq!(app.current_mailbox, MailboxKind::Inbox);
+        assert_eq!(
+            app.mailbox.status_line.as_deref(),
+            Some("No folder matches.")
+        );
+    }
+
+    #[test]
+    fn keys_typed_into_the_picker_do_not_act_on_the_list() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('f'));
+
+        // `d` deletes and `y` archives in the list; here they are letters.
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('y'));
+
+        assert!(app.scheduled_actions.is_empty());
+        assert_eq!(
+            app.folder_picker().map(|picker| picker.query().0),
+            Some("dy")
+        );
     }
 }

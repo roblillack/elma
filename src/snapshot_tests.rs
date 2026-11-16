@@ -553,6 +553,54 @@ fn account_switched() {
     assert_svg("account_switched", &mut app);
 }
 
+/// `g f` lists every folder of the account: the standard ones first, then
+/// the account's own by name, with the open one marked.
+#[test]
+fn folder_picker() {
+    let mut app = inbox();
+    app.char('g');
+    app.char('f');
+    assert_on_screen(&app, "Go to folder");
+    assert_on_screen(&app, "Inbox (current)");
+    assert_svg("folder_picker", &mut app);
+}
+
+/// Typing narrows the list as it goes, whichever part of the name matches.
+#[test]
+fn folder_picker_filtered() {
+    let mut app = inbox();
+    app.char('g');
+    app.char('f');
+    app.type_text("proj");
+    app.key(KeyCode::Down);
+    assert_on_screen(&app, "Projects/Elma");
+    assert!(
+        !app.buffer_lines()
+            .iter()
+            .any(|line| line.contains("Receipts")),
+        "a folder the query does not match is filtered out"
+    );
+    assert_svg("folder_picker_filtered", &mut app);
+}
+
+/// Enter opens the highlighted folder like any other mailbox.
+#[test]
+fn folder_opened_from_picker() {
+    let mut app = inbox();
+    app.char('g');
+    app.char('f');
+    app.type_text("rec");
+    app.key(KeyCode::Enter);
+    assert_on_screen(&app, "Your receipt for March");
+    assert!(
+        !app.buffer_lines()
+            .iter()
+            .any(|line| line.contains("Go to folder")),
+        "the picker closes once a folder is chosen"
+    );
+    assert_svg("folder_opened_from_picker", &mut app);
+}
+
 // -- Without colour --------------------------------------------------------
 
 /// The list as `--color=never` would have it: the bars in reverse video, the

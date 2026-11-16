@@ -15,7 +15,7 @@ use crate::{
         retry_backoff,
     },
     model::{
-        Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
+        Action, ActionType, Folder, MailboxKind, Message, MessageAttachment, MessageContent,
         MessageContentPart, MessageId, MessageStatus,
     },
 };
@@ -613,6 +613,17 @@ impl MailBackend for JmapBackend {
             }
         }
         addresses
+    }
+
+    /// The mailboxes the account had when it connected.
+    ///
+    /// The same list every mailbox is opened by, so whatever is picked from it
+    /// is sure to open.
+    fn list_folders(&self) -> Result<Vec<MailboxKind>> {
+        let inner = self.inner()?;
+        Ok(inner
+            .runtime
+            .block_on(async { inner.mailboxes.lock().await.folders() }))
     }
 
     fn load_mailbox(
@@ -1920,12 +1931,13 @@ impl JmapInner {
         get.properties([
             MailboxProperty::Id,
             MailboxProperty::Name,
+            MailboxProperty::ParentId,
             MailboxProperty::Role,
             MailboxProperty::TotalEmails,
         ]);
         let trace = debug_logging::request(
             "Mailbox/get",
-            format_args!("properties=[id,name,role,totalEmails]"),
+            format_args!("properties=[id,name,parentId,role,totalEmails]"),
         );
         let mut response = trace
             .response(request.send_get_mailbox().await, |response| {
@@ -2107,6 +2119,7 @@ impl MailboxCache {
     fn from_mailboxes(list: Vec<JmapMailbox>) -> Self {
         let mut by_id = HashMap::new();
         let mut by_kind = HashMap::new();
+        let mut parents = HashMap::new();
 
         for mailbox in list {
             if let Some(id) = mailbox.id() {
@@ -2114,9 +2127,13 @@ impl MailboxCache {
                 let role = mailbox.role();
                 let name = mailbox.name().unwrap_or(id.as_str()).to_string();
                 let total = mailbox.total_emails();
+                if let Some(parent) = mailbox.parent_id() {
+                    parents.insert(id.clone(), parent.to_string());
+                }
                 by_id.insert(
                     id.clone(),
                     MailboxInfo {
+                        path: name.clone(),
                         name,
                         total_emails: total,
                     },
@@ -2124,6 +2141,16 @@ impl MailboxCache {
                 if let Some(kind) = kind_from_role(&role) {
                     by_kind.insert(kind, id);
                 }
+            }
+        }
+
+        let paths: Vec<(String, String)> = by_id
+            .keys()
+            .map(|id| (id.clone(), mailbox_path(id, &by_id, &parents)))
+            .collect();
+        for (id, path) in paths {
+            if let Some(info) = by_id.get_mut(&id) {
+                info.path = path;
             }
         }
 
@@ -2135,7 +2162,32 @@ impl MailboxCache {
     }
 
     fn id_for_kind(&self, kind: MailboxKind) -> Option<&String> {
-        self.by_kind.get(&kind)
+        match kind {
+            MailboxKind::Folder(folder) => {
+                self.by_id.contains_key(&folder.id).then_some(&folder.id)
+            }
+            known => self.by_kind.get(&known),
+        }
+    }
+
+    /// Every mailbox the account has, each as the kind that opens it.
+    ///
+    /// Starred and Important come along whether or not the server has a
+    /// mailbox for them: [`Self::filter_for`] finds their mail by keyword.
+    fn folders(&self) -> Vec<MailboxKind> {
+        let mut folders = vec![MailboxKind::Starred, MailboxKind::Important];
+        for (id, info) in &self.by_id {
+            let kind = self
+                .by_kind
+                .iter()
+                .find(|(_, known)| *known == id)
+                .map(|(kind, _)| *kind)
+                .unwrap_or_else(|| MailboxKind::Folder(Folder::intern(id, &info.path)));
+            if !folders.contains(&kind) {
+                folders.push(kind);
+            }
+        }
+        folders
     }
 
     /// The ids of those of `kinds` the account has a mailbox for.
@@ -2151,8 +2203,8 @@ impl MailboxCache {
     }
 
     fn set_total(&mut self, kind: MailboxKind, total: usize) {
-        if let Some(id) = self.by_kind.get(&kind)
-            && let Some(info) = self.by_id.get_mut(id)
+        if let Some(id) = self.id_for_kind(kind).cloned()
+            && let Some(info) = self.by_id.get_mut(&id)
         {
             info.total_emails = total;
             return;
@@ -2183,7 +2235,35 @@ impl MailboxCache {
 #[derive(Clone)]
 struct MailboxInfo {
     name: String,
+    /// The name with those of the mailboxes it sits in in front of it,
+    /// `Projects/Elma`, to tell apart two that share a name.
+    path: String,
     total_emails: usize,
+}
+
+/// The names from the top of the tree down to the mailbox `id`, joined by `/`.
+///
+/// A parent the account did not list ends the path where it is, and so does a
+/// loop in the tree, which a misbehaving server could otherwise send this
+/// round for good.
+fn mailbox_path(
+    id: &str,
+    by_id: &HashMap<String, MailboxInfo>,
+    parents: &HashMap<String, String>,
+) -> String {
+    let mut names = Vec::new();
+    let mut current = Some(id);
+    while let Some(id) = current
+        && names.len() <= by_id.len()
+    {
+        let Some(info) = by_id.get(id) else {
+            break;
+        };
+        names.push(info.name.as_str());
+        current = parents.get(id).map(String::as_str);
+    }
+    names.reverse();
+    names.join("/")
 }
 
 #[derive(Default)]
@@ -3574,6 +3654,7 @@ mod tests {
                 (*id).to_string(),
                 MailboxInfo {
                     name: (*name).to_string(),
+                    path: (*name).to_string(),
                     total_emails: 0,
                 },
             );
@@ -3925,6 +4006,66 @@ mod tests {
 
     fn ids(list: &[&str]) -> Vec<String> {
         list.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    #[test]
+    fn a_nested_mailbox_is_named_by_its_path() {
+        let mut cache = cache(&[("mb-projects", "Projects", None), ("mb-elma", "Elma", None)]);
+        let parents = HashMap::from([("mb-elma".to_string(), "mb-projects".to_string())]);
+
+        assert_eq!(
+            mailbox_path("mb-elma", &cache.by_id, &parents),
+            "Projects/Elma"
+        );
+
+        // A server that files two mailboxes under each other does not get the
+        // client stuck walking round them.
+        let looped = HashMap::from([
+            ("mb-elma".to_string(), "mb-projects".to_string()),
+            ("mb-projects".to_string(), "mb-elma".to_string()),
+        ]);
+        assert!(mailbox_path("mb-elma", &cache.by_id, &looped).len() < 100);
+
+        cache.by_id.get_mut("mb-elma").unwrap().path = "Projects/Elma".to_string();
+        assert!(
+            cache
+                .folders()
+                .contains(&MailboxKind::Folder(Folder::intern(
+                    "mb-elma",
+                    "Projects/Elma"
+                )))
+        );
+    }
+
+    #[test]
+    fn the_folder_list_opens_role_mailboxes_by_their_role() {
+        let cache = cache(&[
+            ("mb-inbox", "Inbox", Some(MailboxKind::Inbox)),
+            ("mb-trash", "Papierkorb", Some(MailboxKind::Trash)),
+            ("mb-receipts", "Receipts", None),
+        ]);
+        let folders = cache.folders();
+        let receipts = MailboxKind::Folder(Folder::intern("mb-receipts", "Receipts"));
+
+        for expected in [
+            MailboxKind::Inbox,
+            MailboxKind::Trash,
+            MailboxKind::Starred,
+            MailboxKind::Important,
+            receipts,
+        ] {
+            assert!(folders.contains(&expected), "{expected:?} missing");
+        }
+        assert_eq!(folders.len(), 5);
+        assert_eq!(
+            cache.id_for_kind(receipts).map(String::as_str),
+            Some("mb-receipts")
+        );
+        assert_eq!(
+            labels_in(receipts, &email(&["mb-receipts", "mb-inbox"], &[]), &cache),
+            ["Inbox"],
+            "the folder that is open earns no label of its own"
+        );
     }
 
     /// Where a message filed under `current` ends up when it is moved out of

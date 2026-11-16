@@ -383,6 +383,18 @@ pub trait MailBackend: Send + Sync {
     fn own_addresses(&self) -> Vec<String> {
         Vec::new()
     }
+    /// Every mailbox the account can open, for the user to pick one from.
+    ///
+    /// A folder that plays one of the roles Elma knows -- the Trash, the Sent
+    /// folder -- comes back as that [`MailboxKind`], so opening it from the
+    /// list behaves exactly as opening it by its own shortcut does; anything
+    /// else comes back as a [`MailboxKind::Folder`].  The order is of no
+    /// consequence, the caller sorts.
+    ///
+    /// Called from a worker thread, so it may go to the server.
+    fn list_folders(&self) -> Result<Vec<MailboxKind>> {
+        Ok(MailboxKind::ALL.to_vec())
+    }
     fn fetch_attachment_blob(&self, _blob_id: &str) -> Result<Vec<u8>> {
         Err(anyhow::anyhow!(
             "this backend does not support on-demand attachment download"

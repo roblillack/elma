@@ -299,6 +299,8 @@ Message status is indicated by a four symbol character prefix in the message lis
   - `t` Sent
   - `S` Spam (Should be `j` or even `!`?)
   - `T` Trash (Should be `g` `r` or even `g` `#`?)
+  - `f` any other folder or label: type part of its name to narrow the list,
+    `Up`/`Down` to pick, `Enter` to open, `Esc` to cancel
 
 When viewing a special mailbox (Archive, Spam, Trash), the primary action key for that mailbox is flipped: `d` in Trash, `y` in Archive, and `!` in Spam each schedule a move back to inbox instead. Pressing `u` then unstages that move, keeping the message where it is.
 

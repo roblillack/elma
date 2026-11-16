@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="640" viewBox="0 0 1000 640" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="16px">
+<rect width="100%" height="100%" fill="#eeeeec"/>
+<rect x="0" y="0" width="1000" height="20" fill="#d3d3d3"/>
+<text x="0" y="15" fill="#696969" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">^Q:Quit g:GoToMailbox G:Accounts c:Compose Enter:Open s:Unstar -:NotImportant r:Reply y:Archive d:De</text>
+<text x="0" y="35" fill="#2e3436" textLength="480" lengthAdjust="spacingAndGlyphs" xml:space="preserve">     [Dec 24, 2025] hr@example.com         12K  </text>
+<rect x="480" y="20" width="90" height="20" fill="#404040"/>
+<text x="480" y="35" fill="#eeeeec" textLength="90" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[Archive]</text>
+<rect x="580" y="20" width="60" height="20" fill="#e0e0e0"/>
+<text x="580" y="35" fill="#2e3436" textLength="60" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[Work]</text>
+<text x="640" y="35" fill="#2e3436" textLength="360" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Holiday schedule for next year     </text>
+<text x="0" y="55" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve" text-decoration="line-through" opacity="0.6">D    [Mar 07 13:37] tickets@support.exam  3.4K  Ticket #4711 has been closed                        </text>
+<text x="0" y="75" fill="#75507b" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.6">!    [Mar 08 22:18] deals@shop.example     61K  LAST CHANCE: 80% off everything!!!                  </text>
+<text x="0" y="95" fill="#008b8b" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-style="italic">A    [Mar 09 08:05] no-reply@calendar.ex  8.9K  Invitation: Sprint review @ Fri Mar 20              </text>
+<text x="0" y="115" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">     [Mar 10 16:45] newsletter@rustweekl  134K  This Week in Rust #612                              </text>
+<text x="0" y="135" fill="#2e3436" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> ○   [Mar 11 09:00] security@bank.exampl  5.6K  Unusual sign-in attempt blocked                     </text>
+<text x="0" y="155" fill="#2e3436" textLength="480" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  →@ [Mar 12 11:20] reservations@hotel.e   96K  </text>
+<rect x="480" y="140" width="80" height="20" fill="#e0e0e0"/>
+<text x="480" y="155" fill="#2e3436" textLength="80" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[Travel]</text>
+<text x="560" y="155" fill="#2e3436" textLength="440" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Your booking confirmation                  </text>
+<text x="0" y="175" fill="#2e3436" textLength="200" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> *   [Mar 13 15:30] </text>
+<rect x="200" y="160" width="10" height="20" fill="#2e3436"/>
+<text x="200" y="175" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌</text>
+<rect x="210" y="160" width="140" height="20" fill="#2e3436"/>
+<text x="210" y="175" fill="#729fcf" textLength="140" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> Go to folder </text>
+<rect x="350" y="160" width="450" height="20" fill="#2e3436"/>
+<text x="350" y="175" fill="#d3d3d3" textLength="450" lengthAdjust="spacingAndGlyphs" xml:space="preserve">────────────────────────────────────────────┐</text>
+<text x="0" y="195" fill="#2e3436" textLength="200" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  ↩  [Mar 13 19:04] </text>
+<rect x="200" y="180" width="10" height="20" fill="#2e3436"/>
+<text x="200" y="195" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="210" y="180" width="10" height="20" fill="#2e3436"/>
+<rect x="220" y="180" width="80" height="20" fill="#2e3436"/>
+<text x="220" y="195" fill="#06989a" textLength="80" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Folder: </text>
+<rect x="300" y="180" width="40" height="20" fill="#555753"/>
+<text x="300" y="195" fill="#eeeeec" textLength="40" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">proj</text>
+<rect x="340" y="180" width="450" height="20" fill="#2e3436"/>
+<rect x="790" y="180" width="10" height="20" fill="#2e3436"/>
+<text x="790" y="195" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="800" y="195" fill="#2e3436" textLength="200" lengthAdjust="spacingAndGlyphs" xml:space="preserve">ing next week       </text>
+<text x="0" y="215" fill="#cc0000" textLength="200" lengthAdjust="spacingAndGlyphs" xml:space="preserve">N    [Mar 14 07:52] </text>
+<rect x="200" y="200" width="10" height="20" fill="#2e3436"/>
+<text x="200" y="215" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="210" y="200" width="580" height="20" fill="#2e3436"/>
+<rect x="790" y="200" width="10" height="20" fill="#2e3436"/>
+<text x="790" y="215" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="0" y="220" width="200" height="20" fill="#cc0000"/>
+<text x="0" y="235" fill="#eeeeec" textLength="200" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">N⊛ @ [Mar 14 08:15] </text>
+<rect x="200" y="220" width="10" height="20" fill="#2e3436"/>
+<text x="200" y="235" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="210" y="220" width="580" height="20" fill="#2e3436"/>
+<text x="210" y="235" fill="#eeeeec" textLength="580" lengthAdjust="spacingAndGlyphs" xml:space="preserve">   Projects/Elma                                          </text>
+<rect x="790" y="220" width="10" height="20" fill="#2e3436"/>
+<text x="790" y="235" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="800" y="220" width="200" height="20" fill="#cc0000"/>
+<text x="800" y="235" fill="#eeeeec" textLength="200" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">342 for February    </text>
+<rect x="200" y="240" width="10" height="20" fill="#2e3436"/>
+<text x="200" y="255" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="210" y="240" width="10" height="20" fill="#2e3436"/>
+<rect x="220" y="240" width="560" height="20" fill="#06989a"/>
+<text x="220" y="255" fill="#2e3436" textLength="560" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">▶ Projects/Website                                      </text>
+<rect x="780" y="240" width="10" height="20" fill="#2e3436"/>
+<rect x="790" y="240" width="10" height="20" fill="#2e3436"/>
+<text x="790" y="255" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="200" y="260" width="10" height="20" fill="#2e3436"/>
+<text x="200" y="275" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="210" y="260" width="580" height="20" fill="#2e3436"/>
+<rect x="790" y="260" width="10" height="20" fill="#2e3436"/>
+<text x="790" y="275" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="200" y="280" width="10" height="20" fill="#2e3436"/>
+<text x="200" y="295" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="210" y="280" width="580" height="20" fill="#2e3436"/>
+<rect x="790" y="280" width="10" height="20" fill="#2e3436"/>
+<text x="790" y="295" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="200" y="300" width="10" height="20" fill="#2e3436"/>
+<text x="200" y="315" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="210" y="300" width="580" height="20" fill="#2e3436"/>
+<rect x="790" y="300" width="10" height="20" fill="#2e3436"/>
+<text x="790" y="315" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="200" y="320" width="10" height="20" fill="#2e3436"/>
+<text x="200" y="335" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="210" y="320" width="580" height="20" fill="#2e3436"/>
+<rect x="790" y="320" width="10" height="20" fill="#2e3436"/>
+<text x="790" y="335" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="200" y="340" width="10" height="20" fill="#2e3436"/>
+<text x="200" y="355" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="210" y="340" width="580" height="20" fill="#2e3436"/>
+<rect x="790" y="340" width="10" height="20" fill="#2e3436"/>
+<text x="790" y="355" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="200" y="360" width="10" height="20" fill="#2e3436"/>
+<text x="200" y="375" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="210" y="360" width="580" height="20" fill="#2e3436"/>
+<rect x="790" y="360" width="10" height="20" fill="#2e3436"/>
+<text x="790" y="375" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="200" y="380" width="10" height="20" fill="#2e3436"/>
+<text x="200" y="395" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="210" y="380" width="580" height="20" fill="#2e3436"/>
+<rect x="790" y="380" width="10" height="20" fill="#2e3436"/>
+<text x="790" y="395" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="200" y="400" width="10" height="20" fill="#2e3436"/>
+<text x="200" y="415" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="210" y="400" width="580" height="20" fill="#2e3436"/>
+<rect x="790" y="400" width="10" height="20" fill="#2e3436"/>
+<text x="790" y="415" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="200" y="420" width="10" height="20" fill="#2e3436"/>
+<text x="200" y="435" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="210" y="420" width="580" height="20" fill="#2e3436"/>
+<rect x="790" y="420" width="10" height="20" fill="#2e3436"/>
+<text x="790" y="435" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="200" y="440" width="10" height="20" fill="#2e3436"/>
+<text x="200" y="455" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└</text>
+<rect x="210" y="440" width="70" height="20" fill="#2e3436"/>
+<text x="210" y="455" fill="#ef2929" textLength="70" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Up/Down</text>
+<rect x="280" y="440" width="10" height="20" fill="#2e3436"/>
+<text x="280" y="455" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
+<rect x="290" y="440" width="40" height="20" fill="#2e3436"/>
+<text x="290" y="455" fill="#eeeeec" textLength="40" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Pick</text>
+<rect x="330" y="440" width="20" height="20" fill="#2e3436"/>
+<rect x="350" y="440" width="50" height="20" fill="#2e3436"/>
+<text x="350" y="455" fill="#ef2929" textLength="50" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Enter</text>
+<rect x="400" y="440" width="10" height="20" fill="#2e3436"/>
+<text x="400" y="455" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
+<rect x="410" y="440" width="40" height="20" fill="#2e3436"/>
+<text x="410" y="455" fill="#eeeeec" textLength="40" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Open</text>
+<rect x="450" y="440" width="20" height="20" fill="#2e3436"/>
+<rect x="470" y="440" width="30" height="20" fill="#2e3436"/>
+<text x="470" y="455" fill="#ef2929" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Esc</text>
+<rect x="500" y="440" width="10" height="20" fill="#2e3436"/>
+<text x="500" y="455" fill="#d3d3d3" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
+<rect x="510" y="440" width="60" height="20" fill="#2e3436"/>
+<text x="510" y="455" fill="#eeeeec" textLength="60" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Cancel</text>
+<rect x="570" y="440" width="230" height="20" fill="#2e3436"/>
+<text x="570" y="455" fill="#d3d3d3" textLength="230" lengthAdjust="spacingAndGlyphs" xml:space="preserve">──────────────────────┘</text>
+<rect x="0" y="620" width="1000" height="20" fill="#d3d3d3"/>
+<text x="0" y="635" fill="#696969" textLength="1000" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Personal • Inbox — message 11/11, 0 scheduled actions, got 0 events — Go to folder: type part of its</text>
+<rect x="340" y="180" width="10" height="20" fill="#2e3436" fill-opacity="0.4"/>
+</svg>
