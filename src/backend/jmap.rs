@@ -2742,10 +2742,14 @@ fn mail_followup_to_header() -> email::Header {
     email::Header::as_addresses("Mail-Followup-To", false)
 }
 
-/// `List-Post`, as text: its `<mailto:...>` is taken apart by
+/// `List-Post`, raw: its `<mailto:...>` is taken apart by
 /// [`list_post_address`], the same as for IMAP.
+///
+/// RFC 8621 allows the List-* headers only in raw form or as URLs, and a
+/// server turns the whole `Email/get` down over any other -- which left every
+/// message unopenable.
 fn list_post_header() -> email::Header {
-    email::Header::as_text("List-Post", false)
+    email::Header::as_raw("List-Post", false)
 }
 
 /// Recipients as the compose fields take them, quoted where the name needs it
@@ -3731,6 +3735,17 @@ mod tests {
         assert_eq!(content.bcc, ["boss@example.com"]);
     }
 
+    /// The forms RFC 8621 (section 4.1.2) allows for each header.  A server
+    /// refuses the whole body fetch over one it does not, so each is pinned.
+    #[test]
+    fn the_reply_headers_are_asked_for_in_forms_the_server_allows() {
+        assert_eq!(list_post_header().to_string(), "header:List-Post");
+        assert_eq!(
+            mail_followup_to_header().to_string(),
+            "header:Mail-Followup-To:asAddresses"
+        );
+    }
+
     #[test]
     fn a_loaded_message_carries_the_headers_a_reply_is_addressed_from() {
         let email: JmapEmail = serde_json::from_value(serde_json::json!({
@@ -3741,7 +3756,7 @@ mod tests {
                 {"name": null, "email": "dev@lists.example.org"},
                 {"name": "Bob", "email": "bob@example.com"},
             ],
-            "header:List-Post:asText": " <mailto:dev@lists.example.org>",
+            "header:List-Post": " <mailto:dev@lists.example.org>",
         }))
         .expect("parsing the canned email");
 
