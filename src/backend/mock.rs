@@ -9,7 +9,7 @@ use crate::{
         ActionStatus, BackendEvent, MailBackend, MailboxSnapshot, OutgoingMessage, compose_address,
     },
     model::{
-        Action, ActionType, MailboxKind, Message, MessageAttachment, MessageContent,
+        Action, ActionType, Folder, MailboxKind, Message, MessageAttachment, MessageContent,
         MessageContentPart, MessageId, MessageStatus,
     },
 };
@@ -186,6 +186,8 @@ impl MockBackend {
             (MailboxKind::Archive, 35usize, MessageStatus::Read),
             (MailboxKind::Spam, 22usize, MessageStatus::Read),
             (MailboxKind::Trash, 18usize, MessageStatus::Read),
+            (demo_folder("Receipts"), 14usize, MessageStatus::Read),
+            (demo_folder("Projects/Elma"), 9usize, MessageStatus::Read),
         ];
 
         for (kind, count, status) in templates {
@@ -234,6 +236,10 @@ impl MockBackend {
                         if rng.one_in(6) {
                             message.status = MessageStatus::New;
                         }
+                    }
+                    MailboxKind::Folder(folder) => {
+                        message.labels = vec![folder.name.clone()];
+                        message.starred = rng.one_in(8);
                     }
                     MailboxKind::Inbox => {}
                 }
@@ -357,14 +363,13 @@ impl MockBackend {
         let mut contents = contents.lock().expect("contents mutex poisoned");
 
         let mut removed = None;
-        for kind in MailboxKind::ALL {
-            if let Some(list) = mailboxes.get_mut(&kind)
-                && let Some(index) = list
-                    .iter()
-                    .position(|mock| mock.message.id == action.message_id)
+        for (kind, list) in mailboxes.iter_mut() {
+            if let Some(index) = list
+                .iter()
+                .position(|mock| mock.message.id == action.message_id)
             {
                 let mock = list.remove(index);
-                removed = Some((kind, mock));
+                removed = Some((*kind, mock));
                 break;
             }
         }
@@ -614,6 +619,18 @@ impl MailBackend for MockBackend {
         vec![DEFAULT_SENDER.to_string()]
     }
 
+    /// The standard mailboxes and whatever folders hold mail.
+    fn list_folders(&self) -> Result<Vec<MailboxKind>> {
+        let mailboxes = self.mailboxes.lock().expect("mailboxes mutex poisoned");
+        let mut folders = MailboxKind::ALL.to_vec();
+        folders.extend(
+            mailboxes
+                .keys()
+                .filter(|kind| matches!(kind, MailboxKind::Folder(_))),
+        );
+        Ok(folders)
+    }
+
     /// Return the current mailbox snapshot and subscribe to future events.
     fn load_mailbox(
         &self,
@@ -722,6 +739,11 @@ impl MailBackend for MockBackend {
     fn save_draft(&self, message: OutgoingMessage) -> Result<()> {
         self.store_composed_message(message, MailboxKind::Drafts, MessageStatus::New, "Draft")
     }
+}
+
+/// A folder of the demo account's own, named as it would be on a server.
+fn demo_folder(name: &str) -> MailboxKind {
+    MailboxKind::Folder(Folder::intern(name, name))
 }
 
 fn generate_mock_attachments(rng: &mut SimpleRng) -> Vec<MessageAttachment> {

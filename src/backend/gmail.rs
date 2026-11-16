@@ -10,7 +10,9 @@ use crate::{
         OutgoingMessage, build_compose_body, mailer_header, mime::build_message_content,
         retry_backoff,
     },
-    model::{Action, ActionType, MailboxKind, Message, MessageContent, MessageId, MessageStatus},
+    model::{
+        Action, ActionType, Folder, MailboxKind, Message, MessageContent, MessageId, MessageStatus,
+    },
 };
 use anyhow::{Context, Result, anyhow};
 use async_imap::{
@@ -703,6 +705,9 @@ struct GmailInner {
     session: AsyncMutex<Option<AsyncSession>>,
     state: AsyncMutex<SharedState>,
     labels: AsyncMutex<SpecialMailboxes>,
+    /// Every folder the account offers, from the same `LIST` that finds the
+    /// special ones.  See [`MailBackend::list_folders`].
+    folders: AsyncMutex<Vec<MailboxKind>>,
     current_mailbox: AsyncMutex<MailboxKind>,
     events: Mutex<Option<mpsc::Sender<BackendEvent>>>,
     idle_stop: AsyncMutex<Option<oneshot::Sender<()>>>,
@@ -795,6 +800,7 @@ impl GmailBackend {
                 session: AsyncMutex::new(None),
                 state: AsyncMutex::new(SharedState::default()),
                 labels: AsyncMutex::new(SpecialMailboxes::default()),
+                folders: AsyncMutex::new(Vec::new()),
                 current_mailbox: AsyncMutex::new(MailboxKind::Inbox),
                 events: Mutex::new(None),
                 idle_stop: AsyncMutex::new(None),
@@ -812,6 +818,23 @@ impl GmailBackend {
 impl MailBackend for GmailBackend {
     fn own_addresses(&self) -> Vec<String> {
         vec![self.inner.email.clone()]
+    }
+
+    /// The folders the last connect listed.
+    ///
+    /// Asking the server again would mean stopping IDLE for a list that
+    /// changes about as often as the user creates a label.
+    fn list_folders(&self) -> Result<Vec<MailboxKind>> {
+        let folders = self
+            .inner
+            .runtime
+            .block_on(async { self.inner.folders.lock().await.clone() });
+        if folders.is_empty() {
+            return Err(anyhow!(
+                "the folders are not known until the account has connected"
+            ));
+        }
+        Ok(folders)
     }
 
     /// Fetch `mailbox` and subscribe to Gmail's IDLE notifications for it.
@@ -1308,6 +1331,7 @@ impl GmailInner {
             MailboxKind::Archive => labels.archive.clone(),
             MailboxKind::Spam => labels.spam.clone(),
             MailboxKind::Trash => labels.trash.clone(),
+            MailboxKind::Folder(folder) => folder.id.clone(),
         };
         Ok(name)
     }
@@ -1558,6 +1582,11 @@ impl GmailInner {
             if let Some(value) = drafts {
                 labels.drafts = value;
             }
+
+            *self.folders.lock().await = names
+                .iter()
+                .filter_map(|name| folder_for_listing(name.name(), name.attributes(), &labels))
+                .collect();
         }
 
         Ok(())
@@ -2670,19 +2699,112 @@ fn has_important_attribute(attrs: &[NameAttribute<'_>]) -> bool {
 /// Mail are as a rule two different messages.  The folder goes into the upper
 /// half of the id, which keeps ids apart across folders and lets an action
 /// find its way back to the folder the message was listed in.
+///
+/// A folder of the user's own is numbered after the ones Elma knows, by its
+/// place in the [`Folder`] interner.
 fn message_id(mailbox: MailboxKind, uid: u32) -> MessageId {
-    let folder = MailboxKind::ALL
-        .iter()
-        .position(|kind| *kind == mailbox)
-        .unwrap_or_default() as MessageId;
+    let folder = match mailbox {
+        MailboxKind::Folder(folder) => MailboxKind::ALL.len() + folder.index(),
+        known => MailboxKind::ALL
+            .iter()
+            .position(|kind| *kind == known)
+            .unwrap_or_default(),
+    } as MessageId;
     ((folder + 1) << 32) | MessageId::from(uid)
 }
 
 /// The folder and UID a [`message_id`] was made from.
 fn message_location(id: MessageId) -> Option<(MailboxKind, u32)> {
     let folder = usize::try_from(id >> 32).ok()?.checked_sub(1)?;
-    let mailbox = *MailboxKind::ALL.get(folder)?;
+    let mailbox = match MailboxKind::ALL.get(folder) {
+        Some(known) => *known,
+        None => MailboxKind::Folder(Folder::by_index(folder - MailboxKind::ALL.len())?),
+    };
     Some((mailbox, id as u32))
+}
+
+/// The mailbox a line of `LIST` output opens, or `None` for one that cannot
+/// be opened -- a parent like `[Gmail]` that only holds other folders.
+///
+/// A folder `labels` names for a role comes back as that role, so a folder
+/// picked from the list is the very one its shortcut opens.
+fn folder_for_listing(
+    name: &str,
+    attrs: &[NameAttribute<'_>],
+    labels: &SpecialMailboxes,
+) -> Option<MailboxKind> {
+    let unselectable = attrs.iter().any(|attr| match attr {
+        NameAttribute::NoSelect => true,
+        // RFC 5258's, which the parser does not know by name.
+        NameAttribute::Extension(name) => name
+            .trim_start_matches('\\')
+            .eq_ignore_ascii_case("NonExistent"),
+        _ => false,
+    });
+    if unselectable {
+        return None;
+    }
+    if name.eq_ignore_ascii_case("INBOX") {
+        return Some(MailboxKind::Inbox);
+    }
+    let known = [
+        (&labels.archive, MailboxKind::Archive),
+        (&labels.trash, MailboxKind::Trash),
+        (&labels.spam, MailboxKind::Spam),
+        (&labels.starred, MailboxKind::Starred),
+        (&labels.important, MailboxKind::Important),
+        (&labels.sent, MailboxKind::Sent),
+        (&labels.drafts, MailboxKind::Drafts),
+    ];
+    Some(
+        known
+            .into_iter()
+            .find(|(label, _)| *label == name)
+            .map(|(_, kind)| kind)
+            .unwrap_or_else(|| {
+                MailboxKind::Folder(Folder::intern(name, &decode_mailbox_name(name)))
+            }),
+    )
+}
+
+/// A mailbox name as the user wrote it, from the modified UTF-7 IMAP sends it
+/// in (RFC 3501, section 5.1.3): `Entw&APw-rfe` is `Entwürfe`.
+///
+/// Anything that does not decode is left as it came, which is still more
+/// useful in a list than nothing.
+fn decode_mailbox_name(name: &str) -> String {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD_NO_PAD;
+
+    let mut decoded = String::with_capacity(name.len());
+    let mut rest = name;
+    while let Some(start) = rest.find('&') {
+        decoded.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('-') else {
+            return name.to_string();
+        };
+        let encoded = &after[..end];
+        if encoded.is_empty() {
+            decoded.push('&');
+        } else {
+            let Ok(bytes) = STANDARD_NO_PAD.decode(encoded.replace(',', "/")) else {
+                return name.to_string();
+            };
+            let (pairs, odd) = bytes.as_chunks::<2>();
+            if !odd.is_empty() {
+                return name.to_string();
+            }
+            let units = pairs.iter().map(|pair| u16::from_be_bytes(*pair));
+            match char::decode_utf16(units).collect::<Result<String, _>>() {
+                Ok(text) => decoded.push_str(&text),
+                Err(_) => return name.to_string(),
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    decoded.push_str(rest);
+    decoded
 }
 
 /// The IMAP command behind an action, whichever folder it runs in.
@@ -4009,6 +4131,79 @@ mod tests {
             .unwrap();
         assert!(highest < u64::MAX - u64::from(u32::MAX));
         assert_eq!(message_location(u64::MAX - 1), None);
+    }
+
+    #[test]
+    fn a_folder_of_the_users_own_gets_ids_of_its_own() {
+        let receipts = MailboxKind::Folder(Folder::intern("Receipts", "Receipts"));
+        let travel = MailboxKind::Folder(Folder::intern("Travel", "Travel"));
+
+        assert_eq!(
+            message_location(message_id(receipts, 7)),
+            Some((receipts, 7))
+        );
+        assert_eq!(message_location(message_id(travel, 7)), Some((travel, 7)));
+        assert!(
+            MailboxKind::ALL
+                .iter()
+                .all(|known| message_id(*known, 7) != message_id(receipts, 7))
+        );
+    }
+
+    // ---------------------------------------------------------------
+    //  Listing folders
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn mailbox_names_are_decoded_from_modified_utf7() {
+        assert_eq!(decode_mailbox_name("Receipts"), "Receipts");
+        assert_eq!(
+            decode_mailbox_name("[Gmail]/Entw&APw-rfe"),
+            "[Gmail]/Entwürfe"
+        );
+        assert_eq!(decode_mailbox_name("Tom &- Jerry"), "Tom & Jerry");
+        assert_eq!(decode_mailbox_name("&ZeVnLIqe-"), "日本語");
+        // Not modified UTF-7 after all: shown as it came.
+        assert_eq!(decode_mailbox_name("Q&A"), "Q&A");
+    }
+
+    #[test]
+    fn a_listed_folder_with_a_role_opens_as_that_role() {
+        let labels = SpecialMailboxes::default();
+
+        assert_eq!(
+            folder_for_listing("INBOX", &[], &labels),
+            Some(MailboxKind::Inbox)
+        );
+        assert_eq!(
+            folder_for_listing(&labels.trash, &[NameAttribute::Trash], &labels),
+            Some(MailboxKind::Trash)
+        );
+        assert_eq!(
+            folder_for_listing("Entw&APw-rfe", &[], &labels),
+            Some(MailboxKind::Folder(Folder::intern(
+                "Entw&APw-rfe",
+                "Entwürfe"
+            )))
+        );
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_opened_is_not_listed() {
+        let labels = SpecialMailboxes::default();
+
+        assert_eq!(
+            folder_for_listing("[Gmail]", &[NameAttribute::NoSelect], &labels),
+            None
+        );
+        assert_eq!(
+            folder_for_listing(
+                "Gone",
+                &[NameAttribute::Extension("\\NonExistent".into())],
+                &labels
+            ),
+            None
+        );
     }
 
     /// Restoring is decided by the folder the message was listed in, which

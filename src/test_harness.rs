@@ -41,8 +41,8 @@ use crate::app::{AccountDescriptor, App};
 use crate::backend::{ActionStatus, BackendEvent, MailBackend, MailboxSnapshot, OutgoingMessage};
 use crate::clock;
 use crate::model::{
-    Action, MailboxKind, Message, MessageAttachment, MessageContent, MessageContentPart, MessageId,
-    MessageStatus,
+    Action, Folder, MailboxKind, Message, MessageAttachment, MessageContent, MessageContentPart,
+    MessageId, MessageStatus,
 };
 use crate::ui;
 
@@ -661,6 +661,17 @@ impl MailBackend for FixtureBackend {
         vec!["rob@example.com".to_string()]
     }
 
+    /// The standard mailboxes and the fixture's own folders.
+    fn list_folders(&self) -> Result<Vec<MailboxKind>> {
+        let mut folders = MailboxKind::ALL.to_vec();
+        folders.extend(
+            self.mailboxes
+                .keys()
+                .filter(|kind| matches!(kind, MailboxKind::Folder(_))),
+        );
+        Ok(folders)
+    }
+
     fn load_mailbox(
         &self,
         mailbox: MailboxKind,
@@ -970,7 +981,27 @@ fn fixture_mailboxes() -> HashMap<MailboxKind, Vec<Message>> {
         .collect();
     mailboxes.insert(MailboxKind::Starred, mailbox(&starred));
 
+    let receipts = mailbox(&[Fixture {
+        recipients: &["rob@example.com"],
+        ..Fixture::new(
+            41,
+            datetime!(2026-03-10 07:05:00 UTC),
+            "billing@vendor.example",
+            "Your receipt for March",
+            2_300,
+            MessageStatus::Read,
+        )
+    }]);
+    mailboxes.insert(fixture_folder("Receipts"), receipts);
+    mailboxes.insert(fixture_folder("Projects/Elma"), Vec::new());
+    mailboxes.insert(fixture_folder("Projects/Website"), Vec::new());
+
     mailboxes
+}
+
+/// A folder of the fixture account's own.
+pub(crate) fn fixture_folder(name: &str) -> MailboxKind {
+    MailboxKind::Folder(Folder::intern(name, name))
 }
 
 /// Bodies for the messages a test opens, keyed by message id.

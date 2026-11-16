@@ -5,9 +5,9 @@
 //! [`crate::app`] remains agnostic of the terminal representation.
 
 use crate::app::{
-    ActiveView, App, ComposeButton, ComposeField, ComposeFocus, ComposeState, LoadPhase,
-    LoadingState, MessageViewState, ProgressMode, SaveAttachmentDialog, SaveAttachmentFocus,
-    SecurityToggle, ShortcutMenu, byte_index_for,
+    ActiveView, App, ComposeButton, ComposeField, ComposeFocus, ComposeState, FolderListState,
+    FolderPicker, LoadPhase, LoadingState, MessageViewState, ProgressMode, SaveAttachmentDialog,
+    SaveAttachmentFocus, SecurityToggle, ShortcutMenu, byte_index_for,
 };
 use crate::clock;
 use crate::model::{MailboxKind, MessageAttachment, SecurityInfo, SecurityLevel, format_size};
@@ -94,6 +94,12 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, theme: Theme) {
 
     if let Some(menu) = app.shortcut_menu() {
         render_shortcut_menu(frame, menu, theme.focused());
+    }
+
+    if let Some(picker) = app.folder_picker()
+        && let Some((x, y)) = render_folder_picker(frame, picker, theme.focused())
+    {
+        frame.set_cursor_position((x, y));
     }
 
     if let Some(dialog) = app.save_attachment_dialog() {
@@ -1628,6 +1634,139 @@ fn render_shortcut_menu(frame: &mut Frame<'_>, menu: &ShortcutMenu, surface: Sur
         .wrap(Wrap { trim: false });
 
     frame.render_widget(paragraph, area);
+}
+
+/// Most folders the picker shows at once; past this the list scrolls.
+const FOLDER_PICKER_ROWS: usize = 12;
+
+/// Draw the folder picker in the middle of the screen, returning where the
+/// cursor goes in its query field.
+fn render_folder_picker(
+    frame: &mut Frame<'_>,
+    picker: &FolderPicker,
+    surface: Surface,
+) -> Option<(u16, u16)> {
+    let frame_area = frame.area();
+    // Sized by the whole list, not by what matches, so the box holds still
+    // while the user types.
+    let list_rows = picker.folder_count().clamp(1, FOLDER_PICKER_ROWS) as u16;
+    let width = frame_area.width.min(60);
+    let height = (1 /* top border */ + 1 /* query */ + 1 /* spacer */ + list_rows
+        + 1/* bottom border */)
+        .min(frame_area.height);
+    if width < 20 || height < 5 {
+        return None;
+    }
+
+    let x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
+    let y = frame_area.y + frame_area.height.saturating_sub(height) / 2;
+    let area = Rect::new(x, y, width, height);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(surface.border_style())
+        .border_type(surface.border_type())
+        .style(surface.style())
+        .title_top(surface.title("Go to folder"))
+        .title_bottom(surface.key_hints(&[
+            ("Up/Down", "Pick"),
+            ("Enter", "Open"),
+            ("Esc", "Cancel"),
+        ]))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+
+    let label = "Folder: ";
+    let label_width = label.width() as u16;
+    let (query, cursor) = picker.query();
+    let (visible, cursor_col) =
+        text_field_view(query, cursor, layout[0].width.saturating_sub(label_width));
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(label, surface.label_style()),
+            Span::styled(
+                visible.to_string(),
+                surface.field_style().add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .style(surface.style()),
+        layout[0],
+    );
+
+    let list_area = layout[2];
+    let mut lines = Vec::new();
+    let state = picker.state();
+    let failed = matches!(state, FolderListState::Failed(_));
+    match state {
+        FolderListState::Loading(elapsed) => lines.push(Line::from(Span::styled(
+            progress_text("Loading folders...", elapsed),
+            surface.warning_style(),
+        ))),
+        FolderListState::Failed(error) => lines.push(Line::from(Span::styled(
+            format!("Could not list the folders: {error}"),
+            surface.warning_style(),
+        ))),
+        FolderListState::Ready => {
+            let matches: Vec<(&str, bool)> = picker.matches().collect();
+            if matches.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "(no folder matches)",
+                    surface.muted_style(),
+                )));
+            }
+            let visible_rows = list_area.height.max(1) as usize;
+            let selected = picker.selected();
+            let start = selected.saturating_sub(visible_rows - 1);
+            for (index, (name, current)) in
+                matches.iter().enumerate().skip(start).take(visible_rows)
+            {
+                let is_selected = index == selected;
+                let marker = if is_selected { "▶ " } else { "  " };
+                let mut spans = vec![Span::raw(format!("{marker}{name}"))];
+                if *current {
+                    // Muted on the plain rows; on the bar it takes the bar's
+                    // colours, against which the muted ones would not read.
+                    let style = if is_selected {
+                        Style::default()
+                    } else {
+                        surface.muted_style()
+                    };
+                    spans.push(Span::styled(" (current)", style));
+                }
+                let mut line = Line::from(spans);
+                if is_selected {
+                    // Out to the edge, so the highlight reads as a bar.
+                    let fill = (list_area.width as usize).saturating_sub(line.width());
+                    line.push_span(Span::raw(" ".repeat(fill)));
+                    line = line.style(surface.select_style());
+                }
+                lines.push(line);
+            }
+        }
+    }
+    // A long folder name is cut off rather than pushing the ones after it
+    // down; only an error, which has to be read in full, wraps.
+    let mut list = Paragraph::new(lines).style(surface.style());
+    if failed {
+        list = list.wrap(Wrap { trim: true });
+    }
+    frame.render_widget(list, list_area);
+
+    let max_x = layout[0].x + layout[0].width.saturating_sub(1);
+    let cursor_x = (layout[0].x + label_width + cursor_col).min(max_x);
+    Some((cursor_x, layout[0].y))
 }
 
 fn render_save_attachment_dialog(

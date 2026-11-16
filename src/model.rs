@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, sync::Mutex};
 use time::{Month, OffsetDateTime};
 
 pub type MessageId = u64;
@@ -23,6 +23,66 @@ pub enum MailboxKind {
     Archive,
     Spam,
     Trash,
+    /// Any other folder or label on the account, picked by name.
+    Folder(&'static Folder),
+}
+
+/// A folder or label of the user's own, one Elma knows by name rather than
+/// by the role it plays.
+///
+/// Interned, so that [`MailboxKind`] stays `Copy`: a mailbox is passed around
+/// and compared all over the client, and a `String` in one of its variants
+/// would turn every one of those places into a clone.  An account has a
+/// handful of folders and lists the same ones every time it is asked, so the
+/// names kept alive for the rest of the process are bounded by what the user
+/// actually has.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct Folder {
+    /// What the backend calls the folder: an IMAP name, a JMAP mailbox id.
+    pub id: String,
+    /// What the user calls it.
+    pub name: String,
+    /// Where the folder sits in the interner, for a backend that has to turn
+    /// it into a number and back again.
+    index: usize,
+}
+
+/// Every folder interned so far, in the order they were first seen.
+static FOLDERS: Mutex<Vec<&'static Folder>> = Mutex::new(Vec::new());
+
+impl Folder {
+    /// The one folder with this `id` and `name`, made on first use.
+    pub fn intern(id: &str, name: &str) -> &'static Folder {
+        let mut folders = FOLDERS.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(folder) = folders
+            .iter()
+            .find(|folder| folder.id == id && folder.name == name)
+        {
+            return folder;
+        }
+        let folder: &'static Folder = Box::leak(Box::new(Folder {
+            id: id.to_string(),
+            name: name.to_string(),
+            index: folders.len(),
+        }));
+        folders.push(folder);
+        folder
+    }
+
+    /// A small number standing for this folder for as long as the process
+    /// runs; [`Folder::by_index`] turns it back.
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// The folder [`Folder::index`] gave `index` for.
+    pub fn by_index(index: usize) -> Option<&'static Folder> {
+        FOLDERS
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(index)
+            .copied()
+    }
 }
 
 impl MailboxKind {
@@ -48,6 +108,7 @@ impl MailboxKind {
             MailboxKind::Archive => "Archive",
             MailboxKind::Spam => "Spam",
             MailboxKind::Trash => "Trash",
+            MailboxKind::Folder(folder) => &folder.name,
         }
     }
 }
@@ -435,5 +496,25 @@ fn short_month(month: Month) -> &'static str {
         Month::October => "Oct",
         Month::November => "Nov",
         Month::December => "Dec",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_is_interned_once_per_id_and_name() {
+        let first = Folder::intern("model-test-id", "Receipts");
+        let again = Folder::intern("model-test-id", "Receipts");
+        let renamed = Folder::intern("model-test-id", "Bills");
+
+        assert!(std::ptr::eq(first, again));
+        assert_ne!(first, renamed);
+        assert!(std::ptr::eq(
+            Folder::by_index(first.index()).unwrap(),
+            first
+        ));
+        assert_eq!(MailboxKind::Folder(first).title(), "Receipts");
     }
 }
