@@ -298,14 +298,34 @@ impl LoadingState {
     }
 }
 
+/// Who a reply goes to.  Compose switches between them with Ctrl+R.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplyKind {
+    /// The author: Reply-To, or From when there is none.
+    Author,
+    /// The author and everyone else the message went to.
+    All,
+    /// The mailing list the message came through, named by its List-Post.
+    List,
+}
+
+impl ReplyKind {
+    /// The name compose goes by while replying this way.
+    fn title(self) -> &'static str {
+        match self {
+            Self::Author => "Reply",
+            Self::All => "Reply All",
+            Self::List => "Reply to List",
+        }
+    }
+}
+
 /// What the UI does with a message body once the worker delivers it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MessageLoadPurpose {
     /// Show it in the message viewer.
     View,
-    Reply {
-        reply_all: bool,
-    },
+    Reply(ReplyKind),
     Forward,
     /// Reopen it in compose for further editing.
     Draft,
@@ -754,12 +774,67 @@ pub(crate) struct ComposeState {
     /// on every tick, so the size cannot be computed where it is displayed.
     body_bytes: usize,
     draft_id: Option<MessageId>,
+    /// Set while composing a reply, so it can be readdressed.
+    reply: Option<ReplyContext>,
     focus: ComposeFocus,
     status: Option<String>,
     body_scroll: usize,
     body_view_height: usize,
     /// Sign and encrypt, when OpenPGP is available at all.
     pgp: Option<PgpChoice>,
+}
+
+/// What a reply was made from, kept so compose can switch who it goes to.
+struct ReplyContext {
+    message: Message,
+    /// The loaded message, for its headers; the body is not kept.
+    headers: MessageContent,
+    own_addresses: Vec<String>,
+    kind: ReplyKind,
+    /// What `kind` put into To and Cc, to tell it apart from what the user has
+    /// typed there since.
+    addressing: ReplyAddressing,
+}
+
+impl ReplyContext {
+    fn new(
+        message: &Message,
+        content: &MessageContent,
+        own_addresses: Vec<String>,
+        kind: ReplyKind,
+    ) -> Self {
+        let headers = MessageContent {
+            parts: Vec::new(),
+            attachments: Vec::new(),
+            ..content.clone()
+        };
+        let addressing = reply_addressing(message, &headers, &own_addresses, kind);
+        Self {
+            message: message.clone(),
+            headers,
+            own_addresses,
+            kind,
+            addressing,
+        }
+    }
+
+    /// The kind Ctrl+R moves on to: replying to the list is only on offer for
+    /// a message that names one.
+    fn next_kind(&self) -> ReplyKind {
+        match self.kind {
+            ReplyKind::Author => ReplyKind::All,
+            ReplyKind::All if self.headers.list_post.is_some() => ReplyKind::List,
+            ReplyKind::All | ReplyKind::List => ReplyKind::Author,
+        }
+    }
+
+    /// What the status line says about where the reply goes, if anything.
+    fn status(&self) -> Option<String> {
+        self.addressing
+            .private_to_list
+            .as_ref()
+            .map(|list| format!("To the author only, not to {list}. ^R switches."))
+    }
 }
 
 impl Default for ComposeState {
@@ -776,6 +851,7 @@ impl Default for ComposeState {
             body: Document::new(),
             body_bytes: 0,
             draft_id: None,
+            reply: None,
             focus: ComposeFocus::Field(ComposeField::To),
             status: None,
             body_scroll: 0,
@@ -827,6 +903,56 @@ impl ComposeState {
 
     pub(crate) fn focus(&self) -> ComposeFocus {
         self.focus
+    }
+
+    fn reply_kind(&self) -> Option<ReplyKind> {
+        self.reply.as_ref().map(|reply| reply.kind)
+    }
+
+    /// Make this a reply, addressed as `reply` says.
+    fn start_reply(&mut self, reply: ReplyContext) {
+        self.set_field_text(ComposeField::To, reply.addressing.to.join(", "));
+        self.set_field_text(ComposeField::Cc, reply.addressing.cc.join(", "));
+        self.status = reply.status();
+        self.reply = Some(reply);
+    }
+
+    /// Readdress the reply to the next kind, returning it; `None` when this is
+    /// not a reply.
+    ///
+    /// Only what the previous kind put into To and Cc is replaced: a recipient
+    /// the user typed in stays where it was put.
+    fn switch_reply_kind(&mut self) -> Option<ReplyKind> {
+        let reply = self.reply.as_mut()?;
+        let kind = reply.next_kind();
+        let addressing =
+            reply_addressing(&reply.message, &reply.headers, &reply.own_addresses, kind);
+
+        let generated: Vec<String> = reply
+            .addressing
+            .to
+            .iter()
+            .chain(&reply.addressing.cc)
+            .map(|recipient| address_key(recipient))
+            .collect();
+        let typed = |value: &str| -> Vec<String> {
+            split_addresses(value)
+                .into_iter()
+                .filter(|recipient| !generated.contains(&address_key(recipient)))
+                .collect()
+        };
+        let typed_to = typed(&self.to.value);
+        let typed_cc = typed(&self.cc.value);
+
+        let to = deduplicated(addressing.to.iter().cloned().chain(typed_to).collect(), &[]);
+        let cc = deduplicated(addressing.cc.iter().cloned().chain(typed_cc).collect(), &to);
+
+        reply.kind = kind;
+        reply.addressing = addressing;
+        self.status = reply.status();
+        self.set_field_text(ComposeField::To, to.join(", "));
+        self.set_field_text(ComposeField::Cc, cc.join(", "));
+        Some(kind)
     }
 
     fn set_focus(&mut self, focus: ComposeFocus) {
@@ -1413,6 +1539,155 @@ fn prefix_subject(subject: &str, prefix: &str) -> String {
 
 fn text_paragraph(content: impl Into<String>) -> Paragraph {
     Paragraph::new_text().with_content(vec![Span::new_text(content.into())])
+}
+
+/// What the status bar says while composing a reply of `kind`.
+fn reply_status_line(kind: ReplyKind, subject: &str) -> String {
+    match kind {
+        ReplyKind::Author => format!("Replying to '{subject}'."),
+        ReplyKind::All => format!("Reply all to '{subject}'."),
+        ReplyKind::List => format!("Replying to the list about '{subject}'."),
+    }
+}
+
+/// The recipients of a reply, worked out from the message being answered.
+#[derive(Debug, Default, PartialEq)]
+struct ReplyAddressing {
+    to: Vec<String>,
+    cc: Vec<String>,
+    /// The list a plain reply to a list message leaves out, so the status line
+    /// can say the reply goes to the author alone.
+    private_to_list: Option<String>,
+}
+
+/// Address a reply the way Mutt and Gmail do.
+///
+/// - A reply goes to Reply-To when the message has one, otherwise to From.
+/// - A reply-all puts the same in To, and everyone else the message went to in
+///   the Cc -- unless the message names a Mail-Followup-To, which is where its
+///   author asked every follow-up to go, and which a reply-all then goes to
+///   alone.
+/// - Answering one's own mail follows up to whom it was sent, not to oneself.
+/// - The account's own addresses never land in the Cc.
+/// - A reply to the list goes to its List-Post address alone; without one it is
+///   a plain reply.
+///
+/// `content` is the loaded message; when it carries no addresses at all -- a
+/// backend that does not fill them in -- the list entry stands in for it.
+fn reply_addressing(
+    message: &Message,
+    content: &MessageContent,
+    own_addresses: &[String],
+    kind: ReplyKind,
+) -> ReplyAddressing {
+    if kind == ReplyKind::List
+        && let Some(list) = &content.list_post
+    {
+        return ReplyAddressing {
+            to: vec![list.clone()],
+            ..ReplyAddressing::default()
+        };
+    }
+    let reply_all = kind == ReplyKind::All;
+
+    let own: Vec<String> = own_addresses.iter().map(|own| address_key(own)).collect();
+    let is_own = |recipient: &String| own.contains(&address_key(recipient));
+
+    let from = if content.from.is_empty() {
+        cleaned(std::slice::from_ref(&message.sender))
+    } else {
+        cleaned(&content.from)
+    };
+    let (original_to, original_cc) = if content.to.is_empty() && content.cc.is_empty() {
+        (cleaned(&message.recipients), Vec::new())
+    } else {
+        (cleaned(&content.to), cleaned(&content.cc))
+    };
+    let sent_by_me = !from.is_empty() && from.iter().all(is_own);
+
+    if reply_all {
+        let followup: Vec<String> = cleaned(&content.mail_followup_to)
+            .into_iter()
+            .filter(|recipient| !is_own(recipient))
+            .collect();
+        if !followup.is_empty() {
+            return ReplyAddressing {
+                to: deduplicated(followup, &[]),
+                ..ReplyAddressing::default()
+            };
+        }
+    }
+
+    let reply_to = cleaned(&content.reply_to);
+    let mut to = if sent_by_me {
+        original_to.clone()
+    } else if !reply_to.is_empty() {
+        reply_to
+    } else {
+        from
+    };
+    if to.is_empty() {
+        to.extend(original_to.first().cloned());
+    }
+    let to = deduplicated(to, &[]);
+
+    let cc = if reply_all {
+        let others = if sent_by_me {
+            original_cc
+        } else {
+            original_to.into_iter().chain(original_cc).collect()
+        };
+        let others = others.into_iter().filter(|recipient| !is_own(recipient));
+        deduplicated(others.collect(), &to)
+    } else {
+        Vec::new()
+    };
+
+    let private_to_list = content.list_post.clone().filter(|list| {
+        let list = address_key(list);
+        !reply_all && !to.iter().any(|recipient| address_key(recipient) == list)
+    });
+
+    ReplyAddressing {
+        to,
+        cc,
+        private_to_list,
+    }
+}
+
+/// `recipients` trimmed, without the empty ones.
+fn cleaned(recipients: &[String]) -> Vec<String> {
+    recipients
+        .iter()
+        .map(|recipient| recipient.trim())
+        .filter(|recipient| !recipient.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// `recipients` with each mailbox kept once, and none that is in `already`.
+fn deduplicated(recipients: Vec<String>, already: &[String]) -> Vec<String> {
+    let mut seen: Vec<String> = already.iter().map(|r| address_key(r)).collect();
+    recipients
+        .into_iter()
+        .filter(|recipient| {
+            let key = address_key(recipient);
+            let new = !seen.contains(&key);
+            seen.push(key);
+            new
+        })
+        .collect()
+}
+
+/// The `user@host` of a recipient, lowercased, so `Ada <ADA@example.com>` and
+/// `ada@example.com` are recognised as the same mailbox.
+fn address_key(recipient: &str) -> String {
+    let recipient = recipient.trim();
+    let bare = match (recipient.rfind('<'), recipient.rfind('>')) {
+        (Some(open), Some(close)) if open < close => &recipient[open + 1..close],
+        _ => recipient,
+    };
+    bare.trim().to_lowercase()
 }
 
 fn build_reply_document(original: &Document, sender: &str, sent: OffsetDateTime) -> Document {
@@ -3139,7 +3414,13 @@ impl App {
 
     /// What the compose dialog is called, for the top of its frame.
     pub(crate) fn compose_title(&self) -> &'static str {
-        match self.compose.as_ref().and_then(|state| state.draft_id()) {
+        let Some(compose) = self.compose.as_ref() else {
+            return "Compose";
+        };
+        if let Some(kind) = compose.reply_kind() {
+            return kind.title();
+        }
+        match compose.draft_id() {
             Some(_) => "Edit Draft",
             None => "Compose",
         }
@@ -3152,6 +3433,19 @@ impl App {
     pub(crate) fn compose_keys(&self) -> &'static [(&'static str, &'static str)] {
         if self.pending_outgoing().is_some() {
             return &[];
+        }
+        if self
+            .compose
+            .as_ref()
+            .is_some_and(|compose| compose.reply_kind().is_some())
+        {
+            return &[
+                ("Tab", "Next"),
+                ("Shift+Tab", "Prev"),
+                ("Esc", "Cancel"),
+                ("Enter", "Activate"),
+                ("^R", "Reply type"),
+            ];
         }
         &[
             ("Tab", "Next"),
@@ -3321,8 +3615,8 @@ impl App {
             KeyCode::Char('y') | KeyCode::Char('Y') => self.schedule_archive(),
             KeyCode::Char('u') | KeyCode::Char('U') => self.toggle_unread(),
             KeyCode::Char('c') | KeyCode::Char('C') => self.open_compose(),
-            KeyCode::Char('r') | KeyCode::Char('R') => self.open_reply(false)?,
-            KeyCode::Char('a') | KeyCode::Char('A') => self.open_reply(true)?,
+            KeyCode::Char('r') | KeyCode::Char('R') => self.open_reply(ReplyKind::Author)?,
+            KeyCode::Char('a') | KeyCode::Char('A') => self.open_reply(ReplyKind::All)?,
             KeyCode::Char('f') | KeyCode::Char('F') => self.open_forward()?,
             KeyCode::Char('!') => {
                 if let Some(real_idx) = self.real_selected_index()
@@ -3363,7 +3657,7 @@ impl App {
             && !key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
         {
-            self.open_reply(false)?;
+            self.open_reply(ReplyKind::Author)?;
             return Ok(());
         }
 
@@ -3371,7 +3665,7 @@ impl App {
             && !key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
         {
-            self.open_reply(true)?;
+            self.open_reply(ReplyKind::All)?;
             return Ok(());
         }
 
@@ -3696,7 +3990,7 @@ impl App {
                     None => match attachment.blob_id.as_deref() {
                         Some(blob_id) => backend
                             .fetch_attachment_blob(blob_id)
-                            .map_err(|err| format!("Failed to download attachment: {err}"))?,
+                            .map_err(|err| format!("Failed to download attachment: {err:#}"))?,
                         None => {
                             return Err("Attachment content is not available.".to_string());
                         }
@@ -3902,8 +4196,8 @@ impl App {
 
         match purpose {
             MessageLoadPurpose::View => unreachable!("handled above"),
-            MessageLoadPurpose::Reply { reply_all } => {
-                self.show_reply_compose(&message, document, reply_all);
+            MessageLoadPurpose::Reply(kind) => {
+                self.show_reply_compose(&message, &loaded.content, document, kind);
             }
             MessageLoadPurpose::Forward => {
                 self.show_forward_compose(&message, document, loaded);
@@ -3964,12 +4258,18 @@ impl App {
         self.begin_message_load(message, purpose, cached, cached_document);
     }
 
-    fn open_reply(&mut self, reply_all: bool) -> Result<()> {
-        self.begin_compose_from_selected(MessageLoadPurpose::Reply { reply_all });
+    fn open_reply(&mut self, kind: ReplyKind) -> Result<()> {
+        self.begin_compose_from_selected(MessageLoadPurpose::Reply(kind));
         Ok(())
     }
 
-    fn show_reply_compose(&mut self, message: &Message, document: Document, reply_all: bool) {
+    fn show_reply_compose(
+        &mut self,
+        message: &Message,
+        content: &MessageContent,
+        document: Document,
+        kind: ReplyKind,
+    ) {
         let mut compose = ComposeState::new();
         let subject = prefix_subject(&message.subject, "Re:");
         compose.set_field_text(ComposeField::Subject, subject);
@@ -3977,40 +4277,29 @@ impl App {
         let reply_body = build_reply_document(&document, &message.sender, message.sent);
         compose.set_body(reply_body);
         compose.set_focus(ComposeFocus::Body);
-
-        let mut primary_recipient = message.sender.trim().to_string();
-        if primary_recipient.is_empty()
-            && let Some(first) = message.recipients.first()
-        {
-            primary_recipient = first.trim().to_string();
-        }
-
-        if !primary_recipient.is_empty() {
-            compose.set_field_text(ComposeField::To, primary_recipient.clone());
-        }
-
-        if reply_all {
-            let primary_lower = primary_recipient.to_ascii_lowercase();
-            let cc_list: Vec<String> = message
-                .recipients
-                .iter()
-                .map(|recipient| recipient.trim().to_string())
-                .filter(|recipient| !recipient.is_empty())
-                .filter(|recipient| recipient.to_ascii_lowercase() != primary_lower)
-                .collect();
-            if !cc_list.is_empty() {
-                compose.set_field_text(ComposeField::Cc, cc_list.join(", "));
-            }
-        }
+        compose.start_reply(ReplyContext::new(
+            message,
+            content,
+            self.backend.own_addresses(),
+            kind,
+        ));
 
         self.compose = Some(compose);
         self.message_view = None;
-        let status = if reply_all {
-            format!("Reply all to '{}'.", message.subject)
-        } else {
-            format!("Replying to '{}'.", message.subject)
+        self.mailbox.status_line = Some(reply_status_line(kind, &message.subject));
+    }
+
+    /// Ctrl+R in compose: readdress the reply to the next kind.
+    fn switch_reply_kind(&mut self) {
+        let Some(compose) = self.compose.as_mut() else {
+            return;
         };
-        self.mailbox.status_line = Some(status);
+        let Some(kind) = compose.switch_reply_kind() else {
+            return;
+        };
+        if let Some(reply) = compose.reply.as_ref() {
+            self.mailbox.status_line = Some(reply_status_line(kind, &reply.message.subject));
+        }
     }
 
     fn open_forward(&mut self) -> Result<()> {
@@ -4068,6 +4357,10 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.request_cancel_compose();
+                return Ok(());
+            }
+            KeyCode::Char('r' | 'R') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.switch_reply_kind();
                 return Ok(());
             }
             KeyCode::Tab => {
@@ -4936,10 +5229,10 @@ impl App {
                     {
                         status = match op.kind {
                             OutgoingKind::Send => {
-                                format!("Message sent but failed to remove draft: {err}")
+                                format!("Message sent but failed to remove draft: {err:#}")
                             }
                             OutgoingKind::Draft => {
-                                format!("Draft saved but failed to remove previous copy: {err}")
+                                format!("Draft saved but failed to remove previous copy: {err:#}")
                             }
                         };
                     }
@@ -5945,9 +6238,12 @@ fn message_load_label(purpose: MessageLoadPurpose, message: &Message) -> String 
     let subject = truncate_label(message.subject.trim(), 40);
     match purpose {
         MessageLoadPurpose::View => format!("Loading '{subject}'"),
-        MessageLoadPurpose::Reply { reply_all: false } => format!("Loading '{subject}' to reply"),
-        MessageLoadPurpose::Reply { reply_all: true } => {
+        MessageLoadPurpose::Reply(ReplyKind::Author) => format!("Loading '{subject}' to reply"),
+        MessageLoadPurpose::Reply(ReplyKind::All) => {
             format!("Loading '{subject}' to reply to all")
+        }
+        MessageLoadPurpose::Reply(ReplyKind::List) => {
+            format!("Loading '{subject}' to reply to the list")
         }
         MessageLoadPurpose::Forward => format!("Loading '{subject}' to forward"),
         MessageLoadPurpose::Draft => format!("Opening draft '{subject}'"),
@@ -6347,7 +6643,14 @@ mod tests {
         fn save_draft(&self, _message: OutgoingMessage) -> anyhow::Result<()> {
             Ok(())
         }
+
+        fn own_addresses(&self) -> Vec<String> {
+            vec![ME.to_string()]
+        }
     }
+
+    /// The address [`NoopBackend`] sends as.
+    const ME: &str = "Rob <me@example.com>";
 
     fn make_message(id: MessageId, status: MessageStatus) -> Message {
         Message {
@@ -8552,7 +8855,9 @@ mod tests {
 
         fn result(&self) -> anyhow::Result<()> {
             if self.fail {
-                anyhow::bail!("backend refused");
+                // Shaped like a real failure: the server's reason, wrapped in
+                // what the backend was doing at the time.
+                return Err(anyhow!("Invalid arguments").context("fetching message body"));
             }
             Ok(())
         }
@@ -8826,8 +9131,9 @@ mod tests {
             app.mailbox
                 .status_line
                 .as_deref()
-                .is_some_and(|status| status.starts_with("Failed to load message:")),
-            "got {:?}",
+                .is_some_and(|status| status
+                    == "Failed to load message: fetching message body: Invalid arguments"),
+            "the server's reason has to come through, got {:?}",
             app.mailbox.status_line
         );
         assert!(app.message_view.is_none());
@@ -9290,6 +9596,315 @@ mod tests {
 
         let compose = app.compose.as_ref().expect("the reply opens compose");
         assert_eq!(compose.field_data(ComposeField::To).0, "sender-1");
+    }
+
+    /// A message Ada sent to a list, Bob and the account.
+    fn list_message() -> (Message, MessageContent) {
+        let message = Message {
+            sender: "Ada".to_string(),
+            recipients: vec!["Dev list".to_string()],
+            ..make_message(1, MessageStatus::Read)
+        };
+        let content = MessageContent {
+            from: vec!["Ada <ada@example.com>".to_string()],
+            to: vec!["Dev list <dev@lists.example.org>".to_string()],
+            cc: vec!["\"Doe, Bob\" <bob@example.com>".to_string(), ME.to_string()],
+            ..MessageContent::default()
+        };
+        (message, content)
+    }
+
+    fn addressing(content: &MessageContent, reply_all: bool) -> (Vec<String>, Vec<String>) {
+        let (message, _) = list_message();
+        let kind = if reply_all {
+            ReplyKind::All
+        } else {
+            ReplyKind::Author
+        };
+        let addressing = reply_addressing(&message, content, &[ME.to_string()], kind);
+        (addressing.to, addressing.cc)
+    }
+
+    #[test]
+    fn a_reply_goes_to_the_sender_by_its_address() {
+        let (_, content) = list_message();
+        let (to, cc) = addressing(&content, false);
+        assert_eq!(to, ["Ada <ada@example.com>"]);
+        assert!(cc.is_empty());
+    }
+
+    #[test]
+    fn a_reply_all_copies_to_and_cc_but_not_the_account_itself() {
+        let (_, content) = list_message();
+        let (to, cc) = addressing(&content, true);
+        assert_eq!(to, ["Ada <ada@example.com>"]);
+        assert_eq!(
+            cc,
+            [
+                "Dev list <dev@lists.example.org>",
+                "\"Doe, Bob\" <bob@example.com>"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_account_is_recognised_whatever_name_and_case_it_comes_with() {
+        let (_, mut content) = list_message();
+        content.cc = vec!["ME@Example.com".to_string()];
+        let (_, cc) = addressing(&content, true);
+        assert_eq!(cc, ["Dev list <dev@lists.example.org>"]);
+    }
+
+    #[test]
+    fn a_reply_goes_to_reply_to_rather_than_the_sender() {
+        let (_, mut content) = list_message();
+        content.reply_to = vec!["Dev list <dev@lists.example.org>".to_string()];
+        let (to, cc) = addressing(&content, false);
+        assert_eq!(to, ["Dev list <dev@lists.example.org>"]);
+        assert!(cc.is_empty());
+    }
+
+    #[test]
+    fn a_reply_all_puts_reply_to_in_place_of_the_sender_and_out_of_the_cc() {
+        let (_, mut content) = list_message();
+        content.reply_to = vec!["dev@lists.example.org".to_string()];
+        let (to, cc) = addressing(&content, true);
+        assert_eq!(to, ["dev@lists.example.org"]);
+        assert_eq!(cc, ["\"Doe, Bob\" <bob@example.com>"]);
+    }
+
+    #[test]
+    fn a_reply_all_goes_to_mail_followup_to_alone() {
+        let (_, mut content) = list_message();
+        content.reply_to = vec!["ada@example.com".to_string()];
+        content.mail_followup_to = vec!["dev@lists.example.org".to_string(), ME.to_string()];
+        let (to, cc) = addressing(&content, true);
+        assert_eq!(to, ["dev@lists.example.org"]);
+        assert!(cc.is_empty());
+    }
+
+    #[test]
+    fn a_plain_reply_ignores_mail_followup_to() {
+        let (_, mut content) = list_message();
+        content.mail_followup_to = vec!["dev@lists.example.org".to_string()];
+        let (to, _) = addressing(&content, false);
+        assert_eq!(to, ["Ada <ada@example.com>"]);
+    }
+
+    #[test]
+    fn answering_ones_own_mail_follows_up_to_its_recipients() {
+        let content = MessageContent {
+            from: vec![ME.to_string()],
+            to: vec!["ada@example.com".to_string()],
+            cc: vec!["bob@example.com".to_string()],
+            ..MessageContent::default()
+        };
+        assert_eq!(
+            addressing(&content, false),
+            (vec!["ada@example.com".to_string()], vec![])
+        );
+        assert_eq!(
+            addressing(&content, true),
+            (
+                vec!["ada@example.com".to_string()],
+                vec!["bob@example.com".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn without_addresses_in_the_content_the_list_entry_stands_in() {
+        let (message, _) = list_message();
+        let addressing =
+            reply_addressing(&message, &MessageContent::default(), &[], ReplyKind::All);
+        assert_eq!(addressing.to, ["Ada"]);
+        assert_eq!(addressing.cc, ["Dev list"]);
+    }
+
+    #[test]
+    fn a_plain_reply_to_a_list_message_says_it_leaves_the_list_out() {
+        let (message, mut content) = list_message();
+        content.list_post = Some("dev@lists.example.org".to_string());
+
+        let private = reply_addressing(&message, &content, &[], ReplyKind::Author);
+        assert_eq!(
+            private.private_to_list.as_deref(),
+            Some("dev@lists.example.org")
+        );
+
+        let reply_all = reply_addressing(&message, &content, &[], ReplyKind::All);
+        assert_eq!(reply_all.private_to_list, None);
+
+        content.reply_to = vec!["Dev list <DEV@lists.example.org>".to_string()];
+        let to_the_list = reply_addressing(&message, &content, &[], ReplyKind::Author);
+        assert_eq!(to_the_list.private_to_list, None);
+    }
+
+    #[test]
+    fn a_reply_to_the_list_goes_to_its_posting_address_alone() {
+        let (message, mut content) = list_message();
+        content.list_post = Some("dev@lists.example.org".to_string());
+        content.reply_to = vec!["ada@example.com".to_string()];
+
+        let list = reply_addressing(&message, &content, &[], ReplyKind::List);
+        assert_eq!(list.to, ["dev@lists.example.org"]);
+        assert!(list.cc.is_empty());
+        assert_eq!(list.private_to_list, None);
+
+        // Without a list to go to, it is a plain reply.
+        content.list_post = None;
+        let plain = reply_addressing(&message, &content, &[], ReplyKind::List);
+        assert_eq!(plain.to, ["ada@example.com"]);
+    }
+
+    #[test]
+    fn reply_all_from_the_app_leaves_the_backends_own_address_out() {
+        let (message, mut content) = list_message();
+        content.list_post = Some("dev@lists.example.org".to_string());
+        let mut app = test_app(vec![message]);
+        app.show_loaded_message(1, content);
+        app.mailbox.selected = Some(0);
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('a'))).unwrap();
+
+        let compose = app.compose.as_ref().expect("the reply opens compose");
+        assert_eq!(
+            compose.field_data(ComposeField::To).0,
+            "Ada <ada@example.com>"
+        );
+        assert_eq!(
+            compose.field_data(ComposeField::Cc).0,
+            "Dev list <dev@lists.example.org>, \"Doe, Bob\" <bob@example.com>"
+        );
+    }
+
+    /// An app replying to `content` with `key`.
+    fn replying(content: MessageContent, key: char) -> App {
+        let (message, _) = list_message();
+        let mut app = test_app(vec![message]);
+        app.show_loaded_message(1, content);
+        app.mailbox.selected = Some(0);
+        app.handle_key(KeyEvent::from(KeyCode::Char(key))).unwrap();
+        assert!(app.compose.is_some(), "the reply opens compose");
+        app
+    }
+
+    fn switch_reply_type(app: &mut App) {
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .unwrap();
+    }
+
+    fn to_and_cc(app: &App) -> (String, String) {
+        let compose = app.compose.as_ref().expect("compose is open");
+        (
+            compose.field_data(ComposeField::To).0.to_string(),
+            compose.field_data(ComposeField::Cc).0.to_string(),
+        )
+    }
+
+    #[test]
+    fn a_plain_reply_from_the_app_says_when_it_leaves_the_list_out() {
+        let (_, mut content) = list_message();
+        content.list_post = Some("dev@lists.example.org".to_string());
+        let app = replying(content, 'r');
+
+        assert_eq!(app.compose_title(), "Reply");
+        assert_eq!(
+            app.compose_status_line(),
+            Some("To the author only, not to dev@lists.example.org. ^R switches.")
+        );
+    }
+
+    #[test]
+    fn ctrl_r_cycles_through_the_reply_types() {
+        let (_, mut content) = list_message();
+        content.list_post = Some("dev@lists.example.org".to_string());
+        let mut app = replying(content, 'r');
+        assert_eq!(
+            to_and_cc(&app),
+            ("Ada <ada@example.com>".to_string(), String::new())
+        );
+
+        switch_reply_type(&mut app);
+        assert_eq!(app.compose_title(), "Reply All");
+        assert_eq!(
+            to_and_cc(&app),
+            (
+                "Ada <ada@example.com>".to_string(),
+                "Dev list <dev@lists.example.org>, \"Doe, Bob\" <bob@example.com>".to_string()
+            )
+        );
+        assert_eq!(app.compose_status_line(), None);
+        assert_eq!(
+            app.mailbox.status_line.as_deref(),
+            Some("Reply all to 'Subject 1'.")
+        );
+
+        switch_reply_type(&mut app);
+        assert_eq!(app.compose_title(), "Reply to List");
+        assert_eq!(
+            to_and_cc(&app),
+            ("dev@lists.example.org".to_string(), String::new())
+        );
+
+        switch_reply_type(&mut app);
+        assert_eq!(app.compose_title(), "Reply");
+        assert_eq!(
+            to_and_cc(&app),
+            ("Ada <ada@example.com>".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn without_a_list_ctrl_r_switches_between_reply_and_reply_all() {
+        let (_, content) = list_message();
+        let mut app = replying(content, 'a');
+        assert_eq!(app.compose_title(), "Reply All");
+
+        switch_reply_type(&mut app);
+        assert_eq!(app.compose_title(), "Reply");
+        switch_reply_type(&mut app);
+        assert_eq!(app.compose_title(), "Reply All");
+    }
+
+    #[test]
+    fn switching_the_reply_type_keeps_the_recipients_typed_in() {
+        let (_, content) = list_message();
+        let mut app = replying(content, 'a');
+        let compose = app.compose.as_mut().unwrap();
+        compose.set_field_text(
+            ComposeField::To,
+            "Ada <ada@example.com>, carol@example.com".to_string(),
+        );
+        compose.set_field_text(
+            ComposeField::Cc,
+            "Dev list <dev@lists.example.org>, dave@example.com".to_string(),
+        );
+
+        switch_reply_type(&mut app);
+
+        // Bob's address came from the reply-all and goes with it; the two
+        // typed in stay where they were put.
+        assert_eq!(
+            to_and_cc(&app),
+            (
+                "Ada <ada@example.com>, carol@example.com".to_string(),
+                "dave@example.com".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn ctrl_r_leaves_a_message_that_is_not_a_reply_alone() {
+        let mut app = test_app(vec![make_message(1, MessageStatus::Read)]);
+        app.handle_key(KeyEvent::from(KeyCode::Char('c'))).unwrap();
+        let compose = app.compose.as_mut().expect("compose opens");
+        compose.set_field_text(ComposeField::To, "ada@example.com".to_string());
+
+        switch_reply_type(&mut app);
+
+        assert_eq!(app.compose_title(), "Compose");
+        assert_eq!(to_and_cc(&app).0, "ada@example.com");
     }
 
     #[test]

@@ -605,6 +605,10 @@ impl MockBackend {
 }
 
 impl MailBackend for MockBackend {
+    fn own_addresses(&self) -> Vec<String> {
+        vec![DEFAULT_SENDER.to_string()]
+    }
+
     /// Return the current mailbox snapshot and subscribe to future events.
     fn load_mailbox(
         &self,

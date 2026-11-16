@@ -810,6 +810,10 @@ impl GmailBackend {
 }
 
 impl MailBackend for GmailBackend {
+    fn own_addresses(&self) -> Vec<String> {
+        vec![self.inner.email.clone()]
+    }
+
     /// Fetch `mailbox` and subscribe to Gmail's IDLE notifications for it.
     fn load_mailbox(
         &self,
@@ -934,7 +938,7 @@ impl MailBackend for GmailBackend {
                 let result = Arc::clone(&inner)
                     .process_action(action.clone())
                     .await
-                    .map_err(|err| err.to_string());
+                    .map_err(|err| format!("{err:#}"));
                 if tx.send(ActionStatus { action, result }).is_err() {
                     break;
                 }
@@ -3481,6 +3485,30 @@ mod tests {
         );
         assert_eq!(content.cc, ["ann@example.com", "Bob <bob@example.com>"]);
         assert_eq!(content.bcc, ["boss@example.com"]);
+    }
+
+    #[test]
+    fn a_loaded_message_carries_the_headers_a_reply_is_addressed_from() {
+        let raw = concat!(
+            "From: \"Lovelace, Ada\" <ada@example.com>\r\n",
+            "Reply-To: Dev list <dev@lists.example.org>\r\n",
+            "Mail-Followup-To: dev@lists.example.org, Bob <bob@example.com>\r\n",
+            "List-Post: <mailto:dev@lists.example.org>\r\n",
+            "To: dev@lists.example.org\r\n",
+            "Subject: Hello\r\n",
+            "\r\n",
+            "Hi.\r\n",
+        );
+        let parsed = mailparse::parse_mail(raw.as_bytes()).expect("parsing the fixture");
+        let content = build_message_content(&parsed).expect("building content");
+
+        assert_eq!(content.from, ["\"Lovelace, Ada\" <ada@example.com>"]);
+        assert_eq!(content.reply_to, ["Dev list <dev@lists.example.org>"]);
+        assert_eq!(
+            content.mail_followup_to,
+            ["dev@lists.example.org", "Bob <bob@example.com>"]
+        );
+        assert_eq!(content.list_post.as_deref(), Some("dev@lists.example.org"));
     }
 
     fn outgoing_with_bcc() -> OutgoingMessage {

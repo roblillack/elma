@@ -8,7 +8,8 @@
 use crate::{
     backend::{
         ActionStatus, BackendEvent, FAILURES_BEFORE_REPORT, LeafPart, MailBackend, MailboxSnapshot,
-        OutgoingMessage, PartRole, build_compose_body, compose_address, mailer_header,
+        OutgoingMessage, PartRole, build_compose_body, compose_address, list_post_address,
+        mailer_header,
         mime::{build_message_content as build_raw_message_content, looks_protected},
         oauth::OAuthCredential,
         retry_backoff,
@@ -594,6 +595,26 @@ impl JmapBackend {
 }
 
 impl MailBackend for JmapBackend {
+    /// The configured address, and once connected every identity's.  The lock
+    /// is held for as long as a connection takes, so it is only tried: a reply
+    /// opened mid-connect makes do with the configured address.
+    fn own_addresses(&self) -> Vec<String> {
+        let mut addresses = vec![self.config.username.clone()];
+        if let Ok(guard) = self.inner.try_lock()
+            && let Some(inner) = guard.as_ref()
+        {
+            for address in &inner.own_addresses {
+                if !addresses
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(address))
+                {
+                    addresses.push(address.clone());
+                }
+            }
+        }
+        addresses
+    }
+
     fn load_mailbox(
         &self,
         mailbox: MailboxKind,
@@ -658,7 +679,7 @@ impl MailBackend for JmapBackend {
                 if tx
                     .send(ActionStatus {
                         action,
-                        result: result.map_err(|err| err.to_string()),
+                        result: result.map_err(|err| format!("{err:#}")),
                     })
                     .is_err()
                 {
@@ -731,6 +752,9 @@ struct JmapInner {
     mailboxes: AsyncMutex<MailboxCache>,
     state: AsyncMutex<JmapState>,
     identity: IdentityInfo,
+    /// Every address the account may send as, aliases included.  See
+    /// [`MailBackend::own_addresses`].
+    own_addresses: Vec<String>,
     events: Mutex<Option<mpsc::Sender<BackendEvent>>>,
     // Read by `emit_event` on every emission, so this is a plain mutex: the
     // async one would force `emit_event` and its callers to become async.
@@ -750,7 +774,7 @@ impl JmapInner {
         let client = Arc::new(Self::connect(&config, &secret).await?);
 
         let mailboxes = Self::load_mailboxes(&client).await?;
-        let identity = Self::load_identity(&client, &config.username).await?;
+        let (identity, own_addresses) = Self::load_identity(&client, &config.username).await?;
 
         Ok(Arc::new(Self {
             runtime,
@@ -761,6 +785,7 @@ impl JmapInner {
             mailboxes: AsyncMutex::new(mailboxes),
             state: AsyncMutex::new(JmapState::default()),
             identity,
+            own_addresses,
             events: Mutex::new(None),
             current_mailbox: Mutex::new(MailboxKind::Inbox),
             event_handle: AsyncMutex::new(None),
@@ -995,7 +1020,11 @@ impl JmapInner {
             EmailProperty::To,
             EmailProperty::Cc,
             EmailProperty::Bcc,
+            EmailProperty::From,
+            EmailProperty::ReplyTo,
             EmailProperty::Header(email::Header::as_text("X-Mailer", false)),
+            EmailProperty::Header(mail_followup_to_header()),
+            EmailProperty::Header(list_post_header()),
         ]);
         {
             let args = get.arguments();
@@ -1907,7 +1936,8 @@ impl JmapInner {
         Ok(MailboxCache::from_mailboxes(mailboxes))
     }
 
-    async fn load_identity(client: &Client, username: &str) -> Result<IdentityInfo> {
+    /// The identity to send as, and the addresses of all of them.
+    async fn load_identity(client: &Client, username: &str) -> Result<(IdentityInfo, Vec<String>)> {
         let mut request = client.build();
         request.add_capability(URI::Submission);
         let get = request.get_identity();
@@ -1925,7 +1955,7 @@ impl JmapInner {
             .context("fetching account identity")?;
         // One that came back without the properties asked for cannot be sent
         // as, and is no reason to turn the account away when others can.
-        let identities = response
+        let identities: Vec<IdentityInfo> = response
             .take_list()
             .into_iter()
             .filter_map(|identity| {
@@ -1936,25 +1966,33 @@ impl JmapInner {
                 })
             })
             .collect();
+        // A wildcard identity (`*@example.com`) lets the account send as anyone
+        // at the domain; it does not make everyone there the account's owner.
+        let own_addresses = identities
+            .iter()
+            .map(|identity| identity.email.clone())
+            .filter(|email| !email.contains('*'))
+            .collect();
 
         let session = client.session();
-        match choose_identity(identities, username, session.username()) {
+        let identity = match choose_identity(identities, username, session.username()) {
             Some(identity) => {
                 debug_logging::log_session(format_args!(
                     "sending as {} (identity {})",
                     identity.email, identity.id
                 ));
-                Ok(identity)
+                identity
             }
             None => {
                 let email = session.username().to_string();
-                Ok(IdentityInfo {
+                IdentityInfo {
                     id: email.clone(),
                     email,
                     name: None,
-                })
+                }
             }
-        }
+        };
+        Ok((identity, own_addresses))
     }
 
     /// Build the message to submit or, with `keep_bcc`, the draft to store.
@@ -2684,8 +2722,34 @@ fn build_message_content(email: &JmapEmail) -> Result<MessageContent> {
         to: compose_addresses(email.to()),
         cc: compose_addresses(email.cc()),
         bcc: compose_addresses(email.bcc()),
+        from: compose_addresses(email.from()),
+        reply_to: compose_addresses(email.reply_to()),
+        mail_followup_to: match email.header(&mail_followup_to_header()) {
+            Some(email::HeaderValue::AsAddresses(addresses)) => compose_addresses(Some(addresses)),
+            _ => Vec::new(),
+        },
+        list_post: match email.header(&list_post_header()) {
+            Some(email::HeaderValue::AsText(text)) => list_post_address(text),
+            _ => None,
+        },
         security: None,
     })
+}
+
+/// `Mail-Followup-To`, which JMAP has no property of its own for.  The request
+/// and the lookup in its response have to name the same form.
+fn mail_followup_to_header() -> email::Header {
+    email::Header::as_addresses("Mail-Followup-To", false)
+}
+
+/// `List-Post`, raw: its `<mailto:...>` is taken apart by
+/// [`list_post_address`], the same as for IMAP.
+///
+/// RFC 8621 allows the List-* headers only in raw form or as URLs, and a
+/// server turns the whole `Email/get` down over any other -- which left every
+/// message unopenable.
+fn list_post_header() -> email::Header {
+    email::Header::as_raw("List-Post", false)
 }
 
 /// Recipients as the compose fields take them, quoted where the name needs it
@@ -3060,10 +3124,20 @@ mod tests {
                         .unwrap_or_else(|| panic!("an unexpected request: {line} {body}"));
                     // Only the mail account holds mail, as on FastMail.
                     let answer = if body.contains("\"accountId\":\"u1\"") {
+                        // An address, an alias and a whole domain to send as.
+                        let list = if method == "Identity/get" {
+                            serde_json::json!([
+                                {"id": "i1", "email": "rob@example.com", "name": "Rob"},
+                                {"id": "i2", "email": "robert@example.org", "name": "Rob"},
+                                {"id": "i3", "email": "*@example.net", "name": "Rob"},
+                            ])
+                        } else {
+                            serde_json::json!([])
+                        };
                         serde_json::json!([method, {
                             "accountId": "u1",
                             "state": "1",
-                            "list": [],
+                            "list": list,
                             "notFound": []
                         }, "s0"])
                     } else {
@@ -3099,6 +3173,30 @@ mod tests {
         });
 
         (port, server)
+    }
+
+    /// Before connecting there is only the configured address to go by; after,
+    /// every identity counts -- but a wildcard does not make the whole domain
+    /// the account's own.
+    #[test]
+    fn the_own_addresses_are_the_identities_once_connected() {
+        let (port, server) = fake_jmap_server(3, 0);
+        let backend = JmapBackend::new(JmapConfig {
+            base_url: format!("http://127.0.0.1:{port}"),
+            auth: bearer_auth(),
+            trusted_hosts: Vec::new(),
+            username: "rob@example.com".to_string(),
+        })
+        .expect("the backend to be constructed");
+        assert_eq!(backend.own_addresses(), ["rob@example.com"]);
+
+        backend.inner().expect("the connection to succeed");
+        server.join().expect("the server thread to finish");
+
+        assert_eq!(
+            backend.own_addresses(),
+            ["rob@example.com", "robert@example.org"]
+        );
     }
 
     /// A credential the server turned down is replaced by connecting again --
@@ -3635,6 +3733,41 @@ mod tests {
         );
         assert_eq!(content.cc, ["Bob <bob@example.com>"]);
         assert_eq!(content.bcc, ["boss@example.com"]);
+    }
+
+    /// The forms RFC 8621 (section 4.1.2) allows for each header.  A server
+    /// refuses the whole body fetch over one it does not, so each is pinned.
+    #[test]
+    fn the_reply_headers_are_asked_for_in_forms_the_server_allows() {
+        assert_eq!(list_post_header().to_string(), "header:List-Post");
+        assert_eq!(
+            mail_followup_to_header().to_string(),
+            "header:Mail-Followup-To:asAddresses"
+        );
+    }
+
+    #[test]
+    fn a_loaded_message_carries_the_headers_a_reply_is_addressed_from() {
+        let email: JmapEmail = serde_json::from_value(serde_json::json!({
+            "id": "M1",
+            "from": [{"name": "Lovelace, Ada", "email": "ada@example.com"}],
+            "replyTo": [{"name": "Dev list", "email": "dev@lists.example.org"}],
+            "header:Mail-Followup-To:asAddresses": [
+                {"name": null, "email": "dev@lists.example.org"},
+                {"name": "Bob", "email": "bob@example.com"},
+            ],
+            "header:List-Post": " <mailto:dev@lists.example.org>",
+        }))
+        .expect("parsing the canned email");
+
+        let content = build_message_content(&email).expect("content builds");
+        assert_eq!(content.from, ["\"Lovelace, Ada\" <ada@example.com>"]);
+        assert_eq!(content.reply_to, ["Dev list <dev@lists.example.org>"]);
+        assert_eq!(
+            content.mail_followup_to,
+            ["dev@lists.example.org", "Bob <bob@example.com>"]
+        );
+        assert_eq!(content.list_post.as_deref(), Some("dev@lists.example.org"));
     }
 
     #[test]

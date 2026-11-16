@@ -146,6 +146,17 @@ pub struct MessageContent {
     pub to: Vec<String>,
     pub cc: Vec<String>,
     pub bcc: Vec<String>,
+    /// The headers a reply is addressed from, written like `to` above.
+    ///
+    /// `from` is here as well because [`Message::sender`] is for display, too.
+    /// Each is empty when the message does not carry the header.
+    pub from: Vec<String>,
+    pub reply_to: Vec<String>,
+    /// Where a list member asked follow-ups to go (`Mail-Followup-To`).  A
+    /// reply-all goes to exactly these.
+    pub mail_followup_to: Vec<String>,
+    /// The list's posting address, from `List-Post: <mailto:...>`.
+    pub list_post: Option<String>,
     /// What OpenPGP had to say about the message, if it was signed or
     /// encrypted.  `None` for ordinary mail.
     pub security: Option<SecurityInfo>,

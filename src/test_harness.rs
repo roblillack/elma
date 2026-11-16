@@ -656,6 +656,11 @@ impl FixtureBackend {
 }
 
 impl MailBackend for FixtureBackend {
+    /// The fixture inbox is addressed to rob@example.com.
+    fn own_addresses(&self) -> Vec<String> {
+        vec!["rob@example.com".to_string()]
+    }
+
     fn load_mailbox(
         &self,
         mailbox: MailboxKind,
