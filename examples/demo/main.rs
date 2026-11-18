@@ -1,4 +1,5 @@
-//! The scripted Elma demo, recorded as the `demo.gif` the README embeds:
+//! The scripted Elma demo, recorded as the `demo.gif` the README embeds,
+//! with a few of its moments also saved as the PNGs in `screenshots/`:
 //!
 //! ```sh
 //! cargo run --release --example demo --features recorder
@@ -82,15 +83,20 @@ mod pace {
 /// The demo's vocabulary: the keys a user would press, with human pacing.
 struct Demo {
     recorder: Recorder,
+    /// Where [`Demo::screenshot`] saves its stills.
+    screenshots: PathBuf,
 }
 
 impl Demo {
-    fn start() -> Self {
+    fn start(screenshots: PathBuf) -> Self {
         let account = AccountDescriptor::new("Personal", Arc::new(DemoBackend::new()));
         let app = TestApp::new(COLUMNS, ROWS, vec![account]);
         let mut recorder = Recorder::start(app);
         recorder.hold(pace::FIRST);
-        Self { recorder }
+        Self {
+            recorder,
+            screenshots,
+        }
     }
 
     fn press(&mut self, code: KeyCode, delay: u32) {
@@ -150,6 +156,12 @@ impl Demo {
         );
     }
 
+    /// Save what is on screen as `screenshots/<name>.png`.
+    fn screenshot(&mut self, name: &str) -> Result<()> {
+        self.recorder
+            .still(&self.screenshots.join(format!("{name}.png")))
+    }
+
     fn finish(self, path: &Path) -> Result<()> {
         self.recorder.finish(path)
     }
@@ -157,7 +169,9 @@ impl Demo {
 
 fn main() -> Result<()> {
     // Resolved before the working directory moves, below.
-    let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo.gif");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let output = root.join("demo.gif");
+    let screenshots = root.join("screenshots");
 
     // The demo writes a file to disk and reads another one back, and both
     // paths end up on screen. Working from a scratch directory keeps them
@@ -175,7 +189,7 @@ fn main() -> Result<()> {
     // the app, below.
     unsafe { std::env::set_var("XDG_DOWNLOAD_DIR", "Downloads") };
 
-    let mut demo = Demo::start();
+    let mut demo = Demo::start(screenshots);
     demo.expect("Invoice 2026-0342 for February");
     demo.pause(pace::READ);
 
@@ -192,6 +206,7 @@ fn main() -> Result<()> {
     demo.action('y'); // and so is the hotel booking
     demo.action('d'); // the support ticket is closed
     demo.expect("5 scheduled actions");
+    demo.screenshot("1-triage")?;
     demo.pause(pace::STUDY);
 
     // Nothing has left the client yet: one keystroke commits the lot, and the
@@ -204,6 +219,7 @@ fn main() -> Result<()> {
     // with. Open it and read it.
     demo.enter(pace::STUDY);
     demo.expect("Invoice 2026-0342");
+    demo.screenshot("2-viewer")?;
     demo.press(KeyCode::PageDown, pace::READ);
     demo.pause(pace::READ);
 
@@ -211,6 +227,7 @@ fn main() -> Result<()> {
     // selected one into the download folder.
     demo.action('S');
     demo.expect("Save attachment");
+    demo.screenshot("3-save-attachment")?;
     demo.pause(pace::READ);
     demo.enter(pace::STUDY);
     demo.expect("Saved to");
@@ -238,6 +255,7 @@ fn main() -> Result<()> {
     demo.write(mailbox::REQUESTED_DOCUMENT);
     demo.enter(pace::STUDY);
     demo.expect(&format!("Attached '{}'", mailbox::REQUESTED_DOCUMENT));
+    demo.screenshot("4-reply")?;
 
     // Tab on past Cancel, Edit message and Draft to Send, and off it goes.
     demo.tab(4);

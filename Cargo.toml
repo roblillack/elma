@@ -10,13 +10,13 @@ repository = "https://github.com/roblillack/elma"
 # Neither the snapshot frames nor the recording made from them are read by
 # anything a published build compiles: the tests that read the first are
 # `#[cfg(test)]`, and the second is a picture for the README.
-exclude = ["src/snapshots", "demo.gif"]
+exclude = ["src/snapshots", "demo.gif", "screenshots"]
 
 [[bin]]
 name = "elma"
 path = "src/main.rs"
 
-# Records `demo.gif`. Behind a feature because it drives the client through the
+# Records `demo.gif` and `screenshots/`. Behind a feature because it drives the client through the
 # test harness, which a normal build has no reason to compile:
 #
 #     cargo run --release --example demo --features recorder

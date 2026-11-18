@@ -11,6 +11,9 @@
 //!
 //! Set `ELMA_DEMO_FRAMES=<dir>` to additionally dump every frame as a PNG,
 //! which is how one debugs a script that ends up showing the wrong thing.
+//!
+//! [`Recorder::still`] saves the frame on screen as a standalone PNG, at
+//! twice the GIF's resolution -- the README's screenshots.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -36,6 +39,10 @@ const METRICS: CellMetrics = CellMetrics {
 /// The terminal the recording is of.  Both halves of every snapshot are
 /// checked either way; this only decides which one the README shows.
 const THEME: TerminalTheme = TerminalTheme::Light;
+
+/// How much larger than the GIF a still is rendered: the SVG is resolution
+/// independent, and a screenshot is looked at closer than an animation.
+const STILL_SCALE: f32 = 2.0;
 
 /// The monospace families the harness's SVG asks for, in the order it asks.
 /// The first one installed is what the recording is set in, so a machine
@@ -113,6 +120,20 @@ impl Recorder {
         self.app.buffer_lines()
     }
 
+    /// Save the frame on screen as a PNG at `path`, rendered at
+    /// [`STILL_SCALE`] times the GIF's resolution.
+    pub fn still(&mut self, path: &Path) -> Result<()> {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
+        }
+        self.render(STILL_SCALE)
+            .save_png(path)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        println!("{}", path.display());
+        Ok(())
+    }
+
     /// Encode everything captured so far into a GIF at `path`.
     pub fn finish(self, path: &Path) -> Result<()> {
         encode_gif(path, &self.frames, self.width, self.height)
@@ -132,16 +153,9 @@ impl Recorder {
     /// Rasterise the current frame and append it, or -- when nothing visible
     /// changed -- extend the previous frame's delay instead.
     fn capture(&mut self, delay: u32) {
-        let svg = self.app.svg_with(METRICS, THEME);
-        let tree = usvg::Tree::from_str(&svg, &self.options).expect("harness SVG parses");
-        let size = tree.size().to_int_size();
-        let mut pixmap =
-            tiny_skia::Pixmap::new(size.width(), size.height()).expect("nonzero frame size");
-        resvg::render(
-            &tree,
-            tiny_skia::Transform::identity(),
-            &mut pixmap.as_mut(),
-        );
+        let pixmap = self.render(1.0);
+        let size = tiny_skia::IntSize::from_wh(pixmap.width(), pixmap.height())
+            .expect("nonzero frame size");
 
         // The SVG paints an opaque background, so every pixel is opaque and the
         // premultiplied buffer equals straight RGBA.
@@ -162,6 +176,25 @@ impl Recorder {
         }
 
         self.frames.push(RecordedFrame { rgba, delay });
+    }
+
+    /// Rasterise the frame on screen, `scale` times the size of its SVG.
+    fn render(&mut self, scale: f32) -> tiny_skia::Pixmap {
+        let svg = self.app.svg_with(METRICS, THEME);
+        let tree = usvg::Tree::from_str(&svg, &self.options).expect("harness SVG parses");
+        let size = tree
+            .size()
+            .to_int_size()
+            .scale_by(scale)
+            .expect("nonzero frame size");
+        let mut pixmap =
+            tiny_skia::Pixmap::new(size.width(), size.height()).expect("nonzero frame size");
+        resvg::render(
+            &tree,
+            tiny_skia::Transform::from_scale(scale, scale),
+            &mut pixmap.as_mut(),
+        );
+        pixmap
     }
 }
 

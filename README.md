@@ -434,6 +434,26 @@ the buttons names the list that decided it. `Ctrl+T` still overrides it for the
 message at hand, and that choice then holds whoever the message ends up
 addressed to. A draft reopens in the format it was saved in.
 
+## Screenshots
+
+Triaging the inbox: messages flagged for archiving (`A`), deletion (`D`) and as
+spam (`!`) wait until the scheduled actions are committed in one go.
+
+![The message list with five scheduled actions waiting to be committed](screenshots/1-triage.png)
+
+Reading an HTML invoice, rendered as text, with its PDF listed among the
+attachments.
+
+![The message viewer showing an HTML invoice](screenshots/2-viewer.png)
+
+Saving that PDF to the download folder.
+
+![The save-attachment dialog over the message viewer](screenshots/3-save-attachment.png)
+
+Replying with a document attached.
+
+![The reply dialog with a PDF attached and the original message quoted](screenshots/4-reply.png)
+
 ## Development
 
 `cargo test` runs the unit tests and the snapshot tests together.
@@ -473,16 +493,18 @@ cargo insta review        # cargo install cargo-insta
 which shows each changed snapshot and writes back the ones you accept, or set
 `INSTA_UPDATE=always` to take the new frames unseen.
 
-### The demo GIF
+### The demo GIF and screenshots
 
-The animation at the top of this file is recorded through the same harness, by
+The animation at the top of this file, and the screenshots above, are recorded through the same harness, by
 a script that presses keys: triage a morning's mail and commit the scheduled
 actions, open the invoice that is left and save its PDF, then answer the
 colleague who asked for a document with that document attached, archive her
 message and commit that too. The story is `examples/demo/main.rs`, the mail it
 works through `examples/demo/mailbox.rs`, and the camera that rasterises the
 SVG frames into a GIF `examples/demo/recorder.rs` — which is also where the
-recorded terminal theme is chosen. Re-record it with
+recorded terminal theme is chosen. Along the way the script saves four of its
+moments, at twice the GIF's resolution, as the PNGs in `screenshots/`.
+Re-record both with
 
 ```bash
 cargo run --release --example demo --features recorder
