@@ -2434,22 +2434,37 @@ impl GmailInner {
         };
 
         let uid_arg = uid.to_string();
-        {
-            let mut guard = self.session.lock().await;
-            let session = guard
-                .as_mut()
-                .ok_or_else(|| anyhow!("IMAP session is not available"))?;
-            let moved = bounded(session.uid_mv(&uid_arg, target)).await;
-            retire_if_lost(&mut guard, moved)
-                .with_context(|| format!("moving message {message_id} to {target}"))?;
-        }
+        let mut guard = self.session.lock().await;
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("IMAP session is not available"))?;
+        let moved = bounded(session.uid_mv(&uid_arg, target)).await;
+        retire_if_lost(&mut guard, moved)
+            .with_context(|| format!("moving message {message_id} to {target}"))?;
 
         {
             let mut state = self.state.lock().await;
             state.expunge(seq);
         }
-
         self.emit_event(BackendEvent::MessageDeleted(message_id));
+
+        // The server answers a MOVE with an EXPUNGE and the EXISTS that
+        // follows from it, and async-imap parks both.  Read them now, while
+        // they still describe the mailbox as it is: left to pile up across a
+        // batch of moves, they fill async-imap's channel -- which then drops
+        // whatever comes after -- and the next look at it takes an EXISTS from
+        // a thousand messages ago for new mail.  The move itself is done
+        // either way, so trouble here is logged, not reported as its failure.
+        let Some(session) = guard.as_mut() else {
+            return Ok(());
+        };
+        let drained = self.drain_exists(session, None).await;
+        if let Err(err) = retire_if_lost(&mut guard, drained) {
+            log_backend_event(
+                "BACKEND",
+                &format!("EXISTS handling after a move failed: {err:?}"),
+            );
+        }
         Ok(())
     }
 
@@ -3108,14 +3123,23 @@ fn tolerate(what: &str, result: Result<()>) -> Result<()> {
 /// Only EXISTS is replayed.  An EXPUNGE arriving this way has lost its
 /// position relative to the FETCH responses it came in with, and applying it
 /// out of order would renumber the wrong messages -- worse than missing it.
+///
+/// The channel holds responses in the order they arrived, so the last EXISTS
+/// is the mailbox as it is now.  The highest one is not: once messages have
+/// been expunged in between, it counts messages that are gone, and anything
+/// that arrives later and stays below it is not seen as new.
 fn take_unsolicited_exists(session: &AsyncSession) -> Option<u32> {
-    let mut highest = None;
-    while let Ok(response) = session.unsolicited_responses.try_recv() {
-        if let UnsolicitedResponse::Exists(count) = response {
-            highest = max_exists(highest, Some(count));
-        }
-    }
-    highest
+    latest_exists(std::iter::from_fn(|| {
+        session.unsolicited_responses.try_recv().ok()
+    }))
+}
+
+/// The last EXISTS among `responses`, which are consumed in full.
+fn latest_exists(responses: impl Iterator<Item = UnsolicitedResponse>) -> Option<u32> {
+    responses.fold(None, |latest, response| match response {
+        UnsolicitedResponse::Exists(count) => Some(count),
+        _ => latest,
+    })
 }
 
 /// The higher of two observed EXISTS counts, if either is present.
@@ -4291,6 +4315,30 @@ mod tests {
         let err = anyhow!("missing UID in fetch response").context("fetching backfill range 1:100");
 
         assert!(!is_connection_lost(&err));
+    }
+
+    /// What a run of moves leaves parked: each one an EXPUNGE and the count
+    /// that follows from it, with a newly arrived message at the end.
+    #[test]
+    fn the_last_parked_exists_is_the_one_that_counts() {
+        let parked = vec![
+            UnsolicitedResponse::Expunge(40),
+            UnsolicitedResponse::Exists(99),
+            UnsolicitedResponse::Expunge(12),
+            UnsolicitedResponse::Exists(98),
+            UnsolicitedResponse::Exists(99),
+            UnsolicitedResponse::Expunge(3),
+        ];
+        assert_eq!(latest_exists(parked.into_iter()), Some(99));
+
+        let shrinking = vec![
+            UnsolicitedResponse::Exists(20298),
+            UnsolicitedResponse::Exists(20297),
+            UnsolicitedResponse::Exists(19665),
+        ];
+        assert_eq!(latest_exists(shrinking.into_iter()), Some(19665));
+
+        assert_eq!(latest_exists(std::iter::empty()), None);
     }
 
     #[test]

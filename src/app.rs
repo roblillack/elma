@@ -3077,20 +3077,20 @@ impl App {
                     {
                         // Announced again: one row per message.
                         merge_backend_update(existing, message);
-                    } else if mailbox
-                        .messages
-                        .get(index)
-                        .is_some_and(|msg| !msg.is_placeholder())
+                    } else if index >= mailbox.messages.len()
+                        || !mailbox.messages[index].is_placeholder()
                     {
                         // The backend's numbering no longer matches the list --
                         // a commit renumbered it locally, or the backend missed
                         // a removal.  Writing into the slot would make the
-                        // message shown there vanish, so the newcomer goes to
-                        // the end, where new mail belongs.
+                        // message shown there vanish, and a slot past the end
+                        // would be reached through placeholders for messages
+                        // the list has already let go of, which nothing would
+                        // ever fill.  So the newcomer goes to the end, where
+                        // new mail belongs.
                         mailbox.messages.push(message);
                         resequence_messages(&mut mailbox.messages);
                     } else {
-                        ensure_placeholder_capacity(&mut mailbox.messages, index + 1);
                         mailbox.messages[index] = message;
                     }
                     if mailbox.selected.is_none() {
@@ -7426,6 +7426,28 @@ mod tests {
         assert_eq!(listed_ids(&app), vec![1, 2, 3, 9]);
         let seqs: Vec<u32> = app.mailbox.messages.iter().map(|msg| msg.seq).collect();
         assert_eq!(seqs, vec![1, 2, 3, 4]);
+    }
+
+    /// While a commit is still being carried out, the list has dropped
+    /// messages the server still counts, so new mail claims a row past the
+    /// end.  Padding up to it showed a "Loading" row for every message still
+    /// waiting to be moved, and nothing ever filled them in.
+    #[test]
+    fn new_mail_claiming_a_row_past_the_end_is_added_without_placeholders() {
+        let mut app = test_app(vec![
+            make_message(1, MessageStatus::Read),
+            make_message(2, MessageStatus::Read),
+        ]);
+        let events = subscribe(&mut app);
+
+        let mut arriving = make_message(9, MessageStatus::New);
+        arriving.seq = 6;
+        events.send(BackendEvent::NewMessage(arriving)).unwrap();
+        app.poll_backend_events();
+
+        assert_eq!(listed_ids(&app), vec![1, 2, 9]);
+        assert!(app.mailbox.messages.iter().all(|msg| !msg.is_placeholder()));
+        assert_eq!(app.mailbox.messages[2].seq, 3);
     }
 
     #[test]
