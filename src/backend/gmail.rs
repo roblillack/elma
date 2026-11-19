@@ -997,7 +997,7 @@ impl GmailInner {
         // protocol, or a future version of async-imap, happens to frame it.
         register_secret(&self.password);
 
-        let session = bounded_by(CONNECT_TIMEOUT, async {
+        let mut session = bounded_by(CONNECT_TIMEOUT, async {
             let tcp = TcpStream::connect((GMAIL_HOST, GMAIL_PORT))
                 .await
                 .context("connecting to Gmail IMAP server")?;
@@ -1025,18 +1025,25 @@ impl GmailInner {
         })
         .await?;
 
-        *guard = Some(session);
-
-        drop(guard);
-        self.determine_special_mailboxes().await?;
+        // The session is readied while the lock is still held, and only then
+        // put where others can take it.  Handed over straight after LOGIN, it
+        // went to whoever asked first -- an action, say, while a backfill was
+        // reconnecting -- and that one sent its UID STORE to a session that
+        // had no mailbox open yet, which Gmail answers with "BAD … not allowed
+        // now".  A session that fails on the way is dropped rather than kept
+        // half ready; the next caller dials afresh.
+        self.determine_special_mailboxes(&mut session).await?;
 
         // Re-select the current mailbox so the session is ready for UID
-        // commands.  Without this, a reconnected session sits in the
-        // "authenticated" state and Gmail rejects UID MOVE / UID STORE with
-        // "BAD … not allowed now".
-        let mailbox = { *self.current_mailbox.lock().await };
-        self.select_mailbox(mailbox).await?;
+        // commands: a fresh one sits in the "authenticated" state, where Gmail
+        // rejects UID MOVE / UID STORE.
+        let mailbox = *self.current_mailbox.lock().await;
+        let name = self.mailbox_name(mailbox).await?;
+        bounded(session.select(&name))
+            .await
+            .with_context(|| format!("selecting mailbox {name}"))?;
 
+        *guard = Some(session);
         Ok(())
     }
 
@@ -1233,8 +1240,7 @@ impl GmailInner {
                 &format!("backfill EXISTS handling failed: {err:?}"),
             );
             if is_connection_lost(&err) {
-                drop(session_guard);
-                self.discard_session().await;
+                *session_guard = None;
                 return Err(err);
             }
         }
@@ -1246,11 +1252,10 @@ impl GmailInner {
         {
             Ok(result) => result,
             Err(err) => {
-                drop(session_guard);
-                if is_connection_lost(&err) {
-                    self.discard_session().await;
-                }
-                return Err(err);
+                // Retired under the same hold of the lock that saw it fail:
+                // let go first, and an action waiting for the session gets
+                // this one, dead, before it can be thrown away.
+                return retire_if_lost(&mut session_guard, Err(err));
             }
         };
 
@@ -1279,8 +1284,7 @@ impl GmailInner {
                     // Labels are optional; a dead connection is not.  Carrying
                     // on here is what sent an IDLE into a closed socket.
                     if is_connection_lost(&err) {
-                        drop(session_guard);
-                        self.discard_session().await;
+                        *session_guard = None;
                         return Err(err);
                     }
                 }
@@ -1297,8 +1301,7 @@ impl GmailInner {
                 &format!("backfill EXISTS handling failed: {err:?}"),
             );
             if is_connection_lost(&err) {
-                drop(session_guard);
-                self.discard_session().await;
+                *session_guard = None;
                 return Err(err);
             }
         }
@@ -1492,21 +1495,16 @@ impl GmailInner {
     }
 
     /// Discover the Gmail archive and trash mailboxes so we can move messages later.
-    async fn determine_special_mailboxes(&self) -> Result<()> {
-        let mut guard = self.session.lock().await;
-        let session = guard
-            .as_mut()
-            .ok_or_else(|| anyhow!("IMAP session is not available"))?;
-
-        let listed = bounded(async {
+    async fn determine_special_mailboxes(&self, session: &mut AsyncSession) -> Result<()> {
+        let names = bounded(async {
             session
                 .list(Some(""), Some("*"))
                 .await?
                 .try_collect::<Vec<_>>()
                 .await
         })
-        .await;
-        let names = retire_if_lost(&mut guard, listed).context("listing mailboxes")?;
+        .await
+        .context("listing mailboxes")?;
 
         let mut archive = None;
         let mut trash = None;
@@ -1839,10 +1837,15 @@ impl GmailInner {
     async fn process_action(self: Arc<Self>, action: Action) -> Result<()> {
         let _guard = self.action_lock.lock().await;
         self.pause_idle().await?;
-        let result = self
-            .apply_action_internal(&action)
-            .await
-            .with_context(|| format!("applying action {:?}", action.action_type));
+        // A backfill that lost its connection retires the session and dials
+        // again on its own schedule.  An action landing in between finds no
+        // session at all, so it dials itself rather than failing.
+        let result = async {
+            self.ensure_connected().await?;
+            self.apply_action_internal(&action).await
+        }
+        .await
+        .with_context(|| format!("applying action {:?}", action.action_type));
         let restart = self.start_idle_loop().await;
         restart?;
         result
