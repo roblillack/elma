@@ -633,6 +633,9 @@ const DEFAULT_TRASH_LABEL: &str = "[Gmail]/Trash";
 const INITIAL_FETCH_LIMIT: u32 = 100;
 const BACKFILL_BATCH_SIZE: u32 = 100;
 const FETCH_MESSAGE_QUERY: &str = "(FLAGS INTERNALDATE RFC822.SIZE ENVELOPE UID BODYSTRUCTURE)";
+/// [`FETCH_MESSAGE_QUERY`] for a message whose BODYSTRUCTURE the parser
+/// cannot read.  The message is listed without an attachment marker.
+const FETCH_MESSAGE_QUERY_WITHOUT_STRUCTURE: &str = "(FLAGS INTERNALDATE RFC822.SIZE ENVELOPE UID)";
 /// Format of the IMAP `INTERNALDATE` attribute (RFC 3501 section 2.3.3).
 const INTERNAL_DATE_FORMAT: &str = "%d-%b-%Y %H:%M:%S %z";
 /// How many times [`GmailInner::drain_exists`] re-enters
@@ -992,6 +995,20 @@ impl GmailInner {
             return Ok(());
         }
 
+        // The session is readied while the lock is still held, and only then
+        // put where others can take it.  Handed over straight after LOGIN, it
+        // went to whoever asked first -- an action, say, while a backfill was
+        // reconnecting -- and that one sent its UID STORE to a session that
+        // had no mailbox open yet, which Gmail answers with "BAD … not allowed
+        // now".  A session that fails on the way is dropped rather than kept
+        // half ready; the next caller dials afresh.
+        *guard = Some(self.open_session().await?);
+        Ok(())
+    }
+
+    /// Dial Gmail, log in, and open the current mailbox: a session ready for
+    /// UID commands, which nobody else has seen yet.
+    async fn open_session(&self) -> Result<AsyncSession> {
         // Registered before the connection exists, so the debug log can scrub
         // the password out of everything it writes -- whichever way the
         // protocol, or a future version of async-imap, happens to frame it.
@@ -1025,13 +1042,6 @@ impl GmailInner {
         })
         .await?;
 
-        // The session is readied while the lock is still held, and only then
-        // put where others can take it.  Handed over straight after LOGIN, it
-        // went to whoever asked first -- an action, say, while a backfill was
-        // reconnecting -- and that one sent its UID STORE to a session that
-        // had no mailbox open yet, which Gmail answers with "BAD … not allowed
-        // now".  A session that fails on the way is dropped rather than kept
-        // half ready; the next caller dials afresh.
         self.determine_special_mailboxes(&mut session).await?;
 
         // Re-select the current mailbox so the session is ready for UID
@@ -1043,8 +1053,7 @@ impl GmailInner {
             .await
             .with_context(|| format!("selecting mailbox {name}"))?;
 
-        *guard = Some(session);
-        Ok(())
+        Ok(session)
     }
 
     async fn stop_backfill_task(&self) {
@@ -1430,14 +1439,92 @@ impl GmailInner {
         Ok(messages)
     }
 
+    /// Fetch the messages `start..=end` in the open mailbox, plus the highest
+    /// EXISTS seen while doing so.
+    ///
+    /// Gmail describes some messages with a BODYSTRUCTURE the parser rejects --
+    /// `.mhtml` attachments come out as a multipart with no parts at all, which
+    /// RFC 3501 does not allow.  The parser cannot step over a response it
+    /// does not understand, so the connection is lost with it, and retrying the
+    /// range only loses the next one the same way.  Instead, what arrived
+    /// before is kept, the message that broke it is fetched on a fresh session
+    /// without its BODYSTRUCTURE, and the rest of the range after it.  The
+    /// fresh session replaces `session` in place.
     async fn fetch_message_range(
         &self,
         session: &mut AsyncSession,
         start: u32,
         end: u32,
     ) -> Result<(Vec<StoredMessage>, Option<u32>)> {
+        let mut collected = Vec::new();
+        let mut highest_exists = None;
+        let mut next = start;
+
+        while next <= end {
+            let fetched = self
+                .fetch_messages(session, next, end, FETCH_MESSAGE_QUERY, &mut collected)
+                .await;
+            let err = match fetched {
+                Ok(exists) => {
+                    highest_exists = max_exists(highest_exists, exists);
+                    break;
+                }
+                Err(err) if is_unparseable_response(&err) => err,
+                Err(err) => return Err(err),
+            };
+
+            // Gmail answers in ascending order, so the response that broke the
+            // parser belongs to the first message that did not arrive.
+            let Some(broken) = first_missing_seq(&collected, next, end) else {
+                // Everything arrived; what failed came after the last message.
+                *session = self.open_session().await.context("reconnecting")?;
+                break;
+            };
+            log_backend_event(
+                "BACKEND",
+                &format!(
+                    "message {broken} cannot be parsed; fetching it without BODYSTRUCTURE: {err:?}"
+                ),
+            );
+
+            *session = self
+                .open_session()
+                .await
+                .context("reconnecting after an unparseable FETCH response")?;
+            let exists = self
+                .fetch_messages(
+                    session,
+                    broken,
+                    broken,
+                    FETCH_MESSAGE_QUERY_WITHOUT_STRUCTURE,
+                    &mut collected,
+                )
+                .await
+                .with_context(|| format!("fetching message {broken} without BODYSTRUCTURE"))?;
+            highest_exists = max_exists(highest_exists, exists);
+            next = broken + 1;
+        }
+
+        collected.sort_by_key(|stored| stored.seq);
+        Ok((collected, highest_exists))
+    }
+
+    /// Issue one FETCH for `start..=end` with `query` and add each message it
+    /// returns to `collected`, unless one with the same sequence number is
+    /// already there.  Returns the highest EXISTS seen.
+    ///
+    /// Messages go into `collected` as they arrive, so a FETCH that breaks off
+    /// halfway leaves the ones before the break behind for the caller.
+    async fn fetch_messages(
+        &self,
+        session: &mut AsyncSession,
+        start: u32,
+        end: u32,
+        query: &str,
+        collected: &mut Vec<StoredMessage>,
+    ) -> Result<Option<u32>> {
         if start == 0 || end == 0 || start > end {
-            return Ok((Vec::new(), None));
+            return Ok(None);
         }
 
         let range = if start == end {
@@ -1447,12 +1534,11 @@ impl GmailInner {
         };
 
         let mailbox = *self.current_mailbox.lock().await;
-        let command = format!("FETCH {range} {FETCH_MESSAGE_QUERY}");
+        let command = format!("FETCH {range} {query}");
         let tag = bounded(session.run_command(&command))
             .await
             .with_context(|| format!("issuing FETCH command for range {range}"))?;
 
-        let mut collected = Vec::new();
         let mut highest_exists: Option<u32> = None;
 
         loop {
@@ -1469,7 +1555,11 @@ impl GmailInner {
             match parsed {
                 Response::Fetch(seq, attrs) => {
                     match build_message_from_attrs(mailbox, *seq, attrs)? {
-                        Some(stored) => collected.push(stored),
+                        Some(stored) => {
+                            if !collected.iter().any(|known| known.seq == stored.seq) {
+                                collected.push(stored);
+                            }
+                        }
                         None => {
                             let _ = self.handle_fetch_update(*seq, attrs).await?;
                         }
@@ -1491,7 +1581,7 @@ impl GmailInner {
             }
         }
 
-        Ok((collected, highest_exists))
+        Ok(highest_exists)
     }
 
     /// Discover the Gmail archive and trash mailboxes so we can move messages later.
@@ -3055,6 +3145,24 @@ fn is_connection_lost(err: &anyhow::Error) -> bool {
             || cause.is::<TimedOut>()
             || cause.downcast_ref::<std::io::Error>().is_some()
     })
+}
+
+/// Did the parser give up on a response, rather than the connection fail?
+///
+/// async-imap reports that as an `io::Error` of kind `Other` carrying the
+/// unparsed input, and leaves the input where it was: the session is lost
+/// either way, but only a parse failure says something about the message.
+fn is_unparseable_response(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            io.kind() == std::io::ErrorKind::Other && io.to_string().contains(" during parsing of ")
+        })
+    })
+}
+
+/// The lowest sequence number in `start..=end` that `collected` lacks.
+fn first_missing_seq(collected: &[StoredMessage], start: u32, end: u32) -> Option<u32> {
+    (start..=end).find(|seq| !collected.iter().any(|stored| stored.seq == *seq))
 }
 
 /// Give one IMAP round trip [`COMMAND_TIMEOUT`] to complete.
@@ -4642,5 +4750,85 @@ mod tests {
 
         assert!(stored.message.has_attachments);
         assert_eq!(stored.message.status, MessageStatus::New);
+    }
+
+    /// What Gmail sends for a message with `.mhtml` attachments: each one is
+    /// described as a multipart with no parts, `("RELATED" (params) (disposition)
+    /// NIL)`, which RFC 3501 does not allow.  `structure` picks whether the
+    /// response carries the BODYSTRUCTURE at all.
+    fn gmail_mhtml_fetch_line(structure: bool) -> Vec<u8> {
+        let mut line = String::from(concat!(
+            r#"* 18306 FETCH (UID 146127 RFC822.SIZE 12392598 "#,
+            r#"INTERNALDATE "01-Oct-2026 08:26:27 +0000" FLAGS (\Answered \Seen) "#,
+            r#"ENVELOPE ("Thu, 1 Oct 2026 10:18:12 +0200" "Design templates" "#,
+            r#"(("Ada" NIL "ada" "example.com")) (("Ada" NIL "ada" "example.com")) "#,
+            r#"(("Ada" NIL "ada" "example.com")) ((NIL NIL "bob" "example.org")) "#,
+            r#"NIL NIL NIL "<id@example.com>")"#,
+        ));
+        if structure {
+            line.push_str(concat!(
+                r#" BODYSTRUCTURE ((("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "#,
+                r#""QUOTED-PRINTABLE" 1562 32 NIL NIL NIL)("TEXT" "HTML" ("CHARSET" "utf-8") "#,
+                r#"NIL NIL "QUOTED-PRINTABLE" 10320 207 NIL NIL NIL) "ALTERNATIVE" "#,
+                r#"("BOUNDARY" "a") NIL NIL)("RELATED" ("NAME" "Colours.mhtml") "#,
+                r#"("ATTACHMENT" ("FILENAME" "Colours.mhtml")) NIL) "MIXED" "#,
+                r#"("BOUNDARY" "b") NIL NIL)"#,
+            ));
+        }
+        line.push_str(")\r\n");
+        line.into_bytes()
+    }
+
+    /// The reason [`GmailInner::fetch_message_range`] has to step around such
+    /// a message.  Should imap-proto learn to read it, this fails, and the
+    /// detour can go.
+    #[test]
+    fn the_parser_rejects_gmails_partless_multipart() {
+        let line = gmail_mhtml_fetch_line(true);
+        // Rejected outright, not merely waiting for more input.
+        let err = Response::parse(&line).expect_err("the parser accepted the line");
+        assert!(!err.is_incomplete());
+    }
+
+    #[test]
+    fn without_its_bodystructure_the_message_still_parses() {
+        let line = gmail_mhtml_fetch_line(false);
+        let (seq, attrs) = fetch_line(&line);
+
+        let stored = build_message_from_attrs(MailboxKind::Inbox, seq, &attrs)
+            .expect("building the message")
+            .expect("a FETCH response without BODYSTRUCTURE is still a message");
+
+        assert_eq!((stored.seq, stored.uid), (18306, 146127));
+        assert_eq!(stored.message.subject, "Design templates");
+        assert!(!stored.message.has_attachments);
+    }
+
+    /// The wording is async-imap's (`ImapStream::decode`); this checks the
+    /// match against it, and that a failing connection does not look the same.
+    #[test]
+    fn a_parse_failure_is_told_apart_from_a_lost_connection() {
+        let parse = anyhow::Error::new(std::io::Error::other(
+            "Error(Error { input: [42], code: Tag }) during parsing of \"* 1 FETCH\"",
+        ))
+        .context("reading FETCH response");
+        assert!(is_unparseable_response(&parse));
+
+        let reset = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+            .context("reading FETCH response");
+        assert!(!is_unparseable_response(&reset));
+        assert!(!is_unparseable_response(&anyhow::Error::new(TimedOut)));
+    }
+
+    #[test]
+    fn the_first_missing_message_is_the_one_after_the_last_that_arrived() {
+        let collected = vec![
+            make_message(1, 10),
+            make_message(2, 11),
+            make_message(3, 13),
+        ];
+        assert_eq!(first_missing_seq(&collected, 10, 15), Some(12));
+        assert_eq!(first_missing_seq(&collected, 13, 13), None);
+        assert_eq!(first_missing_seq(&[], 7, 9), Some(7));
     }
 }
